@@ -1,533 +1,467 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
+import math
 import numpy as np
-import pandas_ta as ta
+import pandas as pd
+import yfinance as yf
+import streamlit as st
 import altair as alt
-from datetime import datetime
 
-# ---------------------------
-# STREAMLIT CONFIG
-# ---------------------------
+# =========================
+# LOCKED SETTINGS (do not tweak)
+# =========================
+LOOKBACK_YEARS = 5
+INTERVAL = "1d"
+MIN_BARS = 260  # sanity check
+TREND_LOOKBACK_DAYS = 10
+
+# Indicator params (frozen)
+MACD_FAST, MACD_SLOW, MACD_SIGNAL = 24, 52, 18
+TSI_LONG, TSI_SHORT, TSI_SIGNAL = 40, 20, 10
+STOCH_LEN, STOCH_SMOOTH_K, STOCH_SMOOTH_D = 14, 3, 3
+
+# Composite thresholds (frozen)
+BUY_LEVEL_TH = 0.20
+SELL_LEVEL_TH = -0.20
+CONF_TH = 70
+
 st.set_page_config(page_title="Robust Market Regime Dashboard", layout="wide")
-st.title("🧭 Robust Market Regime Dashboard (5y + Predictiveness Tools)")
-st.caption("Composite regime score from ratio canaries + confirmation indicators, with SPY overlay + peak markers + next-20d drawdown probability")
 
-# ---------------------------
-# SIDEBAR SETTINGS
-# ---------------------------
-with st.sidebar:
-    st.header("Settings")
-
-    period = st.selectbox("History window", ["1y", "2y", "5y", "10y"], index=2)
-    interval = st.selectbox("Interval", ["1d"], index=0)
-
-    st.subheader("Indicators")
-    stoch_len = st.slider("Canary Stoch length", 10, 60, 14)
-    tsi_long = st.slider("TSI long", 10, 80, 40)
-    tsi_short = st.slider("TSI short", 5, 40, 20)
-    tsi_signal = st.slider("TSI signal", 3, 30, 10)
-
-    st.subheader("Confirmations")
-    confirm_days = st.slider("Confirm MACD/TSI sign (days)", 1, 5, 2)
-    trend_lookback = st.slider("Composite trend lookback (days)", 5, 30, 10)
-
-    st.subheader("Predictiveness")
-    fwd_days = st.slider("Forward window (days) for drawdown probability", 10, 60, 20)
-    dd_threshold = st.slider("Define 'correction' as SPY drawdown ≤", -15.0, -2.0, -5.0, 0.5)
-    state_bins = st.slider("State bins (composite quantiles)", 3, 10, 5)
-
-    st.subheader("Peak markers")
-    peak_window = st.slider("Local peak window (days)", 5, 30, 10)
-    peak_min_move = st.slider("Min drop after peak to count (%)", 0.5, 5.0, 1.5, 0.5)
-
-    st.subheader("Breadth (optional)")
-    use_breadth = st.toggle("Compute breadth (slower)", value=True)
-    breadth_max_tickers = st.slider("Breadth basket size", 20, 140, 60, step=10)
-
-    st.subheader("Scoring weights")
-    w_stress = st.slider("Stress (SPXS:SVOL)", 0.05, 0.60, 0.25, 0.05)
-    w_credit = st.slider("Credit (HYG:SHY)", 0.05, 0.60, 0.25, 0.05)
-    w_lead = st.slider("Leadership (SOXX:SPY)", 0.05, 0.60, 0.20, 0.05)
-    w_fin = st.slider("Financials (XLF:SPY)", 0.05, 0.60, 0.20, 0.05)
-    w_house = st.slider("Housing (ITB:SPY)", 0.00, 0.40, 0.10, 0.05)
-    w_breadth = st.slider("Breadth weight", 0.00, 0.60, 0.20, 0.05)
-
-    st.subheader("Alert thresholds")
-    risk_off_th = st.slider("Risk-Off if Composite ≤", -1.0, 0.0, -0.35, 0.05)
-    risk_on_th = st.slider("Risk-On if Composite ≥", 0.0, 1.0, 0.35, 0.05)
-
-# Normalize weights
-weights = np.array([w_stress, w_credit, w_lead, w_fin, w_house, w_breadth], dtype=float)
-wsum = weights.sum()
-if wsum == 0:
-    st.error("All weights are zero. Increase at least one weight.")
-    st.stop()
-weights = weights / wsum
-w_stress, w_credit, w_lead, w_fin, w_house, w_breadth = weights.tolist()
-
-# ---------------------------
-# COMPONENT DEFINITIONS
-# invert=True => rising ratio = more stress (bad), so score is negated
-# ---------------------------
-COMPONENTS = [
-    {"name": "Stress vs Carry", "a": "SPXS", "b": "SVOL", "invert": True,  "weight": w_stress},
-    {"name": "Credit Gate",     "a": "HYG",  "b": "SHY",  "invert": False, "weight": w_credit},
-    {"name": "Semis Lead",      "a": "SOXX", "b": "SPY",  "invert": False, "weight": w_lead},
-    {"name": "Financials Lead", "a": "XLF",  "b": "SPY",  "invert": False, "weight": w_fin},
-    {"name": "Housing/Cyclic",  "a": "ITB",  "b": "SPY",  "invert": False, "weight": w_house},
-]
-
-ratio_tickers = sorted({c["a"] for c in COMPONENTS} | {c["b"] for c in COMPONENTS} | {"SPY"})
-
-# Breadth basket (liquid proxies; adjustable size)
-BREADTH_TICKERS_BASE = [
-    "SPY","QQQ","IWM","MDY","IJR","RSP",
-    "XLF","XLK","XLI","XLY","XLP","XLV","XLE","XLB",
-    "SOXX","SMH","ITB","XHB","XRT","XME",
-    "HYG","SHY",
-    "EWY","EWG","EEM","FXI","EWZ",
-    "NVDA","AMD","AMAT","MSFT","AMZN","NFLX",
-    "JPM","BAC","WFC","GS","MS","C",
-]
-BREADTH_TICKERS_PAD = [
-    "AAPL","GOOGL","META","TSLA","INTC","MU","DIS","MA","HD","NKE","FDX","CAT","DE",
-    "XBI","IBB","VNQ","IYR","GLD","SLV","USO","XOP","OIH","KRE","KBE","VUG","IWF","IWD","VTV"
-]
-breadth_tickers = (BREADTH_TICKERS_BASE + BREADTH_TICKERS_PAD)[:breadth_max_tickers]
-
-# ---------------------------
+# =========================
 # HELPERS
-# ---------------------------
-@st.cache_data(ttl=3600)
-def download_closes(tickers, period="5y", interval="1d") -> pd.DataFrame:
+# =========================
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def macd_hist(series: pd.Series, fast: int, slow: int, signal: int) -> pd.Series:
+    m = ema(series, fast) - ema(series, slow)
+    sig = ema(m, signal)
+    return (m - sig)
+
+def tsi(series: pd.Series, long_len: int, short_len: int, signal_len: int) -> tuple[pd.Series, pd.Series]:
+    # True Strength Index (TSI)
+    # TSI = 100 * EMA(EMA(m, short), long) / EMA(EMA(|m|, short), long)
+    m = series.diff()
+    ema1 = ema(m, short_len)
+    ema2 = ema(ema1, long_len)
+
+    abs_m = m.abs()
+    abs_ema1 = ema(abs_m, short_len)
+    abs_ema2 = ema(abs_ema1, long_len)
+
+    tsi_val = 100 * (ema2 / abs_ema2.replace(0, np.nan))
+    tsi_sig = ema(tsi_val, signal_len)
+    return tsi_val, tsi_sig
+
+def stoch_kd(series: pd.Series, length: int, smooth_k: int, smooth_d: int) -> tuple[pd.Series, pd.Series]:
+    # Stochastic on the ratio itself using rolling high/low of the ratio
+    low = series.rolling(length).min()
+    high = series.rolling(length).max()
+    k = 100 * (series - low) / (high - low).replace(0, np.nan)
+    k_s = k.rolling(smooth_k).mean()
+    d_s = k_s.rolling(smooth_d).mean()
+    return k_s, d_s
+
+def zscore(series: pd.Series, window: int = 252) -> pd.Series:
+    mu = series.rolling(window).mean()
+    sd = series.rolling(window).std()
+    return (series - mu) / sd.replace(0, np.nan)
+
+def safe_last(series: pd.Series):
+    return float(series.dropna().iloc[-1]) if series.dropna().shape[0] else np.nan
+
+@st.cache_data(ttl=60 * 30)  # 30 min cache
+def fetch_prices(tickers: list[str], period: str, interval: str) -> pd.DataFrame:
     df = yf.download(
         tickers=tickers,
         period=period,
         interval=interval,
         auto_adjust=True,
-        progress=False,
         group_by="ticker",
         threads=True,
+        progress=False,
     )
-    if df is None or df.empty:
-        return pd.DataFrame()
-
+    # Normalize to Close-only table
     if isinstance(df.columns, pd.MultiIndex):
         closes = {}
         for t in tickers:
             if (t, "Close") in df.columns:
                 closes[t] = df[(t, "Close")]
-        return pd.DataFrame(closes).dropna(how="all")
+        close_df = pd.DataFrame(closes)
     else:
-        if "Close" in df.columns and len(tickers) == 1:
-            return df[["Close"]].rename(columns={"Close": tickers[0]}).dropna(how="all")
-        return pd.DataFrame()
+        # single ticker case
+        close_df = pd.DataFrame({tickers[0]: df["Close"]})
+    close_df = close_df.dropna(how="all")
+    return close_df
 
-def safe_ratio(a: pd.Series, b: pd.Series) -> pd.Series:
-    df = pd.concat([a, b], axis=1).dropna()
-    if df.empty:
-        return pd.Series(dtype=float)
-    return (df.iloc[:, 0] / df.iloc[:, 1]).dropna()
+def ratio(a: pd.Series, b: pd.Series) -> pd.Series:
+    return (a / b).replace([np.inf, -np.inf], np.nan)
 
-def canary_stoch(x: pd.Series, length: int = 14) -> pd.Series:
-    x = x.dropna()
-    low = x.rolling(length).min()
-    high = x.rolling(length).max()
-    denom = (high - low).replace(0, np.nan)
-    return 100 * (x - low) / denom
+def series_score(series: pd.Series, invert: bool = False) -> pd.Series:
+    """
+    Returns a per-day score in [-1, +1] using frozen indicators:
+      - MACD histogram sign (24,52,18)
+      - TSI sign (40,20,10)
+      - Stoch %K relative to 50 (14,3,3)
+    """
+    s = series.dropna()
+    if s.shape[0] < MIN_BARS:
+        # return empty aligned series
+        return pd.Series(index=series.index, dtype=float)
 
-def proxy_cci(x: pd.Series, length: int = 100) -> pd.Series:
-    x = x.dropna()
-    sma = x.rolling(length).mean()
-    mad = (x - sma).abs().rolling(length).mean()
-    return (x - sma) / (0.015 * mad)
+    mh = macd_hist(s, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    tsi_val, tsi_sig = tsi(s, TSI_LONG, TSI_SHORT, TSI_SIGNAL)
+    k, d = stoch_kd(s, STOCH_LEN, STOCH_SMOOTH_K, STOCH_SMOOTH_D)
 
-def rolling_confirm_sign(x: pd.Series, days: int = 2) -> pd.Series:
-    def f(arr):
-        if np.all(arr > 0):
-            return 1.0
-        if np.all(arr < 0):
-            return -1.0
-        return 0.0
-    return x.rolling(days).apply(f, raw=True)
+    # Convert to directional signals
+    macd_dir = np.where(mh > 0, 1.0, -1.0)
+    tsi_dir = np.where(tsi_val > 0, 1.0, -1.0)
+    stoch_dir = np.where(k > 50, 1.0, -1.0)
 
-def regime_label(level: float, trend: float) -> str:
-    # Level buckets
-    if level <= -0.50:
-        lvl = "Risk-Off"
-    elif level <= -0.15:
-        lvl = "Deteriorating"
-    elif level < 0.15:
-        lvl = "Transition"
-    elif level < 0.50:
-        lvl = "Healing"
-    else:
-        lvl = "Risk-On"
+    # Weighted blend (fixed)
+    raw = 0.4 * macd_dir + 0.4 * tsi_dir + 0.2 * stoch_dir
+    raw = pd.Series(raw, index=s.index).clip(-1, 1)
 
-    improving = trend >= 0
+    if invert:
+        raw = -raw
 
-    if lvl in ["Healing", "Risk-On"] and improving:
-        return f"✅ {lvl} + improving"
-    if lvl in ["Healing", "Risk-On"] and not improving:
-        return f"⚠️ {lvl} but deteriorating"
-    if lvl in ["Risk-Off", "Deteriorating"] and improving:
-        return f"✅ {lvl} but improving (bottoming)"
-    if lvl in ["Risk-Off", "Deteriorating"] and not improving:
-        return f"🚨 {lvl} and deteriorating"
-    # Transition:
-    return f"🟨 {lvl} (watch trend)" if improving else f"⚠️ {lvl} (weakening)"
+    # Reindex to original
+    out = pd.Series(index=series.index, dtype=float)
+    out.loc[raw.index] = raw
+    return out
 
-def rebase_100(series: pd.Series) -> pd.Series:
+def slope_dir(series: pd.Series, lookback: int) -> pd.Series:
+    return series - series.shift(lookback)
+
+def pct_above_ma(close_df: pd.DataFrame, ma_len: int) -> pd.Series:
+    ma = close_df.rolling(ma_len).mean()
+    above = (close_df > ma).astype(float)
+    return above.mean(axis=1) * 100.0
+
+def nh_nl(close_df: pd.DataFrame, window: int = 252) -> pd.Series:
+    rolling_high = close_df.rolling(window).max()
+    rolling_low = close_df.rolling(window).min()
+    nh = (close_df >= rolling_high).sum(axis=1)
+    nl = (close_df <= rolling_low).sum(axis=1)
+    return (nh - nl).astype(float)
+
+def adv_decl_line(close_df: pd.DataFrame) -> pd.Series:
+    adv = (close_df.diff() > 0).sum(axis=1)
+    dec = (close_df.diff() < 0).sum(axis=1)
+    return (adv - dec).cumsum()
+
+def normalize_to_100(series: pd.Series) -> pd.Series:
     s = series.dropna()
     if s.empty:
-        return pd.Series(index=series.index, dtype=float)
-    return (100 * (s / s.iloc[0])).reindex(series.index)
+        return series
+    base = s.iloc[0]
+    if base == 0 or np.isnan(base):
+        return series
+    out = (series / base) * 100.0
+    return out
 
-def z_to_100(series: pd.Series) -> pd.Series:
-    s = series.dropna()
-    if s.empty or s.std() == 0:
-        return pd.Series(index=series.index, dtype=float)
-    z = (s - s.mean()) / s.std()
-    return (100 + 10 * z).reindex(series.index)
+# =========================
+# TICKERS / COMPONENTS (robust clusters, not individual stocks)
+# =========================
+CORE_TICKERS = [
+    "SPY", "SPXS", "SVOL", "VXX",
+    "HYG", "SHY",
+    "SMH", "SOXX", "XLF", "KBE", "KRE",
+    "RSP",
+    # Breadth basket additions:
+    "XLK", "XLY", "XLI", "XLB", "XLE",
+    "IWM", "MDY", "IJR",
+    "ITB", "XHB",
+    "EEM", "EWG", "EWY",
+    "XOP", "OIH", "GDX",
+]
 
-def clamp(x, lo, hi):
-    return float(max(lo, min(hi, x)))
+# Breadth basket (approx breadth proxy using liquid ETFs & large caps)
+BREADTH_BASKET = [
+    "SPY","RSP","IWM","MDY","IJR",
+    "XLK","XLF","XLY","XLP","XLV","XLI","XLE","XLB","XLU",
+    "SMH","SOXX","XBI","IBB","XRT","ITB","XHB",
+    "EEM","EWG","EWJ","EWY","FXI","EWZ",
+    "GDX","SLV","GLD","USO","XOP","OIH",
+    "AAPL","MSFT","AMZN","GOOGL","NVDA","AMD","META","TSLA",
+    "JPM","BAC","WFC","C","GS","MS",
+    "CAT","DE","FDX","DIS","NKE","MA",
+    "INTC","AMAT","MU","NFLX","SBUX"
+]
 
-def canary_dial(score: float) -> int:
-    # Map composite (-1..+1) to 0..100, clipped
-    score = clamp(score, -1.0, 1.0)
-    return int(round((score + 1) * 50))
+# Deduplicate
+CORE_TICKERS = sorted(list(set(CORE_TICKERS)))
+BREADTH_BASKET = sorted(list(set(BREADTH_BASKET)))
 
-def forward_min_return(series: pd.Series, fwd: int) -> pd.Series:
-    # For each day t: min(close[t+1..t+fwd]) / close[t] - 1
-    s = series.dropna()
-    if s.empty:
-        return pd.Series(dtype=float)
-    arr = s.values
-    out = np.full_like(arr, np.nan, dtype=float)
-    for i in range(len(arr)):
-        j = min(len(arr), i + fwd + 1)
-        if i + 1 >= j:
-            continue
-        mn = np.nanmin(arr[i+1:j])
-        out[i] = (mn / arr[i]) - 1.0
-    return pd.Series(out, index=s.index)
+# Composite components: (name -> config)
+# invert=True means "higher = worse" (risk-off)
+COMPONENTS = {
+    # Stress / carry
+    "SPXS:SVOL (Stress/Carry)": {"type": "ratio", "a": "SPXS", "b": "SVOL", "invert": False, "weight": 0.22},
 
-def local_peaks(series: pd.Series, window: int = 10, min_drop_pct: float = 1.5) -> pd.Series:
-    # Peak if it's the max in +/- window and the subsequent window sees at least min_drop_pct drawdown
-    s = series.dropna()
-    if len(s) < (2 * window + 5):
-        return pd.Series(False, index=series.index)
-    peaks = pd.Series(False, index=s.index)
+    # Vol confirmation (late confirmation)
+    "SPY:VXX (Vol Confirm)": {"type": "ratio", "a": "SPY", "b": "VXX", "invert": True, "weight": 0.10},
 
-    for i in range(window, len(s) - window):
-        seg = s.iloc[i-window:i+window+1]
-        if s.iloc[i] != seg.max():
-            continue
-        # require a drop after peak within next window
-        future = s.iloc[i+1:i+window+1]
-        if future.empty:
-            continue
-        dd = (future.min() / s.iloc[i] - 1.0) * 100.0
-        if dd <= -min_drop_pct:
-            peaks.iloc[i] = True
-    return peaks.reindex(series.index, fill_value=False)
+    # Credit gate
+    "HYG:SHY (Credit)": {"type": "ratio", "a": "HYG", "b": "SHY", "invert": False, "weight": 0.18},
 
-# ---------------------------
-# DOWNLOAD RATIO DATA
-# ---------------------------
-closes_ratio = download_closes(ratio_tickers, period=period, interval=interval)
-if closes_ratio.empty:
-    st.error("Could not download price data from Yahoo. Try rebooting or changing window.")
+    # Leadership clusters
+    "SMH:SPY (Semis Leadership)": {"type": "ratio", "a": "SMH", "b": "SPY", "invert": False, "weight": 0.15},
+    "XLF:SPY (Financials Leadership)": {"type": "ratio", "a": "XLF", "b": "SPY", "invert": False, "weight": 0.10},
+
+    # Concentration / equal-weight
+    "RSP:SPY (Equal-Weight Breadth)": {"type": "ratio", "a": "RSP", "b": "SPY", "invert": False, "weight": 0.10},
+
+    # Cyclical context (light weight, supportive)
+    "IWM:SPY (Small Caps)": {"type": "ratio", "a": "IWM", "b": "SPY", "invert": False, "weight": 0.08},
+    "XLY:SPY (Discretionary)": {"type": "ratio", "a": "XLY", "b": "SPY", "invert": False, "weight": 0.07},
+}
+
+# Normalize weights to sum 1
+w_sum = sum(cfg["weight"] for cfg in COMPONENTS.values())
+for k in COMPONENTS:
+    COMPONENTS[k]["weight"] = COMPONENTS[k]["weight"] / w_sum
+
+# =========================
+# UI (locked)
+# =========================
+st.title("Robust Market Regime Dashboard (Locked Model)")
+st.caption(
+    "Daily | 5y | MACD(24,52,18) + TSI(40,20,10) + Stoch(14,3,3) | Composite + Confidence + Action"
+)
+
+# =========================
+# LOAD DATA
+# =========================
+period = f"{LOOKBACK_YEARS}y"
+tickers_needed = sorted(list(set(CORE_TICKERS + BREADTH_BASKET)))
+
+with st.spinner("Downloading market data (yfinance)..."):
+    close_df = fetch_prices(tickers_needed, period=period, interval=INTERVAL)
+
+if close_df.shape[0] < MIN_BARS or "SPY" not in close_df.columns:
+    st.error("Not enough data loaded or SPY missing. Try again later.")
     st.stop()
 
-# ---------------------------
-# BUILD DAILY SCORE SERIES PER COMPONENT
-# ---------------------------
-hist = pd.DataFrame(index=closes_ratio.index)
-component_latest = []
+# Align & forward-fill small gaps
+close_df = close_df.sort_index().ffill().dropna(how="all")
 
-for c in COMPONENTS:
-    a, b = c["a"], c["b"]
-    if a not in closes_ratio.columns or b not in closes_ratio.columns:
+# =========================
+# BUILD COMPONENT SERIES + SCORES
+# =========================
+component_rows = []
+score_series_map = {}
+latest_weighted_sum = 0.0
+weight_total = 0.0
+
+for name, cfg in COMPONENTS.items():
+    a = cfg["a"]
+    b = cfg["b"]
+
+    if a not in close_df.columns or b not in close_df.columns:
         continue
 
-    ratio = safe_ratio(closes_ratio[a], closes_ratio[b])
-    if ratio.empty or len(ratio) < 250:
-        continue
+    s = ratio(close_df[a], close_df[b]).dropna()
+    sc = series_score(s, invert=cfg["invert"])
+    sc = sc.reindex(close_df.index)
 
-    macd_line = ta.macd(ratio, fast=24, slow=52, signal=18).iloc[:, 0]
-    tsi_df = ta.tsi(ratio, long=tsi_long, short=tsi_short, signal=tsi_signal)
-    tsi_line = tsi_df.iloc[:, 0] if isinstance(tsi_df, pd.DataFrame) else tsi_df
+    # Weighted contribution (latest)
+    latest_sc = safe_last(sc)
+    weighted = latest_sc * cfg["weight"] if not np.isnan(latest_sc) else np.nan
 
-    stoch_k = canary_stoch(ratio, length=stoch_len)
-    cci = proxy_cci(ratio, length=100)
-
-    macd_sign = rolling_confirm_sign(macd_line, days=confirm_days)
-    tsi_sign = rolling_confirm_sign(tsi_line, days=confirm_days)
-
-    stoch_zone = pd.Series(0.0, index=ratio.index)
-    stoch_zone[stoch_k <= 20] = +0.5
-    stoch_zone[stoch_k >= 80] = -0.5
-
-    cci_zone = pd.Series(0.0, index=ratio.index)
-    cci_zone[cci >= 100] = +0.5
-    cci_zone[cci <= -100] = -0.5
-
-    score = 0.4 * macd_sign + 0.4 * tsi_sign + 0.1 * stoch_zone + 0.1 * cci_zone
-    score = score.reindex(hist.index)
-
-    if c["invert"]:
-        score = -score
-
-    hist[c["name"]] = score
-
-    # Latest detail snapshot
-    last_score = float(score.dropna().iloc[-1]) if score.dropna().shape[0] else np.nan
-    component_latest.append({
-        "Component": c["name"],
-        "Ratio": f"{a}:{b}",
-        "Weight": round(c["weight"], 3),
-        "Latest Score": round(last_score, 3) if pd.notna(last_score) else np.nan,
-        "Weighted": round(last_score * c["weight"], 3) if pd.notna(last_score) else np.nan
+    score_series_map[name] = sc
+    component_rows.append({
+        "Component": name,
+        "Weight": round(cfg["weight"], 3),
+        "Latest Score (-1..+1)": None if np.isnan(latest_sc) else round(latest_sc, 2),
+        "Weighted": None if np.isnan(weighted) else round(weighted, 2),
     })
 
-# Composite (ratios-only history)
-hist["Composite (ratios)"] = 0.0
-for c in COMPONENTS:
-    if c["name"] in hist.columns:
-        hist["Composite (ratios)"] += hist[c["name"]] * c["weight"]
+# Composite score as weighted average of component scores
+scores_df = pd.DataFrame(score_series_map)
+# Weighted composite time series
+weights = pd.Series({k: COMPONENTS[k]["weight"] for k in score_series_map.keys()})
+composite = (scores_df * weights).sum(axis=1) / weights.sum()
+composite = composite.clip(-1, 1)
 
-composite_series = hist["Composite (ratios)"].dropna()
+composite_level = safe_last(composite)
+composite_trend = safe_last(composite - composite.shift(TREND_LOOKBACK_DAYS))
 
-# ---------------------------
-# OPTIONAL: LATEST BREADTH (single-point, not full history)
-# ---------------------------
-breadth_score = np.nan
-breadth_metrics = {}
-if use_breadth:
-    closes_b = download_closes(breadth_tickers, period=period, interval=interval)
-    if not closes_b.empty and len(closes_b) >= 220:
-        sma50 = closes_b.rolling(50).mean()
-        sma200 = closes_b.rolling(200).mean()
+# =========================
+# BREADTH BLOCK (approximate breadth using your basket)
+# =========================
+basket_cols = [c for c in BREADTH_BASKET if c in close_df.columns]
+basket = close_df[basket_cols].dropna(how="all").ffill()
 
-        latest = closes_b.iloc[-1]
-        above50 = (latest > sma50.iloc[-1]).mean() * 100
-        above200 = (latest > sma200.iloc[-1]).mean() * 100
-        above_both = ((latest > sma50.iloc[-1]) & (latest > sma200.iloc[-1])).mean() * 100
+pct_50 = pct_above_ma(basket, 50)
+pct_150 = pct_above_ma(basket, 150)
+pct_200 = pct_above_ma(basket, 200)
+adl = adv_decl_line(basket)
+nhnl = nh_nl(basket, 252)
 
-        def pct_to_score(p):
-            return float(np.clip((p - 50) / 10, -1, 1))
+# Breadth confirmation: improving over 10d
+breadth_flags = {
+    "%>50DMA improving": safe_last(pct_50 - pct_50.shift(TREND_LOOKBACK_DAYS)) > 0,
+    "%>150DMA improving": safe_last(pct_150 - pct_150.shift(TREND_LOOKBACK_DAYS)) > 0,
+    "%>200DMA improving": safe_last(pct_200 - pct_200.shift(TREND_LOOKBACK_DAYS)) > 0,
+    "A/D Line improving": safe_last(adl - adl.shift(TREND_LOOKBACK_DAYS)) > 0,
+    "NH-NL improving": safe_last(nhnl - nhnl.shift(TREND_LOOKBACK_DAYS)) > 0,
+}
+breadth_confirm = 100.0 * (sum(bool(v) for v in breadth_flags.values()) / len(breadth_flags))
 
-        breadth_score = 0.4 * pct_to_score(above200) + 0.4 * pct_to_score(above50) + 0.2 * pct_to_score(above_both)
-        breadth_metrics = {"%>50DMA": above50, "%>200DMA": above200, "%>50&200": above_both, "n": int(closes_b.shape[1])}
+# =========================
+# CONFIDENCE SCORE (agreement + breadth + trend stability)
+# =========================
+# Agreement: component direction matches composite direction
+comp_dir = 1 if composite_level > 0 else -1
+agree = 0
+total = 0
+trend_agree = 0
+trend_total = 0
 
-# Latest composite incl breadth (single point)
-latest_level = float(composite_series.iloc[-1]) if not composite_series.empty else np.nan
-if pd.notna(breadth_score):
-    latest_level = float(latest_level + breadth_score * w_breadth)
+for nm, sc in score_series_map.items():
+    latest = safe_last(sc)
+    if np.isnan(latest):
+        continue
+    total += 1
+    if (latest > 0 and comp_dir == 1) or (latest < 0 and comp_dir == -1):
+        agree += 1
 
-# Trend metric (based on ratios-only history to keep it stable)
-trend_series = composite_series - composite_series.shift(trend_lookback)
-latest_trend = float(trend_series.dropna().iloc[-1]) if trend_series.dropna().shape[0] else np.nan
+    # Trend stability: component improving in same direction as composite trend sign
+    d = safe_last(sc - sc.shift(TREND_LOOKBACK_DAYS))
+    if not np.isnan(d):
+        trend_total += 1
+        if (composite_trend >= 0 and d >= 0) or (composite_trend < 0 and d < 0):
+            trend_agree += 1
 
-label = regime_label(latest_level, latest_trend) if pd.notna(latest_level) and pd.notna(latest_trend) else "—"
+agreement_score = 100.0 * (agree / total) if total else np.nan
+trend_stability = 100.0 * (trend_agree / trend_total) if trend_total else np.nan
 
-alert = "—"
-if pd.notna(latest_level):
-    if latest_level <= risk_off_th:
-        alert = "🚨 RISK-OFF ALERT: defensive posture favored"
-    elif latest_level >= risk_on_th:
-        alert = "✅ RISK-ON / HEALING: risk appetite improving"
+# Final confidence (fixed weights)
+confidence = 0.4 * agreement_score + 0.3 * breadth_confirm + 0.3 * trend_stability
+confidence_score = float(confidence) if not np.isnan(confidence) else np.nan
+
+# =========================
+# GATES for ACTION (credit + stress)
+# =========================
+def gate_supportive(series: pd.Series) -> bool:
+    s = series.dropna()
+    if s.shape[0] < MIN_BARS:
+        return False
+    mh = macd_hist(s, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    t, _ = tsi(s, TSI_LONG, TSI_SHORT, TSI_SIGNAL)
+    return (safe_last(mh) > 0) and (safe_last(t) > 0)
+
+# Credit gate: HYG/SHY supportive?
+credit_series = ratio(close_df["HYG"], close_df["SHY"])
+credit_gate = gate_supportive(credit_series)
+
+# Stress gate: SPXS/SVOL NOT expanding? (we want stress to be weakening, so supportive means inverted)
+stress_series = ratio(close_df["SPXS"], close_df["SVOL"])
+# supportive when MACD hist < 0 and TSI < 0 (stress fading)
+stress_gate = (safe_last(macd_hist(stress_series.dropna(), MACD_FAST, MACD_SLOW, MACD_SIGNAL)) < 0) and \
+              (safe_last(tsi(stress_series.dropna(), TSI_LONG, TSI_SHORT, TSI_SIGNAL)[0]) < 0)
+
+# =========================
+# ACTION SIGNAL
+# =========================
+action = "HOLD / NEUTRAL"
+action_color = "gray"
+
+if (composite_level > BUY_LEVEL_TH and composite_trend > 0 and confidence_score >= CONF_TH
+    and credit_gate and stress_gate):
+    action = "BUY (Long SPY)"
+    action_color = "green"
+
+elif (composite_level < SELL_LEVEL_TH and composite_trend < 0 and confidence_score >= CONF_TH
+      and (not stress_gate) and (not credit_gate)):
+    action = "SELL / SHORT (Short SPY)"
+    action_color = "red"
+
+# Regime label (your 4-state grid)
+label = "Transition / Mixed"
+emoji = "⚪"
+
+if composite_level >= 0:
+    if composite_trend >= 0:
+        label, emoji = "Healing + improving", "✅"
     else:
-        alert = "⚠️ TRANSITION: mixed signals (watch confirmations)"
-
-# ---------------------------
-# PROBABILITY: SPY ≥5% drawdown within next N days (state-conditioned)
-# ---------------------------
-spy_close = download_closes(["SPY"], period=period, interval=interval)["SPY"].dropna()
-spy_fwd_min = forward_min_return(spy_close, fwd=fwd_days) * 100.0  # in %
-event = (spy_fwd_min <= dd_threshold)  # True if future min drawdown <= threshold
-
-# Create historical "state" from composite level + trend sign
-if not composite_series.empty:
-    comp_hist = composite_series.reindex(spy_close.index).dropna()
-    trend_hist = (comp_hist - comp_hist.shift(trend_lookback)).dropna()
-    aligned = pd.DataFrame({
-        "comp": comp_hist,
-        "trend": trend_hist,
-        "event": event.reindex(comp_hist.index)
-    }).dropna()
-
-    if aligned.empty or aligned["event"].isna().all():
-        prob_next = np.nan
-        prob_note = "Not enough aligned history to compute probability."
-    else:
-        # Quantile bin for composite level
-        try:
-            aligned["bin"] = pd.qcut(aligned["comp"], q=state_bins, duplicates="drop")
-        except Exception:
-            aligned["bin"] = pd.cut(aligned["comp"], bins=state_bins)
-
-        aligned["trend_sign"] = np.where(aligned["trend"] >= 0, "up", "down")
-
-        # Current state
-        cur_comp = float(comp_hist.iloc[-1])
-        cur_trend_sign = "up" if latest_trend >= 0 else "down"
-
-        # Find matching bin for current level
-        cur_bin = None
-        for b in aligned["bin"].cat.categories if hasattr(aligned["bin"], "cat") else sorted(aligned["bin"].dropna().unique()):
-            if pd.notna(b):
-                if hasattr(b, "left") and hasattr(b, "right"):
-                    if (cur_comp >= b.left) and (cur_comp <= b.right):
-                        cur_bin = b
-                        break
-        if cur_bin is None:
-            # fallback: nearest by comp percentile
-            cur_bin = aligned["bin"].iloc[-1]
-
-        subset = aligned[(aligned["bin"] == cur_bin) & (aligned["trend_sign"] == cur_trend_sign)]
-        if subset.shape[0] < 30:
-            # broaden: ignore trend_sign if too few samples
-            subset = aligned[(aligned["bin"] == cur_bin)]
-
-        prob_next = float(subset["event"].mean()) if subset.shape[0] else np.nan
-        prob_note = f"State samples used: {subset.shape[0]} (bin + trend condition; broadened if sparse)"
+        label, emoji = "Healing but deteriorating", "⚠️"
 else:
-    prob_next = np.nan
-    prob_note = "No composite history."
-
-# ---------------------------
-# CANARY DIAL
-# ---------------------------
-dial_value = canary_dial(latest_level) if pd.notna(latest_level) else 50
-
-# ---------------------------
-# PEAK MARKERS (overlay)
-# ---------------------------
-spy_100 = rebase_100(spy_close)
-comp_100 = z_to_100(composite_series)
-
-spy_peaks = local_peaks(spy_100, window=peak_window, min_drop_pct=peak_min_move)
-comp_peaks = local_peaks(comp_100, window=peak_window, min_drop_pct=peak_min_move)
-
-# ---------------------------
-# TOP SUMMARY
-# ---------------------------
-c1, c2, c3, c4 = st.columns([1.2, 1.0, 1.0, 1.2])
-
-with c1:
-    st.subheader("🧠 Composite Level + Trend")
-    st.metric("Level (latest)", f"{latest_level:.2f}" if pd.notna(latest_level) else "—")
-    st.metric(f"Trend ({trend_lookback}d change)", f"{latest_trend:+.2f}" if pd.notna(latest_trend) else "—")
-    st.write(f"**Label:** {label}")
-    st.write(f"**Alert:** {alert}")
-    st.caption(f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-with c2:
-    st.subheader("🎛️ Canary Score Dial")
-    st.progress(dial_value / 100.0, text=f"{dial_value}/100 (0=risk-off, 100=risk-on)")
-    st.caption("This is a stabilized single-number proxy for regime. Use trend + components for timing.")
-
-with c3:
-    st.subheader("📉 Next move probability")
-    if pd.notna(prob_next):
-        st.metric(f"P(SPY drawdown ≤ {dd_threshold:.1f}% in next {fwd_days}d)", f"{prob_next*100:.1f}%")
+    if composite_trend >= 0:
+        label, emoji = "Risk-off but improving (bottoming)", "✅"
     else:
-        st.metric("Probability", "—")
-    st.caption(prob_note)
+        label, emoji = "Risk-off and deteriorating", "🚨"
 
-with c4:
-    st.subheader("🧪 Breadth (latest)")
-    if use_breadth and breadth_metrics:
-        st.metric("% above 50DMA", f"{breadth_metrics['%>50DMA']:.1f}%")
-        st.metric("% above 200DMA", f"{breadth_metrics['%>200DMA']:.1f}%")
-        st.metric("% above 50&200", f"{breadth_metrics['%>50&200']:.1f}%")
-        st.write(f"**Breadth score:** {breadth_score:.2f}")
-        st.caption(f"Basket: {breadth_metrics['n']} tickers")
-    else:
-        st.info("Breadth off or unavailable.")
+# =========================
+# DISPLAY TOP METRICS
+# =========================
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Composite Level (latest)", f"{composite_level:.2f}")
+c2.metric("Composite Trend (10d Δ)", f"{composite_trend:.2f}")
+c3.metric("Confidence Score", f"{confidence_score:.0f}")
+c4.metric("Regime Label", f"{label} {emoji}")
 
-st.divider()
+st.markdown(
+    f"<div style='padding:14px;border-radius:12px;border:1px solid #ddd;'>"
+    f"<span style='font-size:22px;font-weight:800;color:{action_color};'>{action}</span>"
+    f"<div style='margin-top:6px;color:#666;'>"
+    f"Credit gate={'ON' if credit_gate else 'OFF'} | Stress gate={'ON' if stress_gate else 'OFF'}"
+    f"</div></div>",
+    unsafe_allow_html=True
+)
 
-# ---------------------------
-# COMPONENT TABLE
-# ---------------------------
-st.subheader("📦 Component Health (latest)")
-if component_latest:
-    st.dataframe(pd.DataFrame(component_latest).sort_values("Weighted", ascending=False), use_container_width=True)
-else:
-    st.warning("No component scores computed (check tickers/data availability).")
+# =========================
+# CHART: Composite + SPY overlay (normalized)
+# =========================
+spy_norm = normalize_to_100(close_df["SPY"])
+comp_norm = normalize_to_100(composite + 2.0)  # shift up to avoid negative values; then normalize
 
-# ---------------------------
-# CHART 1: RAW COMPOSITE HISTORY
-# ---------------------------
-st.subheader("📈 Composite History (raw, ratios-only)")
-st.caption("Daily composite regime score built from ratio canaries (full history, not capped).")
-if composite_series.empty:
-    st.warning("Composite series is empty.")
-else:
-    st.line_chart(composite_series.to_frame("Composite (ratios)"), use_container_width=True)
-
-# ---------------------------
-# CHART 2: OVERLAY COMPOSITE vs SPY + PEAK MARKERS
-# ---------------------------
-st.subheader("🧪 Predictiveness overlay: Composite vs SPY (rebased) + peak markers")
-st.caption("SPY rebased to 100. Composite mapped to ~100-scale (z-to-100). Markers show local peaks that preceded meaningful drops.")
-
-df_overlay = pd.DataFrame({
-    "SPY_100": spy_100,
-    "Composite_100": comp_100
+plot_df = pd.DataFrame({
+    "Date": close_df.index,
+    "SPY (Normalized)": spy_norm.values,
+    "Composite (Normalized)": comp_norm.reindex(close_df.index).values,
 }).dropna()
 
-if df_overlay.empty:
-    st.warning("Not enough aligned history for overlay.")
-else:
-    base = df_overlay.reset_index().rename(columns={"index": "Date"})
+base = alt.Chart(plot_df).encode(x="Date:T")
 
-    line = (
-        alt.Chart(base)
-        .transform_fold(["SPY_100", "Composite_100"], as_=["Series", "Value"])
-        .mark_line()
-        .encode(
-            x=alt.X("Date:T", title="Date"),
-            y=alt.Y("Value:Q", title="Comparable scale (around 100)"),
-            color=alt.Color("Series:N"),
-            tooltip=["Date:T", "Series:N", alt.Tooltip("Value:Q", format=".2f")]
-        )
-        .properties(height=420)
-        .interactive()
+line_spy = base.mark_line().encode(y=alt.Y("SPY (Normalized):Q", title="Normalized (base=100)"))
+line_comp = base.mark_line(strokeDash=[6, 3]).encode(y=alt.Y("Composite (Normalized):Q"))
+
+st.subheader("5-Year Overlay: Composite vs SPY (Normalized)")
+st.altair_chart((line_spy + line_comp).interactive(), use_container_width=True)
+
+# =========================
+# COMPONENT TABLE
+# =========================
+st.subheader("Components (Latest Contribution)")
+comp_table = pd.DataFrame(component_rows).sort_values("Weight", ascending=False)
+st.dataframe(comp_table, use_container_width=True)
+
+# =========================
+# BREADTH PANEL
+# =========================
+st.subheader("Breadth Health (Basket Proxies)")
+b1, b2, b3, b4, b5 = st.columns(5)
+b1.metric("% > 50DMA", f"{safe_last(pct_50):.0f}%")
+b2.metric("% > 150DMA", f"{safe_last(pct_150):.0f}%")
+b3.metric("% > 200DMA", f"{safe_last(pct_200):.0f}%")
+b4.metric("NH − NL (52w)", f"{safe_last(nhnl):.0f}")
+b5.metric("Breadth Confirm", f"{breadth_confirm:.0f}")
+
+flags_df = pd.DataFrame({
+    "Breadth Check": list(breadth_flags.keys()),
+    "Improving (10d)": [bool(v) for v in breadth_flags.values()]
+})
+st.dataframe(flags_df, use_container_width=True)
+
+# =========================
+# NOTES
+# =========================
+with st.expander("What this model is (and is not)"):
+    st.write(
+        """
+        - This is a *locked* regime model: it does not optimize parameters.
+        - It blends stress, credit, leadership, and breadth into a single composite score.
+        - Confidence measures agreement + breadth confirmation + stability.
+        - Action (BUY/SELL/HOLD) is gated to reduce whipsaws.
+        """
     )
-
-    # Peak points
-    spy_pk_df = pd.DataFrame({
-        "Date": spy_peaks[spy_peaks].index,
-        "Value": spy_100.reindex(spy_peaks[spy_peaks].index).values,
-        "Peak": "SPY Peak"
-    })
-    comp_pk_df = pd.DataFrame({
-        "Date": comp_peaks[comp_peaks].index,
-        "Value": comp_100.reindex(comp_peaks[comp_peaks].index).values,
-        "Peak": "Composite Peak"
-    })
-    peaks_df = pd.concat([spy_pk_df, comp_pk_df], ignore_index=True)
-
-    if not peaks_df.empty:
-        peaks = (
-            alt.Chart(peaks_df)
-            .mark_point(filled=True, size=70)
-            .encode(
-                x="Date:T",
-                y="Value:Q",
-                shape=alt.Shape("Peak:N"),
-                tooltip=["Date:T", "Peak:N", alt.Tooltip("Value:Q", format=".2f")]
-            )
-        )
-        st.altair_chart(line + peaks, use_container_width=True)
-    else:
-        st.altair_chart(line, use_container_width=True)
-
-with st.expander("Show overlay data (last 60 rows)"):
-    st.dataframe(df_overlay.tail(60), use_container_width=True)
