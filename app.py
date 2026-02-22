@@ -6,130 +6,163 @@ import pandas_ta as ta
 from datetime import datetime
 
 # ---------------- CONFIG ----------------
-st.set_page_config(
-    page_title="Market Regime Dashboard",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Market Regime Dashboard", layout="wide")
 st.title("📊 Market Regime Dashboard")
-st.caption("Composite regime score based on stress, credit, leadership, financials, and breadth proxies")
+st.caption("Composite regime score based on ratios: stress, credit, leadership, financials, cyclicals")
 
 # ---------------- DATA HELPERS ----------------
 @st.cache_data(ttl=3600)
-def get_price(symbol, period="2y"):
+def get_close(symbol: str, period: str = "2y") -> pd.Series:
     df = yf.download(symbol, period=period, auto_adjust=True, progress=False)
-    return df["Close"].dropna()
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    s = df["Close"].dropna()
+    s.name = symbol
+    return s
 
 @st.cache_data(ttl=3600)
-def get_ratio(a, b, period="2y"):
-    s1 = get_price(a, period)
-    s2 = get_price(b, period)
+def get_ratio(a: str, b: str, period: str = "2y") -> pd.Series:
+    s1 = get_close(a, period)
+    s2 = get_close(b, period)
     df = pd.concat([s1, s2], axis=1).dropna()
-    return df.iloc[:,0] / df.iloc[:,1]
+    if df.empty:
+        return pd.Series(dtype=float)
+    r = (df.iloc[:, 0] / df.iloc[:, 1]).dropna()
+    r.name = f"{a}:{b}"
+    return r
 
-def score_series(series, invert=False):
+# ---------------- INDICATORS (ratio-safe) ----------------
+def proxy_cci(x: pd.Series, length: int = 100) -> pd.Series:
+    """
+    CCI-like oscillator for a single series (ratios, spreads, indexes).
+    Uses standard CCI formula where x acts like 'typical price'.
+    """
+    x = x.dropna()
+    sma = x.rolling(length).mean()
+    mad = (x - sma).abs().rolling(length).mean()
+    cci = (x - sma) / (0.015 * mad)
+    return cci
+
+def score_series(series: pd.Series, invert: bool = False) -> pd.Series:
+    """
+    Score in {-1, -0.5, 0, +0.5, +1} from MACD(24,52,18) + Proxy CCI(100)
+    Works on a single ratio series.
+    """
+    series = series.dropna()
+    if len(series) < 120:
+        return pd.Series(dtype=float)
+
     macd = ta.macd(series, fast=24, slow=52, signal=18)
-    cci = ta.cci(series, length=100)
+    cci = proxy_cci(series, length=100)
 
     sc = pd.Series(0.0, index=series.index)
-    sc[(macd.iloc[:,0] > 0) & (cci > 0)] = 0.5
-    sc[(macd.iloc[:,0] > 0) & (cci > 100)] = 1.0
-    sc[(macd.iloc[:,0] < 0) & (cci < 0)] = -0.5
-    sc[(macd.iloc[:,0] < 0) & (cci < -100)] = -1.0
+
+    # Align
+    macd_line = macd.iloc[:, 0].reindex(sc.index)
+    cci = cci.reindex(sc.index)
+
+    # Scoring rules
+    sc[(macd_line > 0) & (cci > 0)] = 0.5
+    sc[(macd_line > 0) & (cci > 100)] = 1.0
+    sc[(macd_line < 0) & (cci < 0)] = -0.5
+    sc[(macd_line < 0) & (cci < -100)] = -1.0
 
     if invert:
         sc *= -1
 
     return sc.dropna()
 
-def label_state(score):
-    if score <= -0.5:
+def label_regime(x: float) -> str:
+    if x <= -0.50:
         return "🟥 Risk-Off"
-    elif score <= -0.15:
+    if x <= -0.15:
         return "🟧 Deteriorating"
-    elif score < 0.15:
+    if x < 0.15:
         return "🟨 Transition"
-    elif score < 0.5:
+    if x < 0.50:
         return "🟩 Healing"
-    else:
-        return "🟦 Risk-On"
+    return "🟦 Risk-On"
 
 # ---------------- COMPONENT DEFINITIONS ----------------
+# NOTE: invert=True means "higher ratio = worse" (stress).
 components = {
-    "Stress vs Carry (SPXS:SVOL)": {
-        "series": get_ratio("SPXS", "SVOL"),
-        "invert": True,
-        "weight": 0.25
-    },
-    "Credit Gate (HYG:SHY)": {
-        "series": get_ratio("HYG", "SHY"),
-        "invert": False,
-        "weight": 0.25
-    },
-    "Semis Leadership (SOXX:SPY)": {
-        "series": get_ratio("SOXX", "SPY"),
-        "invert": False,
-        "weight": 0.20
-    },
-    "Financials Lead (XLF:SPY)": {
-        "series": get_ratio("XLF", "SPY"),
-        "invert": False,
-        "weight": 0.20
-    },
-    "Housing / Cyclicals (ITB:SPY)": {
-        "series": get_ratio("ITB", "SPY"),
-        "invert": False,
-        "weight": 0.10
-    }
+    "Stress vs Carry (SPXS:SVOL)": {"series": get_ratio("SPXS", "SVOL"), "invert": True,  "weight": 0.25},
+    "Credit Gate (HYG:SHY)":       {"series": get_ratio("HYG",  "SHY"),  "invert": False, "weight": 0.25},
+    "Semis Leadership (SOXX:SPY)": {"series": get_ratio("SOXX", "SPY"),  "invert": False, "weight": 0.20},
+    "Financials Lead (XLF:SPY)":   {"series": get_ratio("XLF",  "SPY"),  "invert": False, "weight": 0.20},
+    "Housing/Cyclicals (ITB:SPY)": {"series": get_ratio("ITB",  "SPY"),  "invert": False, "weight": 0.10},
 }
 
-# ---------------- SCORE CALCULATION ----------------
+# ---------------- BUILD DASHBOARD ----------------
 rows = []
-composite_score = 0.0
+composite = 0.0
+any_missing = False
 
 for name, cfg in components.items():
-    sc_series = score_series(cfg["series"], invert=cfg["invert"])
-    latest = sc_series.iloc[-1]
-    weighted = latest * cfg["weight"]
-    composite_score += weighted
+    s = cfg["series"]
+    if s is None or s.empty:
+        any_missing = True
+        rows.append([name, np.nan, cfg["weight"], np.nan, "⚠️ Data missing"])
+        continue
 
-    rows.append([
-        name,
-        latest,
-        cfg["weight"],
-        weighted,
-        label_state(latest)
-    ])
+    sc = score_series(s, invert=cfg["invert"])
+    if sc.empty:
+        any_missing = True
+        rows.append([name, np.nan, cfg["weight"], np.nan, "⚠️ Not enough history"])
+        continue
 
-df = pd.DataFrame(
-    rows,
-    columns=["Component", "Score (-1..1)", "Weight", "Weighted Contribution", "State"]
-)
+    latest = float(sc.iloc[-1])
+    contrib = latest * cfg["weight"]
+    composite += contrib
 
-# ---------------- DISPLAY ----------------
+    rows.append([name, latest, cfg["weight"], contrib, label_regime(latest)])
+
+df = pd.DataFrame(rows, columns=["Component", "Score (-1..1)", "Weight", "Weighted Contribution", "State"])
+
+# ---------------- TOP SUMMARY ----------------
 st.subheader("🧠 Composite Regime Score")
-st.metric(
-    label="Current Regime",
-    value=label_state(composite_score),
-    delta=f"{composite_score:.2f}"
-)
+st.metric("Current Regime", label_regime(composite), f"{composite:.2f}")
+st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local time)")
 
-st.write("Last updated:", datetime.now().strftime("%Y-%m-%d %H:%M ET"))
+if any_missing:
+    st.warning("One or more components have missing/insufficient data. The composite may be incomplete until data loads.")
 
 st.subheader("📦 Component Breakdown")
 st.dataframe(df, use_container_width=True)
 
-# ---------------- TIME SERIES ----------------
+# ---------------- HISTORY ----------------
 st.subheader("📈 Composite Regime Score (Daily History)")
 
-hist = pd.DataFrame(index=list(components.values())[0]["series"].index)
+# Create a unified history index from available series
+valid_series = [cfg["series"] for cfg in components.values() if cfg["series"] is not None and not cfg["series"].empty]
+if len(valid_series) == 0:
+    st.error("No data could be downloaded from Yahoo Finance right now.")
+    st.stop()
+
+hist_index = valid_series[0].index
+for s in valid_series[1:]:
+    hist_index = hist_index.union(s.index)
+
+hist = pd.DataFrame(index=hist_index).sort_index()
 
 for name, cfg in components.items():
-    hist[name] = score_series(cfg["series"], invert=cfg["invert"])
+    s = cfg["series"]
+    if s is None or s.empty:
+        continue
+    sc = score_series(s, invert=cfg["invert"])
+    if sc.empty:
+        continue
+    hist[name] = sc.reindex(hist.index)
 
-hist["Composite"] = sum(
-    hist[name] * cfg["weight"]
-    for name, cfg in components.items()
-)
+# Composite history
+hist["Composite"] = 0.0
+for name, cfg in components.items():
+    if name in hist.columns:
+        hist["Composite"] += hist[name] * cfg["weight"]
+
+hist = hist.dropna(subset=["Composite"])
 
 st.line_chart(hist["Composite"])
+
+with st.expander("Show recent history table"):
+    st.dataframe(hist.tail(60), use_container_width=True)
