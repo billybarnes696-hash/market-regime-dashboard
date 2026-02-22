@@ -67,19 +67,38 @@ def close_only_cci(close: pd.Series, length=100):
 
 def indicator_pack(close: pd.Series) -> pd.DataFrame:
     close = close.dropna()
+    min_required = max(MACD_SLOW, TSI_R, STOCH_LEN, CCI_LEN) + 20
+    if len(close) < min_required:
+        return pd.DataFrame(columns=["macdh", "tsi", "stochk", "cci"])
+    
+    # MACD with error handling
     macd = ta.macd(close, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-    macdh = macd.iloc[:, 1]  # histogram
-    tsi = ta.tsi(close, fast=TSI_S, slow=TSI_R, signal=TSI_SIGNAL).iloc[:, 0]
+    if macd is None or macd.empty or len(macd.columns) < 2:
+        return pd.DataFrame(columns=["macdh", "tsi", "stochk", "cci"])
+    
+    # Find MACD histogram column (more robust than iloc)
+    macdh_col = [c for c in macd.columns if "MACDh" in c or "macdh" in c.lower() or "hist" in c.lower()]
+    if macdh_col:
+        macdh = macd[macdh_col[0]].rename("macdh")
+    else:
+        macdh = macd.iloc[:, 1].rename("macdh")
+    
+    # TSI
+    tsi = ta.tsi(close, fast=TSI_S, slow=TSI_R, signal=TSI_SIGNAL)
+    if tsi is None or tsi.empty:
+        return pd.DataFrame(columns=["macdh", "tsi", "stochk", "cci"])
+    tsi = tsi.iloc[:, 0].rename("tsi")  # TSI line (not signal)
+    
+    # Stoch & CCI (custom functions)
     stoch_k, _ = close_only_stoch(close, length=STOCH_LEN, smoothk=STOCH_SMOOTHK, smoothd=STOCH_SMOOTHD)
     cci = close_only_cci(close, length=CCI_LEN)
-
-    out = pd.concat(
-        [macdh.rename("macdh"), tsi.rename("tsi"), stoch_k.rename("stochk"), cci.rename("cci")],
-        axis=1
-    ).dropna()
+    
+    out = pd.concat([macdh, tsi, stoch_k.rename("stochk"), cci.rename("cci")], axis=1).dropna()
     return out
 
 def score_from_indicators(ind: pd.DataFrame) -> pd.Series:
+    if ind.empty:
+        return pd.Series(dtype=float)
     # +1 bull, -1 bear, else 0
     bull = (ind["macdh"] > 0) & (ind["tsi"] > 0) & (ind["stochk"] > 50) & (ind["cci"] > 0)
     bear = (ind["macdh"] < 0) & (ind["tsi"] < 0) & (ind["stochk"] < 50) & (ind["cci"] < 0)
@@ -89,12 +108,21 @@ def score_from_indicators(ind: pd.DataFrame) -> pd.Series:
     return sc
 
 def make_ratio(close_df: pd.DataFrame, num: str, den: str) -> pd.Series:
-    return (close_df[num] / close_df[den]).rename(f"{num}:{den}")
+    if num not in close_df.columns or den not in close_df.columns:
+        return pd.Series(dtype=float)
+    ratio = (close_df[num] / close_df[den]).replace([np.inf, -np.inf], np.nan)
+    return ratio.rename(f"{num}:{den}")
 
 def perf_stats(equity: pd.Series) -> dict:
     eq = equity.dropna()
     if len(eq) < 5:
-        return {}
+        return {
+            "Total Return": np.nan,
+            "CAGR": np.nan,
+            "Max Drawdown": np.nan,
+            "Ann. Vol": np.nan,
+            "Sharpe (rf=0)": np.nan
+        }
     rets = eq.pct_change().dropna()
     total_return = (eq.iloc[-1] / eq.iloc[0]) - 1.0
     years = (eq.index[-1] - eq.index[0]).days / 365.25
@@ -111,7 +139,7 @@ def perf_stats(equity: pd.Series) -> dict:
         "Sharpe (rf=0)": sharpe
     }
 
-def build_composite_scores(close: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series, pd.Series]:
+def build_composite_scores(close: pd.DataFrame) -> tuple:
     # Components + weights
     ratios = {
         "SPXS:SVOL (Stress/Carry)": {"series": make_ratio(close, "SPXS", "SVOL"), "invert": True,  "weight": 0.22},
@@ -129,18 +157,36 @@ def build_composite_scores(close: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series
     scores = {}
     for name, cfg in ratios.items():
         s = cfg["series"].dropna()
+        if s.empty:
+            continue  # skip if ratio has no data
         ind = indicator_pack(s)
+        if ind.empty:
+            continue  # skip if indicators can't be computed
         sc = score_from_indicators(ind)
+        if sc.empty:
+            continue
         if cfg["invert"]:
             sc = -sc
         scores[name] = sc
+
+    if not scores:
+        st.error("⚠️ No valid signals computed — check data range or indicator parameters.")
+        return pd.DataFrame(), pd.Series(), pd.Series(), pd.Series(), pd.Series()
 
     # Align to common index
     all_idx = None
     for sc in scores.values():
         all_idx = sc.index if all_idx is None else all_idx.intersection(sc.index)
 
+    if all_idx is None or len(all_idx) < 10:
+        st.error("⚠️ Insufficient overlapping data for composite calculation.")
+        return pd.DataFrame(), pd.Series(), pd.Series(), pd.Series(), pd.Series()
+
     scores_df = pd.DataFrame({k: v.loc[all_idx] for k, v in scores.items()}).dropna()
+
+    if scores_df.empty:
+        st.error("⚠️ Composite scores dataframe is empty after alignment.")
+        return pd.DataFrame(), pd.Series(), pd.Series(), pd.Series(), pd.Series()
 
     w = pd.Series({k: ratios[k]["weight"] for k in scores_df.columns})
     w = w / w.sum()
@@ -154,8 +200,8 @@ def build_composite_scores(close: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series
     confidence = (0.6 * align + 0.4 * strength) * 100.0
 
     # Gates
-    credit_gate = (scores_df["HYG:SHY (Credit)"] > 0)
-    stress_gate = (scores_df["SPXS:SVOL (Stress/Carry)"] > 0)
+    credit_gate = (scores_df["HYG:SHY (Credit)"] > 0) if "HYG:SHY (Credit)" in scores_df.columns else pd.Series(False, index=composite.index)
+    stress_gate = (scores_df["SPXS:SVOL (Stress/Carry)"] > 0) if "SPXS:SVOL (Stress/Carry)" in scores_df.columns else pd.Series(False, index=composite.index)
 
     return scores_df, composite, confidence, credit_gate, stress_gate
 
@@ -173,6 +219,10 @@ def build_positions(composite, confidence, credit_gate, stress_gate,
         "credit": credit_gate.astype(int),
         "stress": stress_gate.astype(int),
     }).dropna()
+    
+    if df.empty:
+        return pd.DataFrame()
+    
     df["trend"] = df["comp"] - df["comp"].shift(trend_window)
     df = df.dropna()
 
@@ -205,6 +255,9 @@ def backtest_two_assets(price_spy, price_def, pos_spy, cost_bps=0.0, cash_mode=F
         "DEF": price_def.loc[idx] if (price_def is not None) else np.nan,
         "pos_spy": pos_spy.loc[idx],
     }).dropna(subset=["SPY", "pos_spy"]).copy()
+
+    if df.empty:
+        return pd.Series(dtype=float), 0
 
     spy_ret = df["SPY"].pct_change().fillna(0)
     if cash_mode:
@@ -247,14 +300,34 @@ TICKERS = [
     "HYG",
     "SMH", "SOXX", "XLF", "RSP", "IWM", "XLY",
 ]
-close = fetch_adjclose(TICKERS, years=years)
+
+with st.spinner("📥 Fetching market data..."):
+    close = fetch_adjclose(TICKERS, years=years)
+
+# Data validation
+missing_tickers = [t for t in TICKERS if t not in close.columns]
+if missing_tickers:
+    st.warning(f"⚠️ Missing data for: {', '.join(missing_tickers)}. Some components may be skipped.")
+
+if close.empty:
+    st.error("❌ No data retrieved. Please check your internet connection or try a shorter history.")
+    st.stop()
 
 # Composite
-scores_df, composite, confidence, credit_gate, stress_gate = build_composite_scores(close)
+with st.spinner("🔧 Building composite signals..."):
+    scores_df, composite, confidence, credit_gate, stress_gate = build_composite_scores(close)
+
+if composite.empty:
+    st.error("❌ Failed to build composite signals. Try increasing history or checking ticker availability.")
+    st.stop()
 
 # Positions
 pos_df = build_positions(composite, confidence, credit_gate, stress_gate,
                          buy_thr=buy_thr, sell_thr=sell_thr, conf_thr=conf_thr, trend_window=trend_window)
+
+if pos_df.empty:
+    st.error("❌ Failed to build positions. Check your threshold settings.")
+    st.stop()
 
 # Latest metrics
 latest = pos_df.iloc[-1]
@@ -278,12 +351,12 @@ st.info(f"**{action}**")
 
 # Backtests (3 allocations)
 spy = close["SPY"].dropna()
-shy = close["SHY"].dropna()
-agg = close["AGG"].dropna()
+shy = close["SHY"].dropna() if "SHY" in close.columns else None
+agg = close["AGG"].dropna() if "AGG" in close.columns else None
 
 eq_cash, trades_cash = backtest_two_assets(spy, None, pos_df["pos_spy"], cost_bps=cost_bps, cash_mode=True)
-eq_shy, trades_shy   = backtest_two_assets(spy, shy,  pos_df["pos_spy"], cost_bps=cost_bps, cash_mode=False)
-eq_agg, trades_agg   = backtest_two_assets(spy, agg,  pos_df["pos_spy"], cost_bps=cost_bps, cash_mode=False)
+eq_shy, trades_shy   = backtest_two_assets(spy, shy,  pos_df["pos_spy"], cost_bps=cost_bps, cash_mode=False) if shy is not None else (pd.Series(dtype=float), 0)
+eq_agg, trades_agg   = backtest_two_assets(spy, agg,  pos_df["pos_spy"], cost_bps=cost_bps, cash_mode=False) if agg is not None else (pd.Series(dtype=float), 0)
 
 # Buy & hold SPY baseline
 idx = spy.index.intersection(pos_df.index)
@@ -297,47 +370,65 @@ for name, eq, trades in [
     ("Strategy: SPY/AGG",  eq_agg,  trades_agg),
     ("Buy&Hold: SPY",      bh,      0),
 ]:
+    if eq.empty:
+        continue
     s = perf_stats(eq)
     stats_rows.append({
         "Portfolio": name,
-        "Total Return %": round(s["Total Return"] * 100, 1),
-        "CAGR %": round(s["CAGR"] * 100, 2),
-        "Max DD %": round(s["Max Drawdown"] * 100, 1),
-        "Ann Vol %": round(s["Ann. Vol"] * 100, 1),
-        "Sharpe (rf=0)": round(s["Sharpe (rf=0)"], 2),
+        "Total Return %": round(s["Total Return"] * 100, 1) if not np.isnan(s["Total Return"]) else "N/A",
+        "CAGR %": round(s["CAGR"] * 100, 2) if not np.isnan(s["CAGR"]) else "N/A",
+        "Max DD %": round(s["Max Drawdown"] * 100, 1) if not np.isnan(s["Max Drawdown"]) else "N/A",
+        "Ann Vol %": round(s["Ann. Vol"] * 100, 1) if not np.isnan(s["Ann. Vol"]) else "N/A",
+        "Sharpe (rf=0)": round(s["Sharpe (rf=0)"], 2) if not np.isnan(s["Sharpe (rf=0)"]) else "N/A",
         "Trades": int(trades),
     })
 
 st.subheader("Performance Comparison (same signal, 3 allocations)")
-st.dataframe(pd.DataFrame(stats_rows), use_container_width=True)
+if stats_rows:
+    st.dataframe(pd.DataFrame(stats_rows), use_container_width=True)
+else:
+    st.warning("⚠️ No performance data available.")
 
 # Equity curves
 st.subheader("Equity Curves (Normalized, $10k start)")
-fig = plt.figure()
-base = 10000
-plt.plot(eq_cash.index, eq_cash * base, label="SPY/CASH")
-plt.plot(eq_shy.index,  eq_shy  * base, label="SPY/SHY")
-plt.plot(eq_agg.index,  eq_agg  * base, label="SPY/AGG")
-plt.plot(bh.index,      bh      * base, label="Buy&Hold SPY")
-plt.xlabel("Date")
-plt.ylabel("Equity ($)")
-plt.legend()
-st.pyplot(fig)
+if not eq_cash.empty:
+    fig = plt.figure(figsize=(12, 6))
+    base = 10000
+    plt.plot(eq_cash.index, eq_cash * base, label="SPY/CASH", linewidth=2)
+    if not eq_shy.empty:
+        plt.plot(eq_shy.index,  eq_shy  * base, label="SPY/SHY", linewidth=2)
+    if not eq_agg.empty:
+        plt.plot(eq_agg.index,  eq_agg  * base, label="SPY/AGG", linewidth=2)
+    plt.plot(bh.index,      bh      * base, label="Buy&Hold SPY", linewidth=2, linestyle='--')
+    plt.xlabel("Date")
+    plt.ylabel("Equity ($)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    st.pyplot(fig)
+else:
+    st.warning("⚠️ No equity curve data available.")
 
 # Overlay: Composite vs SPY
 st.subheader("Overlay: Composite vs SPY (Normalized)")
-overlay = pd.DataFrame({
-    "Composite": normalize_100((pos_df["comp"] + 2.0).loc[idx]),  # shift for stability
-    "SPY": normalize_100(spy.loc[idx]),
-}).dropna()
+if len(idx) > 10:
+    overlay = pd.DataFrame({
+        "Composite": normalize_100((pos_df["comp"] + 2.0).loc[idx]),  # shift for stability
+        "SPY": normalize_100(spy.loc[idx]),
+    }).dropna()
 
-fig2 = plt.figure()
-plt.plot(overlay.index, overlay["Composite"], label="Composite (shifted+normalized)")
-plt.plot(overlay.index, overlay["SPY"], label="SPY (normalized)")
-plt.xlabel("Date")
-plt.ylabel("Normalized (base=100)")
-plt.legend()
-st.pyplot(fig2)
+    if not overlay.empty:
+        fig2 = plt.figure(figsize=(12, 6))
+        plt.plot(overlay.index, overlay["Composite"], label="Composite (shifted+normalized)", linewidth=2)
+        plt.plot(overlay.index, overlay["SPY"], label="SPY (normalized)", linewidth=2)
+        plt.xlabel("Date")
+        plt.ylabel("Normalized (base=100)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        st.pyplot(fig2)
+    else:
+        st.warning("⚠️ No overlay data available.")
+else:
+    st.warning("⚠️ Insufficient data for overlay chart.")
 
 # Components table
 st.subheader("Components (Latest)")
@@ -352,28 +443,46 @@ w = pd.Series({
     "IWM:SPY (Small caps)": 0.08,
     "XLY:SPY (Discretionary)": 0.06,
 })
-w = w / w.sum()
-rows = []
-for col in scores_df.columns:
-    rows.append({
-        "Component": col,
-        "Weight": float(w[col]),
-        "Latest Score (-1/0/+1)": float(scores_df[col].iloc[-1]),
-        "Weighted (latest)": float(scores_df[col].iloc[-1] * w[col]),
-    })
-st.dataframe(pd.DataFrame(rows).sort_values("Weight", ascending=False), use_container_width=True)
+# Filter weights to match available columns
+w = w[[c for c in w.index if c in scores_df.columns]] if not scores_df.empty else w
+w = w / w.sum() if not w.empty else w
+
+if not scores_df.empty:
+    rows = []
+    for col in scores_df.columns:
+        weight_val = float(w[col]) if col in w.index else 0.0
+        rows.append({
+            "Component": col,
+            "Weight": weight_val,
+            "Latest Score (-1/0/+1)": float(scores_df[col].iloc[-1]),
+            "Weighted (latest)": float(scores_df[col].iloc[-1] * weight_val),
+        })
+    st.dataframe(pd.DataFrame(rows).sort_values("Weight", ascending=False), use_container_width=True)
+else:
+    st.warning("⚠️ No component data available.")
 
 # Recent signals
 st.subheader("Recent Signals (last 120 bars)")
-tail = pos_df.tail(120).copy()
-tail_out = tail[["comp", "trend", "conf", "credit", "stress", "buy", "sell", "pos_spy"]].rename(columns={
-    "comp":"Composite",
-    "trend":"Composite Trend",
-    "conf":"Confidence",
-    "credit":"Credit Gate",
-    "stress":"Stress Gate",
-    "buy":"BUY Signal",
-    "sell":"SELL Signal",
-    "pos_spy":"Position (1=SPY,0=DEF)"
-})
-st.dataframe(tail_out, use_container_width=True)
+if len(pos_df) > 0:
+    tail = pos_df.tail(120).copy()
+    tail_out = tail[["comp", "trend", "conf", "credit", "stress", "buy", "sell", "pos_spy"]].rename(columns={
+        "comp":"Composite",
+        "trend":"Composite Trend",
+        "conf":"Confidence",
+        "credit":"Credit Gate",
+        "stress":"Stress Gate",
+        "buy":"BUY Signal",
+        "sell":"SELL Signal",
+        "pos_spy":"Position (1=SPY,0=DEF)"
+    })
+    st.dataframe(tail_out, use_container_width=True)
+else:
+    st.warning("⚠️ No signal history available.")
+
+# Data Diagnostics (optional, collapsible)
+with st.expander("🔍 Data Diagnostics"):
+    st.write("**Available tickers:**", list(close.columns))
+    st.write("**Date range:**", close.index.min(), "→", close.index.max())
+    st.write("**NaN counts per ticker:**", close.isna().sum().to_dict())
+    st.write("**Composite length:**", len(composite))
+    st.write("**Position length:**", len(pos_df))
