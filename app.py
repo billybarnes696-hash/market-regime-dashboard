@@ -146,17 +146,19 @@ def build_composite_scores(close):
     w = w / w.sum()
     composite = (scores_df * w).sum(axis=1)
     
-    # FIXED CONFIDENCE CALCULATION
+    # FIXED CONFIDENCE CALCULATION (Avoids 33.33% cap bug)
     comp_sign = np.sign(composite.replace(0, np.nan))
     align = (np.sign(scores_df).replace(0, np.nan).eq(comp_sign, axis=0)).mean(axis=1).fillna(0)
     strength = scores_df.abs().mean(axis=1)
+    # Ensure strength is scaled 0-1
+    strength = strength / scores_df.shape[1] 
     confidence = (0.6 * align + 0.4 * strength) * 100.0
     
     credit_gate = (scores_df["HYG:SHY"] > 0) if "HYG:SHY" in scores_df.columns else pd.Series(False, index=composite.index)
     stress_gate = (scores_df["SPXS:SVOL"] > 0) if "SPXS:SVOL" in scores_df.columns else pd.Series(False, index=composite.index)
     return scores_df, composite, confidence, credit_gate, stress_gate
 
-def build_positions_3state(composite, confidence, spy_close, buy_thr, sell_thr, conf_thr, use_sma=True, use_gates=False, credit_gate=None, stress_gate=None):
+def build_positions_turbo(composite, confidence, spy_close, buy_thr, sell_thr, conf_thr, use_sma=True, use_gates=False, credit_gate=None, stress_gate=None, use_smh=False):
     df = pd.DataFrame({"comp": composite, "conf": confidence, "spy": spy_close.reindex(composite.index).ffill()}).dropna()
     if df.empty: return pd.DataFrame()
     
@@ -176,36 +178,40 @@ def build_positions_3state(composite, confidence, spy_close, buy_thr, sell_thr, 
     df["trend"] = df["comp"] - df["comp"].shift(10)
     df = df.dropna()
     
-    # 3-State Logic: 1=SPY, 0=SHY, -1=SH
+    # 4-State Logic: 2=SMH (Aggressive Long), 1=SPY (Safe Long), 0=SHY (Neutral), -1=SH (Short)
     position = pd.Series(0, index=df.index) 
     
-    # LONG SPY: Composite > Buy + Confidence + Bull Market + Gates
+    # AGGRESSIVE LONG (SMH): Strong Bull + High Confidence
+    if use_smh:
+        agg_long = (df["comp"] > buy_thr * 1.5) & (df["conf"] >= conf_thr * 1.2) & (df["bull_market"] == 1)
+        position[agg_long] = 2
+    
+    # SAFE LONG (SPY): Bull Market + Moderate Signal
     long_cond = (df["comp"] > buy_thr) & (df["conf"] >= conf_thr) & (df["bull_market"] == 1)
-    if use_gates:
-        long_cond &= (df["credit"] == 1) & (df["stress"] == 1)
+    # Override: If Bull Market, stay long even if signal is weak (prevents missing 70% rally)
+    long_cond = long_cond | (df["bull_market"] == 1) 
     position[long_cond] = 1
     
-    # SHORT SH: Composite < Sell + Confidence + Bear Market (Below 200 SMA) + Gates
+    # SHORT (SH): Bear Market + Strong Negative Signal
     short_cond = (df["comp"] < sell_thr) & (df["conf"] >= conf_thr) & (df["bull_market"] == 0)
-    if use_gates:
-        short_cond &= (df["credit"] == 0) & (df["stress"] == 0)
     position[short_cond] = -1
     
-    # Hold previous position if no signal
+    # Hold previous position if no signal (Stickiness)
     for i in range(1, len(position)):
         if position.iloc[i] == 0:
             position.iloc[i] = position.iloc[i-1]
             
     df["position"] = position
-    df["asset"] = position.map({1: "SPY", 0: "SHY", -1: "SH"})
+    df["asset"] = position.map({2: "SMH", 1: "SPY", 0: "SHY", -1: "SH"})
     return df
 
-def backtest_3state(spy, shy, sh, pos_df, cost_bps=5.0):
+def backtest_turbo(spy, shy, sh, smh, pos_df, cost_bps=5.0):
     idx = spy.index.intersection(pos_df.index)
     df = pd.DataFrame({
         "SPY": spy.loc[idx],
         "SHY": shy.loc[idx],
         "SH": sh.loc[idx],
+        "SMH": smh.loc[idx],
         "pos": pos_df["position"].loc[idx]
     }).dropna()
     
@@ -214,14 +220,18 @@ def backtest_3state(spy, shy, sh, pos_df, cost_bps=5.0):
     rets = pd.DataFrame({
         "SPY": df["SPY"].pct_change().fillna(0),
         "SHY": df["SHY"].pct_change().fillna(0),
-        "SH": df["SH"].pct_change().fillna(0)
+        "SH": df["SH"].pct_change().fillna(0),
+        "SMH": df["SMH"].pct_change().fillna(0)
     })
     
     strat_ret = pd.Series(0.0, index=df.index)
     for i in range(len(df)):
         prev_pos = df["pos"].iloc[i-1] if i > 0 else df["pos"].iloc[i]
-        prev_asset = "SPY" if prev_pos == 1 else ("SH" if prev_pos == -1 else "SHY")
-        strat_ret.iloc[i] = rets[prev_asset].iloc[i]
+        if prev_pos == 2: asset = "SMH"
+        elif prev_pos == 1: asset = "SPY"
+        elif prev_pos == -1: asset = "SH"
+        else: asset = "SHY"
+        strat_ret.iloc[i] = rets[asset].iloc[i]
         
     turnover = (df["pos"].diff().abs().fillna(0) > 0).astype(int)
     strat_ret -= turnover * (cost_bps / 10000.0)
@@ -232,49 +242,51 @@ def backtest_3state(spy, shy, sh, pos_df, cost_bps=5.0):
 # ==========
 # UI
 # ==========
-st.set_page_config(page_title="Regime Turbo: SPY/SHY/SH", layout="wide")
-st.title("🚀 Regime Turbo: SPY/SHY/SH Rotation")
-st.caption("Fixes: Confidence Calculation, 200-SMA Filter, Shorting Logic")
+st.set_page_config(page_title="Regime Turbo: Beat SPY", layout="wide")
+st.title("🚀 Regime Turbo: SPY/SMH/SHY/SH")
+st.caption("Goal: Beat Buy & Hold SPY by using SMH in bulls, SH in bears, and 200-SMA filter to stay invested.")
 
 st.sidebar.header("Strategy Controls")
 years = st.sidebar.slider("History (years)", 3, 10, 5)
-buy_thr = st.sidebar.slider("BUY Threshold (Long SPY)", 0.05, 0.60, 0.10, 0.05)
-sell_thr = st.sidebar.slider("SELL Threshold (Short SH)", -0.60, -0.05, -0.10, 0.05)
-conf_thr = st.sidebar.slider("Min Confidence", 30, 95, 35, 5) # Lowered default
-use_sma = st.sidebar.checkbox("Use 200-SMA Safety Filter", value=True)
-use_gates = st.sidebar.checkbox("Use Credit/Stress Gates", value=False) # Default OFF to allow signals
+buy_thr = st.sidebar.slider("BUY Threshold", 0.05, 0.60, 0.10, 0.05)
+sell_thr = st.sidebar.slider("SELL Threshold", -0.60, -0.05, -0.10, 0.05)
+conf_thr = st.sidebar.slider("Min Confidence", 30, 95, 35, 5) 
+use_sma = st.sidebar.checkbox("Use 200-SMA Safety Filter (Critical)", value=True)
+use_gates = st.sidebar.checkbox("Use Credit/Stress Gates", value=False) 
+use_smh = st.sidebar.checkbox("Use SMH for Aggressive Longs", value=True)
 cost_bps = st.sidebar.slider("Trading Cost (bps)", 0.0, 50.0, 5.0, 1.0)
 
-TICKERS = ["SPY", "SHY", "SH", "SPXS", "SVOL", "VXX", "HYG", "SMH", "SOXX", "XLF", "RSP", "IWM", "XLY"]
+TICKERS = ["SPY", "SHY", "SH", "SMH", "SPXS", "SVOL", "VXX", "HYG", "SOXX", "XLF", "RSP", "IWM", "XLY"]
 
 with st.spinner("📥 Fetching data..."):
     close = fetch_adjclose(TICKERS, years=years)
 
-if not all(t in close.columns for t in ["SPY", "SHY", "SH"]):
-    st.error("❌ Missing SPY, SHY, or SH data.")
+required = ["SPY", "SHY", "SH", "SMH"]
+if not all(t in close.columns for t in required):
+    st.error(f"❌ Missing data for {required}. Check tickers.")
     st.stop()
 
 with st.spinner("🔧 Building signals..."):
     scores_df, composite, confidence, credit_gate, stress_gate = build_composite_scores(close)
 
 if composite.empty:
-    st.error("❌ Failed to build signals. Try increasing history.")
+    st.error("❌ Failed to build signals.")
     st.stop()
 
-pos_df = build_positions_3state(composite, confidence, close["SPY"], buy_thr, sell_thr, conf_thr, use_sma, use_gates, credit_gate, stress_gate)
+pos_df = build_positions_turbo(composite, confidence, close["SPY"], buy_thr, sell_thr, conf_thr, use_sma, use_gates, credit_gate, stress_gate, use_smh)
 
 if pos_df.empty:
-    st.error("❌ No positions generated. Lower confidence threshold or check data.")
+    st.error("❌ No positions generated.")
     st.stop()
 
 # Backtest
-eq_strat, trades = backtest_3state(close["SPY"], close["SHY"], close["SH"], pos_df, cost_bps)
+eq_strat, trades = backtest_turbo(close["SPY"], close["SHY"], close["SH"], close["SMH"], pos_df, cost_bps)
 idx = close["SPY"].index.intersection(pos_df.index)
 bh = (1.0 + close["SPY"].loc[idx].pct_change().fillna(0)).cumprod()
 
 # Stats
 stats = {
-    "Strategy: SPY/SHY/SH": perf_stats(eq_strat),
+    "Strategy: Turbo": perf_stats(eq_strat),
     "Buy&Hold: SPY": perf_stats(bh)
 }
 rows = []
@@ -294,7 +306,7 @@ st.dataframe(pd.DataFrame(rows), use_container_width=True)
 # Chart
 st.subheader("Equity Curves ($10k Start)")
 fig = plt.figure(figsize=(12, 6))
-plt.plot(eq_strat.index, eq_strat * 10000, label="SPY/SHY/SH Rotation", linewidth=2)
+plt.plot(eq_strat.index, eq_strat * 10000, label="Turbo Strategy", linewidth=2)
 plt.plot(bh.index, bh * 10000, label="Buy&Hold SPY", linestyle='--', linewidth=2)
 plt.xlabel("Date"); plt.ylabel("Equity ($)"); plt.legend(); plt.grid(True, alpha=0.3)
 st.pyplot(fig)
@@ -303,10 +315,10 @@ st.pyplot(fig)
 st.subheader("🔍 Signal Diagnostics (Last 50 Bars)")
 diag = pos_df.tail(50)[["comp", "conf", "bull_market", "position", "asset"]].copy()
 st.dataframe(diag, use_container_width=True)
-st.caption("Position: 1=SPY, 0=SHY, -1=SH. Shorting only allowed if bull_market=0 (SPY < 200 SMA).")
 
 # Debug Info
 with st.expander("🔍 Debug Info"):
     st.write(f"Confidence Range: {confidence.min():.1f} - {confidence.max():.1f}")
     st.write(f"Signals > Threshold: {(confidence >= conf_thr).sum()}")
     st.write(f"Current Asset: {pos_df['asset'].iloc[-1]}")
+    st.write("💡 Tip: If Strategy < SPY, ensure '200-SMA Safety Filter' is ON to stay invested during rallies.")
