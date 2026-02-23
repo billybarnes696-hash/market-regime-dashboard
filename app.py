@@ -8,15 +8,8 @@ import matplotlib.pyplot as plt
 # =========================
 # CONFIGURATION
 # =========================
-MACD_FAST, MACD_SLOW, MACD_SIGNAL = 24, 52, 18
-TSI_R, TSI_S, TSI_SIGNAL = 40, 20, 10
-STOCH_LEN, STOCH_SMOOTHK, STOCH_SMOOTHD = 14, 3, 3
-CCI_LEN = 100
 TRADING_DAYS = 252
 
-# ==========
-# DATA & UTILS
-# ==========
 @st.cache_data(ttl=3600)
 def fetch_adjclose(tickers, years=5):
     end = pd.Timestamp.today().normalize()
@@ -36,289 +29,182 @@ def fetch_adjclose(tickers, years=5):
             try:
                 if t in data.columns.get_level_values(0) and "Close" in data[t].columns:
                     close_cols[t] = data[t]["Close"]
-            except:
-                continue
+            except: continue
         adj = pd.DataFrame(close_cols)
-    
     return adj.dropna(how="all").ffill().dropna()
 
-def normalize_100(s):
-    s = s.dropna()
-    return 100.0 * s / float(s.iloc[0]) if not s.empty else s
-
-def close_only_stoch(close, length=14, smoothk=3, smoothd=3):
-    lo, hi = close.rolling(length).min(), close.rolling(length).max()
-    denom = (hi - lo).replace(0, np.nan)
-    k = (100.0 * (close - lo) / denom).rolling(smoothk).mean()
-    return k, k.rolling(smoothd).mean()
-
-def close_only_cci(close, length=100):
-    sma = close.rolling(length).mean()
-    mad = (close - sma).abs().rolling(length).mean()
-    return (close - sma) / (0.015 * mad.replace(0, np.nan))
-
-def indicator_pack(close):
-    close = close.dropna()
-    min_req = max(MACD_SLOW, TSI_R, CCI_LEN) + 20
-    if len(close) < min_req:
-        return pd.DataFrame(columns=["macdh", "tsi", "stochk", "cci"])
+def build_simple_composite(close):
+    """Simplified composite based on key ratios"""
+    ratios = [
+        ("HYG", "SHY"), ("SMH", "SPY"), ("SPY", "VXX"), 
+        ("XLF", "SPY"), ("IWM", "SPY")
+    ]
     
-    try:
-        macd = ta.macd(close, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-        if macd is None or macd.empty or len(macd.columns) < 2:
-            return pd.DataFrame(columns=["macdh", "tsi", "stochk", "cci"])
-        macdh_col = [c for c in macd.columns if "MACDh" in c or "macdh" in c.lower()]
-        macdh = macd[macdh_col[0]].rename("macdh") if macdh_col else macd.iloc[:, 1].rename("macdh")
+    signals = []
+    for num, den in ratios:
+        if num not in close.columns or den not in close.columns: continue
+        ratio = (close[num] / close[den]).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(ratio) < 50: continue
         
-        tsi = ta.tsi(close, fast=TSI_S, slow=TSI_R, signal=TSI_SIGNAL)
-        if tsi is None or tsi.empty:
-            return pd.DataFrame(columns=["macdh", "tsi", "stochk", "cci"])
-        tsi = tsi.iloc[:, 0].rename("tsi")
-        
-        stoch_k, _ = close_only_stoch(close, length=STOCH_LEN, smoothk=STOCH_SMOOTHK, smoothd=STOCH_SMOOTHD)
-        cci = close_only_cci(close, length=CCI_LEN)
-        
-        return pd.concat([macdh, tsi, stoch_k.rename("stochk"), cci.rename("cci")], axis=1).dropna()
-    except Exception:
-        return pd.DataFrame(columns=["macdh", "tsi", "stochk", "cci"])
-
-def score_from_indicators(ind):
-    if ind.empty: return pd.Series(dtype=float)
-    bull = (ind["macdh"] > 0) & (ind["tsi"] > 0) & (ind["stochk"] > 50) & (ind["cci"] > 0)
-    bear = (ind["macdh"] < 0) & (ind["tsi"] < 0) & (ind["stochk"] < 50) & (ind["cci"] < 0)
-    sc = pd.Series(0.0, index=ind.index)
-    sc[bull], sc[bear] = 1.0, -1.0
-    return sc
-
-def make_ratio(close_df, num, den):
-    if num not in close_df.columns or den not in close_df.columns:
-        return pd.Series(dtype=float)
-    return (close_df[num] / close_df[den]).replace([np.inf, -np.inf], np.nan).rename(f"{num}:{den}")
-
-def perf_stats(equity):
-    eq = equity.dropna()
-    if len(eq) < 5: return {"Total Return": np.nan, "CAGR": np.nan, "Max Drawdown": np.nan, "Sharpe": np.nan}
-    rets = eq.pct_change().dropna()
-    years = (eq.index[-1] - eq.index[0]).days / 365.25
-    cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1 if years > 0 else np.nan
-    dd = eq / eq.cummax() - 1.0
-    sharpe = (rets.mean() / rets.std()) * np.sqrt(TRADING_DAYS) if rets.std() != 0 else np.nan
-    return {
-        "Total Return": (eq.iloc[-1] / eq.iloc[0]) - 1.0,
-        "CAGR": cagr,
-        "Max Drawdown": float(dd.min()),
-        "Sharpe": float(sharpe)
-    }
-
-# ==========
-# SIGNAL ENGINE
-# ==========
-def build_composite_scores(close):
-    ratios = {
-        "SPXS:SVOL": {"series": make_ratio(close, "SPXS", "SVOL"), "invert": True,  "weight": 0.22},
-        "HYG:SHY":   {"series": make_ratio(close, "HYG",  "SHY"),  "invert": False, "weight": 0.18},
-        "SMH:SPY":   {"series": make_ratio(close, "SMH",  "SPY"),  "invert": False, "weight": 0.14},
-        "SPY:VXX":   {"series": make_ratio(close, "SPY",  "VXX"),  "invert": False, "weight": 0.08},
-        "XLF:SPY":   {"series": make_ratio(close, "XLF",  "SPY"),  "invert": False, "weight": 0.10},
-        "RSP:SPY":   {"series": make_ratio(close, "RSP",  "SPY"),  "invert": False, "weight": 0.08},
-        "IWM:SPY":   {"series": make_ratio(close, "IWM",  "SPY"),  "invert": False, "weight": 0.08},
-        "XLY:SPY":   {"series": make_ratio(close, "XLY",  "SPY"),  "invert": False, "weight": 0.06},
-        "SOXX:SPY":  {"series": make_ratio(close, "SOXX", "SPY"),  "invert": False, "weight": 0.06},
-    }
-    scores = {}
-    for name, cfg in ratios.items():
-        s = cfg["series"].dropna()
-        if s.empty: continue
-        ind = indicator_pack(s)
-        if ind.empty: continue
-        sc = score_from_indicators(ind)
-        if sc.empty: continue
-        scores[name] = -sc if cfg["invert"] else sc
+        # Simple momentum: price above 50-day MA = bullish
+        ma50 = ratio.rolling(50).mean()
+        sig = pd.Series(0, index=ratio.index)
+        sig[ratio > ma50] = 1
+        sig[ratio < ma50] = -1
+        signals.append(sig.ffill())
     
-    if not scores: return pd.DataFrame(), pd.Series(), pd.Series(), pd.Series(), pd.Series()
-    
-    all_idx = scores[list(scores.keys())[0]].index
-    for sc in scores.values(): all_idx = all_idx.intersection(sc.index)
-    scores_df = pd.DataFrame({k: v.loc[all_idx] for k, v in scores.items()}).dropna()
-    if scores_df.empty: return pd.DataFrame(), pd.Series(), pd.Series(), pd.Series(), pd.Series()
-    
-    w = pd.Series({k: ratios[k]["weight"] for k in scores_df.columns})
-    w = w / w.sum()
-    composite = (scores_df * w).sum(axis=1)
-    
-    # FIXED CONFIDENCE CALCULATION (Avoids 33.33% cap bug)
-    comp_sign = np.sign(composite.replace(0, np.nan))
-    align = (np.sign(scores_df).replace(0, np.nan).eq(comp_sign, axis=0)).mean(axis=1).fillna(0)
-    strength = scores_df.abs().mean(axis=1)
-    # Ensure strength is scaled 0-1
-    strength = strength / scores_df.shape[1] 
-    confidence = (0.6 * align + 0.4 * strength) * 100.0
-    
-    credit_gate = (scores_df["HYG:SHY"] > 0) if "HYG:SHY" in scores_df.columns else pd.Series(False, index=composite.index)
-    stress_gate = (scores_df["SPXS:SVOL"] > 0) if "SPXS:SVOL" in scores_df.columns else pd.Series(False, index=composite.index)
-    return scores_df, composite, confidence, credit_gate, stress_gate
+    if not signals: return pd.Series(0, index=close.index)
+    return pd.concat(signals, axis=1).mean(axis=1).ffill()
 
-def build_positions_turbo(composite, confidence, spy_close, buy_thr, sell_thr, conf_thr, use_sma=True, use_gates=False, credit_gate=None, stress_gate=None, use_smh=False):
-    df = pd.DataFrame({"comp": composite, "conf": confidence, "spy": spy_close.reindex(composite.index).ffill()}).dropna()
+def build_positions_3state(composite, spy_close, conf_thr=30, use_sma=True):
+    """3-State: -1=SH, 0=SHY, 1=SPY"""
+    df = pd.DataFrame({
+        "comp": composite, 
+        "spy": spy_close.reindex(composite.index).ffill()
+    }).dropna()
+    
     if df.empty: return pd.DataFrame()
     
     if use_sma:
         df["sma_200"] = df["spy"].rolling(200).mean()
-        df["bull_market"] = (df["spy"] > df["sma_200"]).astype(int)
+        df["bull"] = (df["spy"] > df["sma_200"]).astype(int)
     else:
-        df["bull_market"] = 1
-        
-    if use_gates and credit_gate is not None and stress_gate is not None:
-        df["credit"] = credit_gate.reindex(df.index).fillna(False).astype(int)
-        df["stress"] = stress_gate.reindex(df.index).fillna(False).astype(int)
-    else:
-        df["credit"] = 1
-        df["stress"] = 1
-
-    df["trend"] = df["comp"] - df["comp"].shift(10)
-    df = df.dropna()
+        df["bull"] = 1
     
-    # 4-State Logic: 2=SMH (Aggressive Long), 1=SPY (Safe Long), 0=SHY (Neutral), -1=SH (Short)
-    position = pd.Series(0, index=df.index) 
+    # Clear 3-state logic (NO confidence bottleneck)
+    def get_position(row):
+        if row["bull"] == 1 and row["comp"] > 0.1:
+            return 1  # SPY
+        elif row["bull"] == 0 and row["comp"] < -0.1:
+            return -1  # SH (Short)
+        else:
+            return 0  # SHY (Neutral)
     
-    # AGGRESSIVE LONG (SMH): Strong Bull + High Confidence
-    if use_smh:
-        agg_long = (df["comp"] > buy_thr * 1.5) & (df["conf"] >= conf_thr * 1.2) & (df["bull_market"] == 1)
-        position[agg_long] = 2
+    df["position"] = df.apply(get_position, axis=1)
     
-    # SAFE LONG (SPY): Bull Market + Moderate Signal
-    long_cond = (df["comp"] > buy_thr) & (df["conf"] >= conf_thr) & (df["bull_market"] == 1)
-    # Override: If Bull Market, stay long even if signal is weak (prevents missing 70% rally)
-    long_cond = long_cond | (df["bull_market"] == 1) 
-    position[long_cond] = 1
+    # Add stickiness to reduce whipsaw
+    for i in range(1, len(df)):
+        if df["position"].iloc[i] != df["position"].iloc[i-1]:
+            # Only allow change if signal is strong
+            if abs(df["comp"].iloc[i]) < 0.15:
+                df["position"].iloc[i] = df["position"].iloc[i-1]
     
-    # SHORT (SH): Bear Market + Strong Negative Signal
-    short_cond = (df["comp"] < sell_thr) & (df["conf"] >= conf_thr) & (df["bull_market"] == 0)
-    position[short_cond] = -1
-    
-    # Hold previous position if no signal (Stickiness)
-    for i in range(1, len(position)):
-        if position.iloc[i] == 0:
-            position.iloc[i] = position.iloc[i-1]
-            
-    df["position"] = position
-    df["asset"] = position.map({2: "SMH", 1: "SPY", 0: "SHY", -1: "SH"})
+    df["asset"] = df["position"].map({1: "SPY", 0: "SHY", -1: "SH"})
     return df
 
-def backtest_turbo(spy, shy, sh, smh, pos_df, cost_bps=5.0):
+def backtest_3state(spy, shy, sh, pos_df, cost_bps=5.0):
+    """Proper backtest with lagged positions"""
     idx = spy.index.intersection(pos_df.index)
     df = pd.DataFrame({
         "SPY": spy.loc[idx],
         "SHY": shy.loc[idx],
         "SH": sh.loc[idx],
-        "SMH": smh.loc[idx],
         "pos": pos_df["position"].loc[idx]
     }).dropna()
     
     if df.empty: return pd.Series(), 0
     
+    # Calculate returns
     rets = pd.DataFrame({
         "SPY": df["SPY"].pct_change().fillna(0),
         "SHY": df["SHY"].pct_change().fillna(0),
-        "SH": df["SH"].pct_change().fillna(0),
-        "SMH": df["SMH"].pct_change().fillna(0)
+        "SH": df["SH"].pct_change().fillna(0)
     })
     
+    # Strategy returns (use PREVIOUS day's position)
     strat_ret = pd.Series(0.0, index=df.index)
     for i in range(len(df)):
-        prev_pos = df["pos"].iloc[i-1] if i > 0 else df["pos"].iloc[i]
-        if prev_pos == 2: asset = "SMH"
-        elif prev_pos == 1: asset = "SPY"
-        elif prev_pos == -1: asset = "SH"
-        else: asset = "SHY"
+        prev_pos = df["pos"].iloc[i-1] if i > 0 else 1
+        asset = {1: "SPY", 0: "SHY", -1: "SH"}.get(prev_pos, "SPY")
         strat_ret.iloc[i] = rets[asset].iloc[i]
-        
+    
+    # Transaction costs
     turnover = (df["pos"].diff().abs().fillna(0) > 0).astype(int)
     strat_ret -= turnover * (cost_bps / 10000.0)
     
     equity = (1.0 + strat_ret).cumprod()
     return equity, turnover.sum()
 
-# ==========
-# UI
-# ==========
-st.set_page_config(page_title="Regime Turbo: Beat SPY", layout="wide")
-st.title("🚀 Regime Turbo: SPY/SMH/SHY/SH")
-st.caption("Goal: Beat Buy & Hold SPY by using SMH in bulls, SH in bears, and 200-SMA filter to stay invested.")
+def perf_stats(equity):
+    eq = equity.dropna()
+    if len(eq) < 10: return {"Return": np.nan, "CAGR": np.nan, "DD": np.nan, "Sharpe": np.nan}
+    rets = eq.pct_change().dropna()
+    years = (eq.index[-1] - eq.index[0]).days / 365.25
+    cagr = (eq.iloc[-1]/eq.iloc[0])**(1/years) - 1 if years > 0 else np.nan
+    dd = (eq / eq.cummax() - 1).min()
+    sharpe = (rets.mean()/rets.std())*np.sqrt(252) if rets.std() > 0 else np.nan
+    return {
+        "Return": (eq.iloc[-1]/eq.iloc[0])-1,
+        "CAGR": cagr, 
+        "DD": float(dd),
+        "Sharpe": float(sharpe)
+    }
 
-st.sidebar.header("Strategy Controls")
+# ========== UI ==========
+st.set_page_config(page_title="3-State Rotation: SPY/SHY/SH", layout="wide")
+st.title("🎯 3-State Rotation: SPY → SHY → SH")
+st.caption("Long SPY (Bull) | Cash/SHY (Neutral) | Short SH (Bear)")
+
+st.sidebar.header("Controls")
 years = st.sidebar.slider("History (years)", 3, 10, 5)
-buy_thr = st.sidebar.slider("BUY Threshold", 0.05, 0.60, 0.10, 0.05)
-sell_thr = st.sidebar.slider("SELL Threshold", -0.60, -0.05, -0.10, 0.05)
-conf_thr = st.sidebar.slider("Min Confidence", 30, 95, 35, 5) 
-use_sma = st.sidebar.checkbox("Use 200-SMA Safety Filter (Critical)", value=True)
-use_gates = st.sidebar.checkbox("Use Credit/Stress Gates", value=False) 
-use_smh = st.sidebar.checkbox("Use SMH for Aggressive Longs", value=True)
-cost_bps = st.sidebar.slider("Trading Cost (bps)", 0.0, 50.0, 5.0, 1.0)
+use_sma = st.sidebar.checkbox("Use 200-SMA Filter (Required for Shorting)", value=True)
+cost_bps = st.sidebar.slider("Trading Cost (bps)", 0, 50, 5)
 
-TICKERS = ["SPY", "SHY", "SH", "SMH", "SPXS", "SVOL", "VXX", "HYG", "SOXX", "XLF", "RSP", "IWM", "XLY"]
+TICKERS = ["SPY", "SHY", "SH", "HYG", "VXX", "SMH", "XLF", "IWM"]
 
-with st.spinner("📥 Fetching data..."):
+with st.spinner("📥 Fetching..."):
     close = fetch_adjclose(TICKERS, years=years)
 
-required = ["SPY", "SHY", "SH", "SMH"]
-if not all(t in close.columns for t in required):
-    st.error(f"❌ Missing data for {required}. Check tickers.")
+if not all(t in close.columns for t in ["SPY", "SHY", "SH"]):
+    st.error("❌ Missing SPY, SHY, or SH")
     st.stop()
 
 with st.spinner("🔧 Building signals..."):
-    scores_df, composite, confidence, credit_gate, stress_gate = build_composite_scores(close)
-
-if composite.empty:
-    st.error("❌ Failed to build signals.")
-    st.stop()
-
-pos_df = build_positions_turbo(composite, confidence, close["SPY"], buy_thr, sell_thr, conf_thr, use_sma, use_gates, credit_gate, stress_gate, use_smh)
+    composite = build_simple_composite(close)
+    pos_df = build_positions_3state(composite, close["SPY"], use_sma=use_sma)
 
 if pos_df.empty:
-    st.error("❌ No positions generated.")
+    st.error("❌ No positions generated")
     st.stop()
 
 # Backtest
-eq_strat, trades = backtest_turbo(close["SPY"], close["SHY"], close["SH"], close["SMH"], pos_df, cost_bps)
-idx = close["SPY"].index.intersection(pos_df.index)
-bh = (1.0 + close["SPY"].loc[idx].pct_change().fillna(0)).cumprod()
+eq_strat, trades = backtest_3state(close["SPY"], close["SHY"], close["SH"], pos_df, cost_bps)
+bh = (1 + close["SPY"].pct_change().fillna(0)).cumprod()
 
 # Stats
 stats = {
-    "Strategy: Turbo": perf_stats(eq_strat),
+    "Strategy: 3-State": perf_stats(eq_strat),
     "Buy&Hold: SPY": perf_stats(bh)
 }
-rows = []
-for name, s in stats.items():
-    rows.append({
-        "Portfolio": name,
-        "Total Return %": f"{s['Total Return']*100:.1f}" if not np.isnan(s['Total Return']) else "N/A",
-        "CAGR %": f"{s['CAGR']*100:.2f}" if not np.isnan(s['CAGR']) else "N/A",
-        "Max DD %": f"{s['Max Drawdown']*100:.1f}" if not np.isnan(s['Max Drawdown']) else "N/A",
-        "Sharpe": f"{s['Sharpe']:.2f}" if not np.isnan(s['Sharpe']) else "N/A",
-        "Trades": int(trades) if "Strategy" in name else 0
-    })
-
-st.subheader("Performance Comparison")
-st.dataframe(pd.DataFrame(rows), use_container_width=True)
+st.subheader("Performance")
+st.dataframe(pd.DataFrame([
+    {"Strategy": k, "Return %": f"{v['Return']*100:.1f}", "CAGR %": f"{v['CAGR']*100:.2f}", 
+     "Max DD %": f"{v['DD']*100:.1f}", "Sharpe": f"{v['Sharpe']:.2f}"}
+    for k, v in stats.items()
+]), use_container_width=True)
 
 # Chart
-st.subheader("Equity Curves ($10k Start)")
-fig = plt.figure(figsize=(12, 6))
-plt.plot(eq_strat.index, eq_strat * 10000, label="Turbo Strategy", linewidth=2)
-plt.plot(bh.index, bh * 10000, label="Buy&Hold SPY", linestyle='--', linewidth=2)
-plt.xlabel("Date"); plt.ylabel("Equity ($)"); plt.legend(); plt.grid(True, alpha=0.3)
+st.subheader("Equity ($10k Start)")
+fig, ax = plt.subplots(figsize=(12,5))
+ax.plot(eq_strat.index, eq_strat*10000, label="3-State Strategy", linewidth=2)
+ax.plot(bh.index, bh*10000, label="Buy&Hold SPY", linestyle="--")
+ax.set_xlabel("Date"); ax.set_ylabel("Equity ($)"); ax.legend(); ax.grid(alpha=0.3)
 st.pyplot(fig)
 
-# Diagnostics
-st.subheader("🔍 Signal Diagnostics (Last 50 Bars)")
-diag = pos_df.tail(50)[["comp", "conf", "bull_market", "position", "asset"]].copy()
+# Diagnostic: Did it actually trade?
+st.subheader("🔍 Did It Actually Rotate? (Last 50 Days)")
+diag = pos_df.tail(50)[["comp", "bull", "position", "asset"]].copy()
 st.dataframe(diag, use_container_width=True)
 
-# Debug Info
+# Asset allocation
+if len(pos_df) > 0:
+    alloc = pos_df["asset"].value_counts()
+    st.subheader("📊 Time in Each Asset")
+    st.bar_chart(alloc)
+
+# Debug info
 with st.expander("🔍 Debug Info"):
-    st.write(f"Confidence Range: {confidence.min():.1f} - {confidence.max():.1f}")
-    st.write(f"Signals > Threshold: {(confidence >= conf_thr).sum()}")
-    st.write(f"Current Asset: {pos_df['asset'].iloc[-1]}")
-    st.write("💡 Tip: If Strategy < SPY, ensure '200-SMA Safety Filter' is ON to stay invested during rallies.")
+    st.write(f"**Position Changes:** {trades}")
+    st.write(f"**Unique Assets Used:** {pos_df['asset'].unique().tolist()}")
+    st.write(f"**Bull Market %:** {(pos_df['bull']==1).mean()*100:.1f}%")
+    st.write(f"**Short Signals:** {(pos_df['position']==-1).sum()} days")
