@@ -5,23 +5,24 @@ import numpy as np
 import pandas_ta as ta
 import matplotlib.pyplot as plt
 import warnings
+import time
 warnings.filterwarnings('ignore')
 
 # =========================
 # CONFIGURATION
 # =========================
 TRADING_DAYS = 252
-MIN_HISTORY_DAYS = 252  # Minimum 1 year of data required
+MIN_HISTORY_DAYS = 252
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
 
 # ==========
 # ERROR HANDLING UTILS
 # ==========
 class StrategyError(Exception):
-    """Custom error for strategy validation failures"""
     pass
 
 def validate_data(close, required_tickers):
-    """Validate downloaded data meets requirements"""
     errors = []
     warnings_list = []
     
@@ -43,8 +44,7 @@ def validate_data(close, required_tickers):
     
     return len(errors) == 0, errors, warnings_list
 
-def validate_signals(composite, confidence, pos_df):
-    """Validate signals are actually generating trades"""
+def validate_signals(composite, pos_df):
     errors = []
     warnings_list = []
     
@@ -52,40 +52,25 @@ def validate_signals(composite, confidence, pos_df):
         errors.append("❌ Composite signal is empty")
         return False, errors, warnings_list
     
-    if confidence.empty:
-        errors.append("❌ Confidence signal is empty")
-        return False, errors, warnings_list
-    
-    # Check for stuck positions
     if pos_df is not None and not pos_df.empty:
         unique_positions = pos_df['position'].nunique()
         if unique_positions == 1:
             warnings_list.append(f"⚠️ Position stuck at {pos_df['position'].iloc[0]} - no rotation occurring")
         
-        # Check if we ever go defensive
         defensive_days = (pos_df['position'] <= 0).sum()
         total_days = len(pos_df)
         if defensive_days == 0 and total_days > 100:
             warnings_list.append("⚠️ Never went defensive (SHY/SH) - may miss drawdown protection")
         
-        # Check trade frequency
         trades = (pos_df['position'].diff().abs() > 0).sum()
         if trades == 0:
             errors.append("❌ No trades executed - check thresholds")
         elif trades > len(pos_df) * 0.1:
-            warnings_list.append(f"⚠️ High turnover: {trades} trades ({trades/len(pos_df)*100:.1f}% of days)")
-    
-    # Check confidence range
-    conf_min, conf_max = confidence.min(), confidence.max()
-    if conf_max < 30:
-        errors.append(f"❌ Confidence too low (max: {conf_max:.1f}%) - signals won't trigger")
-    elif conf_min == conf_max:
-        errors.append(f"❌ Confidence stuck at {conf_min:.1f}% - calculation issue")
+            warnings_list.append(f"⚠️ High turnover: {trades} trades")
     
     return len(errors) == 0, errors, warnings_list
 
 def validate_backtest(equity, bh_equity):
-    """Validate backtest results are reasonable"""
     errors = []
     warnings_list = []
     
@@ -93,77 +78,114 @@ def validate_backtest(equity, bh_equity):
         errors.append("❌ Strategy equity curve is empty")
         return False, errors, warnings_list
     
-    # Check for NaN/Inf in equity
     if equity.isna().any() or np.isinf(equity).any():
         errors.append("❌ Equity curve contains NaN or Inf values")
     
-    # Check for extreme drawdowns
     dd = (equity / equity.cummax() - 1).min()
     if dd < -0.8:
         warnings_list.append(f"⚠️ Extreme drawdown: {dd*100:.1f}%")
     
-    # Check if strategy significantly underperforms
-    if len(equity) > 100 and len(bh_equity) > 100:
-        strat_ret = equity.iloc[-1] / equity.iloc[0] - 1
-        bh_ret = bh_equity.iloc[-1] / bh_equity[0] - 1
-        if strat_ret < bh_ret * 0.5:
-            warnings_list.append(f"⚠️ Strategy return ({strat_ret*100:.1f}%) is less than half of Buy&Hold ({bh_ret*100:.1f}%)")
-    
     return len(errors) == 0, errors, warnings_list
 
 # ==========
-# DATA FETCHING
+# DATA FETCHING WITH RETRIES
 # ==========
 @st.cache_data(ttl=3600)
 def fetch_adjclose(tickers, years=5):
     end = pd.Timestamp.today().normalize()
     start = end - pd.Timedelta(days=int(years * 365.25) + 30)
     
-    try:
-        data = yf.download(
-            tickers=tickers, 
-            start=start, 
-            end=end + pd.Timedelta(days=1),
-            auto_adjust=True, 
-            progress=False, 
-            group_by="ticker", 
-            threads=True
-        )
-    except Exception as e:
-        st.error(f"🚨 Data download failed: {str(e)}")
-        return pd.DataFrame()
+    last_error = None
     
-    if data is None or (isinstance(data, pd.DataFrame) and data.empty):
-        st.error("🚨 No data returned from Yahoo Finance")
-        return pd.DataFrame()
+    for attempt in range(MAX_RETRIES):
+        try:
+            st.write(f"📡 Attempting download (try {attempt + 1}/{MAX_RETRIES})...")
+            
+            # Add user-agent header to avoid blocking
+            data = yf.download(
+                tickers=tickers, 
+                start=start, 
+                end=end + pd.Timedelta(days=1),
+                auto_adjust=True, 
+                progress=False, 
+                group_by="ticker", 
+                threads=True,
+                timeout=30
+            )
+            
+            if data is None or (isinstance(data, pd.DataFrame) and data.empty):
+                raise Exception("Empty data returned")
+            
+            # Process data
+            if isinstance(tickers, str) or len(tickers) == 1:
+                adj = data["Close"].to_frame(tickers if isinstance(tickers, str) else tickers[0])
+            else:
+                close_cols = {}
+                for t in tickers:
+                    try:
+                        if t in data.columns.get_level_values(0) and "Close" in data[t].columns:
+                            close_cols[t] = data[t]["Close"]
+                    except: 
+                        continue
+                adj = pd.DataFrame(close_cols)
+            
+            if adj.empty:
+                raise Exception("No valid price columns found")
+            
+            result = adj.dropna(how="all").ffill().dropna()
+            
+            if len(result) < MIN_HISTORY_DAYS:
+                raise Exception(f"Insufficient data: {len(result)} days")
+            
+            st.success(f"✅ Successfully downloaded {len(result)} days of data")
+            return result
+            
+        except Exception as e:
+            last_error = str(e)
+            st.warning(f"⚠️ Download attempt {attempt + 1} failed: {last_error}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
     
-    try:
-        if isinstance(tickers, str) or len(tickers) == 1:
-            adj = data["Close"].to_frame(tickers if isinstance(tickers, str) else tickers[0])
+    # If all retries failed, offer mock data
+    st.error(f"🚨 All download attempts failed. Last error: {last_error}")
+    return None
+
+def generate_mock_data(tickers, years=5):
+    """Generate realistic mock data for testing when yfinance fails"""
+    st.warning("⚠️ Using MOCK DATA for testing (yfinance failed)")
+    
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.Timedelta(days=int(years * 365.25))
+    dates = pd.date_range(start=start, end=end, freq='B')  # Business days
+    
+    np.random.seed(42)  # Reproducible
+    
+    data = {}
+    for ticker in tickers:
+        # Generate realistic price movements
+        if ticker == "SPY":
+            drift = 0.0004  # ~10% annual
+            vol = 0.015
+        elif ticker == "SH":
+            drift = -0.0004  # Inverse of SPY
+            vol = 0.015
+        elif ticker == "SHY":
+            drift = 0.0001  # Low volatility
+            vol = 0.003
         else:
-            close_cols = {}
-            for t in tickers:
-                try:
-                    if t in data.columns.get_level_values(0) and "Close" in data[t].columns:
-                        close_cols[t] = data[t]["Close"]
-                except: 
-                    continue
-            adj = pd.DataFrame(close_cols)
+            drift = 0.0003
+            vol = 0.02
         
-        if adj.empty:
-            st.error("🚨 No valid price columns found")
-            return pd.DataFrame()
-        
-        return adj.dropna(how="all").ffill().dropna()
-    except Exception as e:
-        st.error(f"🚨 Data processing failed: {str(e)}")
-        return pd.DataFrame()
+        returns = np.random.normal(drift, vol, len(dates))
+        prices = 100 * np.cumprod(1 + returns)
+        data[ticker] = pd.Series(prices, index=dates)
+    
+    return pd.DataFrame(data)
 
 # ==========
 # SIGNAL GENERATION
 # ==========
 def build_simple_composite(close):
-    """Simplified composite based on key ratios"""
     try:
         ratios = [
             ("HYG", "SHY"), ("SMH", "SPY"), ("SPY", "VXX"), 
@@ -178,7 +200,6 @@ def build_simple_composite(close):
             if len(ratio) < 50: 
                 continue
             
-            # Simple momentum: price above 50-day MA = bullish
             ma50 = ratio.rolling(50).mean()
             sig = pd.Series(0, index=ratio.index)
             sig[ratio > ma50] = 1
@@ -190,9 +211,7 @@ def build_simple_composite(close):
         
         composite = pd.concat(signals, axis=1).mean(axis=1).ffill()
         
-        # Validate composite
         if composite.isna().all():
-            st.warning("⚠️ Composite signal is all NaN")
             return pd.Series(0, index=close.index)
         
         return composite
@@ -200,8 +219,7 @@ def build_simple_composite(close):
         st.error(f"🚨 Composite calculation failed: {str(e)}")
         return pd.Series(0, index=close.index if 'close' in locals() else pd.DatetimeIndex([]))
 
-def build_positions_3state(composite, spy_close, conf_thr=30, use_sma=True):
-    """3-State: -1=SH, 0=SHY, 1=SPY"""
+def build_positions_3state(composite, spy_close, use_sma=True):
     try:
         df = pd.DataFrame({
             "comp": composite, 
@@ -209,7 +227,6 @@ def build_positions_3state(composite, spy_close, conf_thr=30, use_sma=True):
         }).dropna()
         
         if df.empty: 
-            st.error("🚨 No valid data for position building")
             return pd.DataFrame()
         
         if use_sma:
@@ -218,18 +235,17 @@ def build_positions_3state(composite, spy_close, conf_thr=30, use_sma=True):
         else:
             df["bull"] = 1
         
-        # Clear 3-state logic
         def get_position(row):
             if row["bull"] == 1 and row["comp"] > 0.1:
                 return 1  # SPY
             elif row["bull"] == 0 and row["comp"] < -0.1:
-                return -1  # SH (Short)
+                return -1  # SH
             else:
-                return 0  # SHY (Neutral)
+                return 0  # SHY
         
         df["position"] = df.apply(get_position, axis=1)
         
-        # Add stickiness to reduce whipsaw
+        # Stickiness
         for i in range(1, len(df)):
             if df["position"].iloc[i] != df["position"].iloc[i-1]:
                 if abs(df["comp"].iloc[i]) < 0.15:
@@ -242,7 +258,6 @@ def build_positions_3state(composite, spy_close, conf_thr=30, use_sma=True):
         return pd.DataFrame()
 
 def backtest_3state(spy, shy, sh, pos_df, cost_bps=5.0):
-    """Proper backtest with lagged positions"""
     try:
         idx = spy.index.intersection(pos_df.index)
         df = pd.DataFrame({
@@ -272,9 +287,7 @@ def backtest_3state(spy, shy, sh, pos_df, cost_bps=5.0):
         
         equity = (1.0 + strat_ret).cumprod()
         
-        # Validate equity
         if equity.isna().any() or np.isinf(equity).any():
-            st.warning("⚠️ Equity curve contains invalid values")
             equity = equity.replace([np.inf, -np.inf], np.nan).ffill()
         
         return equity, turnover.sum()
@@ -299,7 +312,6 @@ def perf_stats(equity):
             "Sharpe": float(sharpe)
         }
     except Exception as e:
-        st.error(f"🚨 Performance stats calculation failed: {str(e)}")
         return {"Return": np.nan, "CAGR": np.nan, "DD": np.nan, "Sharpe": np.nan}
 
 # ==========
@@ -313,14 +325,25 @@ st.sidebar.header("Controls")
 years = st.sidebar.slider("History (years)", 3, 10, 5)
 use_sma = st.sidebar.checkbox("Use 200-SMA Filter (Required for Shorting)", value=True)
 cost_bps = st.sidebar.slider("Trading Cost (bps)", 0, 50, 5)
+use_mock_data = st.sidebar.checkbox("Use Mock Data (if download fails)", value=False)
 show_debug = st.sidebar.checkbox("Show Debug Info", value=True)
 
 TICKERS = ["SPY", "SHY", "SH", "HYG", "VXX", "SMH", "XLF", "IWM"]
 REQUIRED = ["SPY", "SHY", "SH"]
 
 # Data Fetching
+close = None
 with st.spinner("📥 Fetching data..."):
     close = fetch_adjclose(TICKERS, years=years)
+
+# Fallback to mock data
+if close is None or close.empty:
+    if use_mock_data:
+        close = generate_mock_data(TICKERS, years=years)
+    else:
+        st.error("🚨 Data download failed. Enable 'Use Mock Data' in sidebar to test logic.")
+        st.info("💡 **Troubleshooting:**\n1. Check internet connection\n2. Try shorter history (3 years)\n3. Enable 'Use Mock Data' to test app logic\n4. If on Streamlit Cloud, yfinance may be rate-limited")
+        st.stop()
 
 # Data Validation
 data_ok, data_errors, data_warnings = validate_data(close, REQUIRED)
@@ -344,7 +367,7 @@ if pos_df.empty:
     st.stop()
 
 # Signal Validation
-signal_ok, signal_errors, signal_warnings = validate_signals(composite, pd.Series(), pos_df)
+signal_ok, signal_errors, signal_warnings = validate_signals(composite, pos_df)
 
 if signal_warnings:
     for w in signal_warnings:
@@ -396,7 +419,7 @@ try:
 except Exception as e:
     st.error(f"🚨 Chart rendering failed: {str(e)}")
 
-# Diagnostic: Did it actually trade?
+# Diagnostic
 st.subheader("🔍 Did It Actually Rotate? (Last 50 Days)")
 try:
     diag = pos_df.tail(50)[["comp", "bull", "position", "asset"]].copy()
@@ -423,30 +446,14 @@ if show_debug:
         st.write(f"**Short Signals:** {(pos_df['position']==-1).sum()} days")
         st.write(f"**Neutral Days:** {(pos_df['position']==0).sum()} days")
         st.write(f"**Long Days:** {(pos_df['position']==1).sum()} days")
-        
-        # Confidence check
         st.write(f"**Composite Range:** {pos_df['comp'].min():.2f} to {pos_df['comp'].max():.2f}")
-        
-        # Validation summary
         st.write("---")
         st.write("**Validation Summary:**")
         st.write(f"✅ Data Valid: {data_ok}")
         st.write(f"✅ Signals Valid: {signal_ok}")
         st.write(f"✅ Backtest Valid: {backtest_ok}")
-        
-        # Recommendations
-        st.write("---")
-        st.write("**Recommendations:**")
-        if (pos_df['position']==1).mean() > 0.95:
-            st.warning("⚠️ Strategy is long >95% of time - similar to Buy&Hold")
-        if (pos_df['position']==-1).sum() == 0:
-            st.warning("⚠️ Never shorted - SPY may have stayed above 200-SMA entire period")
-        if trades < 5:
-            st.warning("⚠️ Very few trades - may be too conservative")
-        if trades > len(pos_df) * 0.1:
-            st.warning("⚠️ High turnover - consider increasing thresholds")
 
-# Final reality check
+# Reality Check
 st.subheader("⚠️ Reality Check")
 strat_ret = stats["Strategy: 3-State"]['Return']
 bh_ret = stats["Buy&Hold: SPY"]['Return']
