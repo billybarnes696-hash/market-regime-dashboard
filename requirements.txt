@@ -1,11 +1,15 @@
-# requirements.txt
-# (Plotly + pandas_ta are optional; app will run without them, but charting is nicer with plotly.)
-streamlit>=1.36
+# Core
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Data Fetching
 yfinance>=0.2.43
-pandas>=2.2
-numpy>=1.26
-requests>=2.32
-beautifulsoup4>=4.12
-lxml>=5.2
-plotly>=5.22
-pandas_ta>=0.3.14b0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Charting (Optional but Recommended)
+plotly>=5.22.0
+
+# Technical Indicators (Optional - has fallback if missing)
+pandas_ta>=0.3.14b
