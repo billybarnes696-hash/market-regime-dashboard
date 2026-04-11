@@ -1,10 +1,8 @@
-
 import io
 import json
 import math
 import zipfile
 from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,14 +17,12 @@ ALL_SERIES = CORE_CUMULATIVE_SERIES + OPTIONAL_RAW_SERIES + PRICE_SERIES
 DEFAULT_WEIGHTS = {"NYAD": 0.28, "NYSI": 0.28, "NYHL": 0.24, "BPSPX": 0.10, "SPXA50R": 0.10}
 LOOKBACK_CHOICES = list(range(1, 21))
 
-
 def safe_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
-
 def normalize_col_name(col: str) -> str:
     c = str(col).strip().upper().replace("$", "")
-    c = c.replace(" ", "_").replace("-", "_")
+    c = c.replace("  ", " ").replace("-", " ")
     aliases = {
         "DATE": "Date",
         "DATETIME": "Date",
@@ -44,7 +40,6 @@ def normalize_col_name(col: str) -> str:
     }
     return aliases.get(c, c)
 
-
 def infer_series_name_from_text(text: str) -> Optional[str]:
     upper = text.upper().replace("$", "")
     for s in ALL_SERIES + ["NYMO"]:
@@ -52,13 +47,11 @@ def infer_series_name_from_text(text: str) -> Optional[str]:
             return s
     return None
 
-
 def read_stockcharts_history(blob: bytes, filename: str) -> Optional[pd.DataFrame]:
     try:
         text = blob.decode("utf-8", errors="replace")
     except Exception:
         return None
-
     lines = [ln.rstrip("\n") for ln in text.splitlines() if ln.strip()]
     if len(lines) < 3:
         return None
@@ -93,7 +86,6 @@ def read_stockcharts_history(blob: bytes, filename: str) -> Optional[pd.DataFram
     out = out.dropna(subset=["Date", series_name]).drop_duplicates(subset=["Date"], keep="last").sort_values("Date")
     return out
 
-
 def read_csv_like(blob: bytes, filename: str) -> Optional[pd.DataFrame]:
     lower = filename.lower()
     if lower.endswith(".csv"):
@@ -119,14 +111,12 @@ def read_csv_like(blob: bytes, filename: str) -> Optional[pd.DataFrame]:
             return None
     return None
 
-
 def extract_single_series(df: Optional[pd.DataFrame], fallback_name: str) -> Optional[pd.DataFrame]:
     if df is None or df.empty:
         return None
     df = df.rename(columns={c: normalize_col_name(c) for c in df.columns}).copy()
     if "Date" not in df.columns:
         return None
-
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"]).sort_values("Date")
 
@@ -163,7 +153,6 @@ def extract_single_series(df: Optional[pd.DataFrame], fallback_name: str) -> Opt
     out = out.dropna(subset=[series_name]).drop_duplicates(subset=["Date"], keep="last").sort_values("Date")
     return out
 
-
 def load_series_from_zip(zip_bytes: bytes) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -180,16 +169,14 @@ def load_series_from_zip(zip_bytes: bytes) -> Dict[str, pd.DataFrame]:
             out[s] = parsed
     return out
 
-
 def load_snapshot(file, snapshot_date: pd.Timestamp) -> Dict[str, pd.DataFrame]:
     blob = file.getvalue()
-
     # StockCharts table snapshot
     try:
         raw = pd.read_csv(io.BytesIO(blob))
         if {"Symbol", "Close"}.issubset(raw.columns):
             raw = raw.copy()
-            raw["Symbol"] = raw["Symbol"].astype(str).str.upper().str.replace("$", "", regex=False)
+            raw["Symbol"] = raw["Symbol"].astype(str).str.upper().replace("$", "", regex=False)
             found = {}
             for s in ALL_SERIES:
                 vals = raw.loc[raw["Symbol"] == s, "Close"]
@@ -227,7 +214,6 @@ def load_snapshot(file, snapshot_date: pd.Timestamp) -> Dict[str, pd.DataFrame]:
         out[s] = parsed
     return out
 
-
 def merge_series(series_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     merged = None
     for sdf in series_dict.values():
@@ -235,7 +221,6 @@ def merge_series(series_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     if merged is None:
         return pd.DataFrame(columns=["Date"] + ALL_SERIES)
     return merged.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
-
 
 def append_snapshot(base: pd.DataFrame, snapshot_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     snap = merge_series(snapshot_dict)
@@ -245,7 +230,6 @@ def append_snapshot(base: pd.DataFrame, snapshot_dict: Dict[str, pd.DataFrame]) 
         return snap
     out = pd.concat([base, snap], ignore_index=True)
     return out.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
-
 
 def maybe_cumulate(df: pd.DataFrame, mode_map: Dict[str, str]) -> pd.DataFrame:
     out = df.copy()
@@ -257,16 +241,13 @@ def maybe_cumulate(df: pd.DataFrame, mode_map: Dict[str, str]) -> pd.DataFrame:
             out[s] = out[s].fillna(0).cumsum()
     return out
 
-
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
-
 
 def rolling_zscore(series: pd.Series, window: int) -> pd.Series:
     mean = series.rolling(window).mean()
     std = series.rolling(window).std(ddof=0).replace(0, np.nan)
     return (series - mean) / std
-
 
 def true_strength_index(series: pd.Series, long_span: int = 25, short_span: int = 13, signal_span: int = 7) -> Tuple[pd.Series, pd.Series]:
     delta = series.diff()
@@ -277,7 +258,6 @@ def true_strength_index(series: pd.Series, long_span: int = 25, short_span: int 
     signal = ema(tsi, signal_span)
     return tsi, signal
 
-
 def bollinger_percent_b(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.Series:
     ma = series.rolling(window).mean()
     std = series.rolling(window).std(ddof=0)
@@ -285,12 +265,10 @@ def bollinger_percent_b(series: pd.Series, window: int = 20, num_std: float = 2.
     lower = ma - num_std * std
     return (series - lower) / (upper - lower).replace(0, np.nan)
 
-
 def adx_from_close(close: pd.Series, window: int = 14) -> pd.Series:
     close = safe_numeric(close)
     high = close * 1.002
     low = close * 0.998
-
     prev_close = close.shift(1)
     prev_high = high.shift(1)
     prev_low = low.shift(1)
@@ -309,7 +287,6 @@ def adx_from_close(close: pd.Series, window: int = 14) -> pd.Series:
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     return dx.ewm(alpha=1 / window, adjust=False).mean()
 
-
 def percentile_rank(series: pd.Series, window: int = 252) -> pd.Series:
     def _rank(vals: pd.Series) -> float:
         vals = vals.dropna()
@@ -318,10 +295,8 @@ def percentile_rank(series: pd.Series, window: int = 252) -> pd.Series:
         return vals.rank(pct=True).iloc[-1]
     return series.rolling(window, min_periods=max(20, window // 4)).apply(_rank, raw=False)
 
-
 def normalize_to_score(series: pd.Series, center: float = 50.0, scale: float = 18.0, clip: float = 2.75) -> pd.Series:
     return center + scale * series.clip(-clip, clip)
-
 
 def compute_series_features(df: pd.DataFrame, col: str) -> pd.DataFrame:
     s = safe_numeric(df[col]).astype(float)
@@ -342,7 +317,6 @@ def compute_series_features(df: pd.DataFrame, col: str) -> pd.DataFrame:
     f[f"{col}_delta5"] = s.diff(5)
     return f
 
-
 def score_series_features(features: pd.DataFrame, col: str) -> pd.DataFrame:
     out = pd.DataFrame(index=features.index)
     pos = normalize_to_score(features[f"{col}_z"]) * 0.55 + (features[f"{col}_pctb"].clip(0, 1) * 100) * 0.45
@@ -357,7 +331,6 @@ def score_series_features(features: pd.DataFrame, col: str) -> pd.DataFrame:
     )
     master = pos * 0.35 + trend * 0.40 + accel * 0.25
     signal = ema(master, 8)
-
     out[f"{col}_position_score"] = pos
     out[f"{col}_trend_score"] = trend
     out[f"{col}_accel_score"] = accel
@@ -366,7 +339,6 @@ def score_series_features(features: pd.DataFrame, col: str) -> pd.DataFrame:
     out[f"{col}_cross"] = np.where(master >= signal, 1, -1)
     out[f"{col}_relrange"] = percentile_rank(master, 252) * 100
     return out
-
 
 def weighted_average(df: pd.DataFrame, cols: List[str], weights: Dict[str, float]) -> pd.Series:
     available = [c for c in cols if c in df.columns]
@@ -377,7 +349,6 @@ def weighted_average(df: pd.DataFrame, cols: List[str], weights: Dict[str, float
     vals = df[available].astype(float)
     return (vals * w).sum(axis=1)
 
-
 def classify_state(score: pd.Series, slope5: pd.Series, cross: pd.Series, relrange: pd.Series) -> pd.Series:
     labels = []
     for sc, sl, cr, rr in zip(score.fillna(np.nan), slope5.fillna(np.nan), cross.fillna(np.nan), relrange.fillna(np.nan)):
@@ -386,7 +357,6 @@ def classify_state(score: pd.Series, slope5: pd.Series, cross: pd.Series, relran
             continue
         improving = (not pd.isna(sl) and sl > 0) or (not pd.isna(cr) and cr > 0)
         regressing = (not pd.isna(sl) and sl < 0) or (not pd.isna(cr) and cr < 0)
-
         if sc >= 72:
             labels.append("Expansion" if improving else "Exhaustion Risk")
         elif sc >= 60:
@@ -399,11 +369,11 @@ def classify_state(score: pd.Series, slope5: pd.Series, cross: pd.Series, relran
             labels.append("Washout / Reversal Watch" if improving else "Stress / Breakdown")
     return pd.Series(labels, index=score.index)
 
-
 def assign_regimes(model: pd.DataFrame, target_col: str) -> pd.Series:
     rr = percentile_rank(model[target_col], 252)
     slope = model[target_col].diff(5)
-    tsi_fast, sig_fast = true_strength_index(model[target_col].fillna(method="ffill"), 7, 4, 5)
+    # Fixed: .fillna(method="ffill") removed in Pandas 2.2+
+    tsi_fast, sig_fast = true_strength_index(model[target_col].ffill(), 7, 4, 5)
     out = []
     for a, b, c in zip(rr, slope, tsi_fast - sig_fast):
         if pd.isna(a):
@@ -420,11 +390,9 @@ def assign_regimes(model: pd.DataFrame, target_col: str) -> pd.Series:
             out.append("range")
     return pd.Series(out, index=model.index)
 
-
 def build_model_frame(source_df: pd.DataFrame, include_optional: List[str], include_rsp: bool, rsp_weight: float) -> pd.DataFrame:
     model = pd.DataFrame({"Date": pd.to_datetime(source_df["Date"])})
     input_series = [s for s in CORE_CUMULATIVE_SERIES + include_optional if s in source_df.columns]
-
     for s in input_series:
         f = compute_series_features(source_df, s)
         sc = score_series_features(f, s)
@@ -461,7 +429,6 @@ def build_model_frame(source_df: pd.DataFrame, include_optional: List[str], incl
     model["RegimeCluster"] = assign_regimes(model, "Ultimate_With_RSP")
     return model
 
-
 def clip_years(df: pd.DataFrame, years: int) -> pd.DataFrame:
     if df.empty:
         return df
@@ -469,7 +436,6 @@ def clip_years(df: pd.DataFrame, years: int) -> pd.DataFrame:
     start = end - pd.DateOffset(years=years)
     clipped = df[df["Date"] >= start].copy()
     return clipped if not clipped.empty else df.copy()
-
 
 def plot_main(model: pd.DataFrame, source_df: pd.DataFrame, years: int, include_rsp: bool) -> go.Figure:
     model_view = clip_years(model, years)
@@ -486,7 +452,6 @@ def plot_main(model: pd.DataFrame, source_df: pd.DataFrame, years: int, include_
         fig.add_hline(y=level, line_dash="dot", opacity=0.3, annotation_text=label, annotation_position="right")
     return fig
 
-
 def plot_components(model: pd.DataFrame, active_inputs: List[str], years: int) -> go.Figure:
     model_view = clip_years(model, years)
     fig = go.Figure()
@@ -500,7 +465,6 @@ def plot_components(model: pd.DataFrame, active_inputs: List[str], years: int) -
     fig.update_layout(title=f"Component Oscillators ({years}Y view)", xaxis_title="Date", yaxis_title="Score", hovermode="x unified", height=460)
     return fig
 
-
 def describe_dataset(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for col in ALL_SERIES:
@@ -512,13 +476,11 @@ def describe_dataset(df: pd.DataFrame) -> pd.DataFrame:
         rows.append({"Series": col, "Start": temp["Date"].min(), "End": temp["Date"].max(), "Rows": int(len(temp)), "Latest": float(temp[col].iloc[-1])})
     return pd.DataFrame(rows)
 
-
 def get_lookup_idx(df: pd.DataFrame, lookup_date: pd.Timestamp) -> Optional[int]:
     mask = df["Date"] <= lookup_date
     if not mask.any():
         return None
     return int(np.where(mask)[0][-1])
-
 
 def safe_price_at(series: pd.Series, idx: int, horizon: int = 0) -> Optional[float]:
     target = idx + horizon
@@ -527,14 +489,12 @@ def safe_price_at(series: pd.Series, idx: int, horizon: int = 0) -> Optional[flo
     val = series.iloc[target]
     return None if pd.isna(val) else float(val)
 
-
 def compute_forward_returns(rsp: pd.Series, horizons: List[int]) -> pd.DataFrame:
     out = pd.DataFrame(index=rsp.index)
     for h in horizons:
         out[f"fwd_{h}d"] = rsp.shift(-h) / rsp - 1
         out[f"fwd_price_{h}d"] = rsp.shift(-h)
     return out
-
 
 def similarity_backtest(
     model: pd.DataFrame,
@@ -552,7 +512,6 @@ def similarity_backtest(
     work["cross"] = safe_numeric(model["Ultimate_Cross"])
     work["regime_code"] = model["RegimeCluster"].map({"washout": 0, "repair": 1, "range": 2, "constructive": 3, "exhaustion": 4})
     work["rsp"] = safe_numeric(rsp)
-
     for s in analog_inputs:
         for suffix in ["master_score", "signal", "relrange"]:
             col = f"{s}_{suffix}"
@@ -615,7 +574,6 @@ def similarity_backtest(
     candidates = candidates.sort_values(["distance", "Date"]).head(k).copy()
     return candidates, work
 
-
 def weighted_forward_stats(analogs: pd.DataFrame) -> Dict[str, float]:
     if analogs.empty:
         return {}
@@ -623,7 +581,6 @@ def weighted_forward_stats(analogs: pd.DataFrame) -> Dict[str, float]:
     if w.sum() <= 0:
         w = pd.Series(np.ones(len(analogs)), index=analogs.index)
     w = w / w.sum()
-
     out: Dict[str, float] = {}
     for h in [5, 10, 20]:
         vals = safe_numeric(analogs[f"fwd_{h}d"])
@@ -638,27 +595,23 @@ def weighted_forward_stats(analogs: pd.DataFrame) -> Dict[str, float]:
         out[f"winrate_{h}d"] = float((ww * (vv > 0).astype(float)).sum())
     return out
 
-
 def format_pct(x: Optional[float]) -> str:
     if x is None or pd.isna(x):
         return "n/a"
     return f"{x * 100:.2f}%"
-
 
 def format_num(x: Optional[float], digits: int = 2) -> str:
     if x is None or pd.isna(x):
         return "n/a"
     return f"{x:.{digits}f}"
 
-
 def analog_distribution_chart(analogs: pd.DataFrame, horizon: int) -> go.Figure:
     fig = go.Figure()
     vals = safe_numeric(analogs.get(f"fwd_{horizon}d", pd.Series(dtype=float))).dropna() * 100
     if not vals.empty:
         fig.add_histogram(x=vals, nbinsx=20, name=f"{horizon}d returns")
-        fig.update_layout(title=f"Analog return distribution: {horizon}d", xaxis_title="Forward return %", yaxis_title="Count", height=320)
+    fig.update_layout(title=f"Analog return distribution: {horizon}d", xaxis_title="Forward return %", yaxis_title="Count", height=320)
     return fig
-
 
 st.title("Breadth Regime Dashboard")
 st.caption("Cumulative breadth core with optional BPSPX/SPXA50R overlays, TSI-style signal crosses, historical lookup, and analog projections.")
@@ -668,7 +621,6 @@ with st.sidebar:
     hist_zip = st.file_uploader("Historical ZIP", type=["zip"])
     daily_file = st.file_uploader("Daily snapshot", type=["csv", "xlsx", "xls", "txt"])
     snapshot_date = pd.Timestamp(st.date_input("Daily snapshot date", value=pd.Timestamp.today().date()))
-
     st.header("Series mode")
     mode_map = {}
     for s in ALL_SERIES:
@@ -709,6 +661,7 @@ if not hist_series:
 merged = merge_series(hist_series)
 if daily_file is not None:
     merged = append_snapshot(merged, load_snapshot(daily_file, snapshot_date))
+
 merged = maybe_cumulate(merged, mode_map)
 merged = merged.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
 
@@ -724,7 +677,7 @@ current = model.iloc[-1]
 
 left, right = st.columns([1.15, 0.85])
 with left:
-    st.plotly_chart(plot_main(model, merged, years_master, include_rsp), use_container_width=True)
+    st.plotly_chart(plot_main(model, merged, years_master, include_rsp), width="stretch")
 with right:
     st.subheader("Current score")
     breadth_delta = model["Breadth_Ultimate"].diff().iloc[-1] if len(model) > 1 else np.nan
@@ -740,11 +693,10 @@ with right:
         if f"{s}_master_score" in current.index:
             label = f"{s} {'Bull' if current.get(f'{s}_cross', -1) > 0 else 'Bear'}"
             st.metric(label, format_num(current[f"{s}_master_score"], 1))
-
-st.plotly_chart(plot_components(model, active_inputs, years_components), use_container_width=True)
+    st.plotly_chart(plot_components(model, active_inputs, years_components), width="stretch")
 
 with st.expander("Data coverage"):
-    st.dataframe(describe_dataset(merged), use_container_width=True)
+    st.dataframe(describe_dataset(merged), width="stretch")
 
 st.subheader("Historical calendar lookup")
 if not model.empty:
@@ -760,7 +712,6 @@ if not model.empty:
         r3.metric("Lookup cross", "Bull" if row["Ultimate_Cross"] > 0 else "Bear")
         rsp_lookup = safe_price_at(merged["RSP"], lookup_idx, 0) if "RSP" in merged.columns else None
         r4.metric("Lookup RSP", format_num(rsp_lookup, 2))
-
         if "RSP" in merged.columns:
             p1, p2, p3 = st.columns(3)
             for col_obj, h in zip([p1, p2, p3], [5, 10, 20]):
@@ -779,7 +730,7 @@ if not model.empty:
                 "Cross": "Bull" if row.get(f"{s}_cross", -1) > 0 else "Bear",
                 "Raw": row.get(f"{s}_raw", np.nan),
             })
-        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(comp_rows), width="stretch")
 
 st.subheader("Analog prediction score")
 if "RSP" not in merged.columns or merged["RSP"].dropna().empty:
@@ -790,7 +741,7 @@ else:
         analog_inputs.append("BPSPX")
     if use_spxa50r_in_analog and "SPXA50R" in include_optional:
         analog_inputs.append("SPXA50R")
-
+    
     analogs, hist = similarity_backtest(model, merged["RSP"], target_col="Ultimate_With_RSP", analog_inputs=analog_inputs, k=analog_k)
     stats = weighted_forward_stats(analogs)
 
@@ -815,56 +766,53 @@ else:
             "analogs_used": int(len(analogs)),
         }
         st.code(json.dumps(summary, indent=2, default=str), language="json")
-        st.plotly_chart(analog_distribution_chart(analogs, dist_horizon), use_container_width=True)
+        st.plotly_chart(analog_distribution_chart(analogs, dist_horizon), width="stretch")
     else:
         st.warning("Not enough overlapping history to build analogs yet.")
 
-    if not analogs.empty:
-        display = analogs[["Date", "target_score", "relrange", "cross", "regime_code", "distance", "similarity", "fwd_5d", "fwd_10d", "fwd_20d", "fwd_price_5d", "fwd_price_10d", "fwd_price_20d"]].copy()
-        display["cross"] = display["cross"].map({1: "Bull", -1: "Bear"})
-        display["regime_code"] = display["regime_code"].map({0: "washout", 1: "repair", 2: "range", 3: "constructive", 4: "exhaustion"})
-        display = display.rename(columns={"target_score": "score", "relrange": "relative_range"})
-        for col in ["fwd_5d", "fwd_10d", "fwd_20d"]:
-            display[col] = display[col].map(format_pct)
-        for col in ["score", "relative_range", "distance", "similarity", "fwd_price_5d", "fwd_price_10d", "fwd_price_20d"]:
-            if col in display.columns:
-                display[col] = pd.to_numeric(display[col], errors="ignore")
-        st.dataframe(display, use_container_width=True)
+if not analogs.empty:
+    display = analogs[["Date", "target_score", "relrange", "cross", "regime_code", "distance", "similarity", "fwd_5d", "fwd_10d", "fwd_20d", "fwd_price_5d", "fwd_price_10d", "fwd_price_20d"]].copy()
+    display["cross"] = display["cross"].map({1: "Bull", -1: "Bear"})
+    display["regime_code"] = display["regime_code"].map({0: "washout", 1: "repair", 2: "range", 3: "constructive", 4: "exhaustion"})
+    display = display.rename(columns={"target_score": "score", "relrange": "relative_range"})
+    for col in ["fwd_5d", "fwd_10d", "fwd_20d"]:
+        display[col] = display[col].map(format_pct)
+    for col in ["score", "relative_range", "distance", "similarity", "fwd_price_5d", "fwd_price_10d", "fwd_price_20d"]:
+        if col in display.columns:
+            display[col] = pd.to_numeric(display[col], errors="ignore")
+    st.dataframe(display, width="stretch")
 
 if show_raw:
     st.subheader("Merged source data")
-    st.dataframe(merged.tail(300), use_container_width=True)
+    st.dataframe(merged.tail(300), width="stretch")
 
 with st.expander("How the state logic works"):
     st.markdown(
         """
-- **Expansion**: high score and still improving.
-- **Exhaustion Risk**: high score but rolling over.
-- **Constructive**: above neutral and improving.
-- **Constructive / Fading**: still positive but losing thrust.
-- **Neutral / Improving** vs **Neutral / Regressing**: same zone, different direction.
-- **Repair / Progressing** vs **Repair / Stalling**: early recovery vs bounce losing force.
-- **Washout / Reversal Watch**: deeply weak but turning up.
-- **Stress / Breakdown**: weak and still deteriorating.
-
-The master oscillator is shown as a **TSI-style score with a signal line**, so you can read bull/bear crosses more cleanly than with a noisy raw score line.
-        """
+Expansion: high score and still improving.
+Exhaustion Risk: high score but rolling over.
+Constructive: above neutral and improving.
+Constructive / Fading: still positive but losing thrust.
+Neutral / Improving vs Neutral / Regressing: same zone, different direction.
+Repair / Progressing vs Repair / Stalling: early recovery vs bounce losing force.
+Washout / Reversal Watch: deeply weak but turning up.
+Stress / Breakdown: weak and still deteriorating.
+The master oscillator is shown as a TSI-style score with a signal line, so you can read bull/bear crosses more cleanly than with a noisy raw score line.
+"""
     )
 
 with st.expander("Expected file formats"):
     st.markdown(
         """
-**Historical ZIP**
-- Supports StockCharts historical exports.
-- Also supports normal CSV/XLSX/TXT files with `Date` plus one series column.
-
-**Daily snapshot**
-- Supports StockCharts symbol-table snapshot files with `Symbol` and `Close`.
-- Or files with explicit columns like `Date, NYAD, NYSI, NYHL, BPSPX, SPXA50R, RSP`.
-
-**Cumulative behavior**
-- NYAD / NYSI / NYHL are usually cumulative in your use case.
-- BPSPX / SPXA50R should stay raw / non-cumulative.
-- RSP should stay raw price.
-        """
+Historical ZIP
+Supports StockCharts historical exports.
+Also supports normal CSV/XLSX/TXT files with `Date` plus one series column.
+Daily snapshot
+Supports StockCharts symbol-table snapshot files with `Symbol` and `Close`.
+Or files with explicit columns like `Date, NYAD, NYSI, NYHL, BPSPX, SPXA50R, RSP`.
+Cumulative behavior
+NYAD / NYSI / NYHL are usually cumulative in your use case.
+BPSPX / SPXA50R should stay raw / non-cumulative.
+RSP should stay raw price.
+"""
     )
