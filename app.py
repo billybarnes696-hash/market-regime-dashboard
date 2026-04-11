@@ -1,770 +1,715 @@
-
-# app.py
-# ------------------------------------------------------------
-# Optionable ETF Mean-Reversion Optimizer & Screener
-# Parallel Processing + Checkpointing + Progress Tracking
-# ------------------------------------------------------------
-
-from __future__ import annotations
-import importlib
-import random
-import time
+import io
 import json
-import os
-from datetime import date, timedelta
-from typing import List, Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
+import zipfile
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
+
+st.set_page_config(page_title="Breadth Ultimate Oscillator", layout="wide")
 
 # -----------------------------
-# Optional Dependencies
+# Helpers
 # -----------------------------
-PLOTLY_AVAILABLE = True
-try:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-except Exception:
-    PLOTLY_AVAILABLE = False
+EXPECTED_SERIES = ["NYAD", "NYSI", "NYHL", "BPSPX", "SPXA50R", "RSP"]
+CUMULATIVE_CORE_SERIES = ["NYAD", "NYSI", "NYHL"]
+OPTIONAL_RAW_SERIES = ["BPSPX", "SPXA50R"]
+OSCILLATOR_SERIES = CUMULATIVE_CORE_SERIES + OPTIONAL_RAW_SERIES
+DEFAULT_WEIGHTS = {"NYAD": 0.26, "NYSI": 0.26, "NYHL": 0.24, "BPSPX": 0.12, "SPXA50R": 0.12}
 
-PANDAS_TA_AVAILABLE = True
-try:
-    ta = importlib.import_module("pandas_ta")
-except Exception:
-    PANDAS_TA_AVAILABLE = False
-    ta = None
 
-YFINANCE_AVAILABLE = True
-try:
-    yf = importlib.import_module("yfinance")
-except Exception:
-    YFINANCE_AVAILABLE = False
-    yf = None
+@dataclass
+class SimilarityResult:
+    anchor_date: pd.Timestamp
+    similarity: float
+    forward_5d: float
+    forward_10d: float
+    forward_20d: float
 
-if not YFINANCE_AVAILABLE:
-    st.error("Missing required package: yfinance. Please install it.")
-    st.stop()
 
-# -----------------------------
-# Config
-# -----------------------------
-CHECKPOINT_FILE = "optimization_checkpoint.json"
-CACHE_DIR = "cache_data"
-os.makedirs(CACHE_DIR, exist_ok=True)
+def safe_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
 
-# -----------------------------
-# Fallback ETF List
-# -----------------------------
-FALLBACK_ETFS = [
-    "SPY","QQQ","IWM","DIA","XLK","XLF","XLE","XLI","XLY","XLU","XLV","XLP","XLB",
-    "SMH","SOXX","ARKK","TLT","IEF","SHY","HYG","LQD","GLD","SLV","GDX",
-    "USO","UNG","VNQ","EEM","VWO","FXI","EWJ","EWZ","EFA","VEA","VTI","VOO"
-]
 
-# -----------------------------
-# Data Fetching (Cached)
-# -----------------------------
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def fetch_daily_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
-    try:
-        df = yf.download(ticker, start=start, end=end, interval="1d", progress=False, threads=False)
-    except Exception:
-        return pd.DataFrame()
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if c and c[0] else c[-1] for c in df.columns]
-    
-    df.columns = [str(c).strip().title() for c in df.columns]
-    
-    required = {"Open", "High", "Low", "Close"}
-    if not required.issubset(set(df.columns)):
-        return pd.DataFrame()
-    
-    if "Volume" not in df.columns:
-        df["Volume"] = np.nan
-        
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    if len(df) < 250:
-        return pd.DataFrame()
-        
-    return df
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def is_optionable_yf(ticker: str) -> bool:
-    try:
-        t = yf.Ticker(ticker)
-        exps = t.options
-        return bool(exps and len(exps) > 0)
-    except Exception:
-        return False
-
-# -----------------------------
-# Indicators
-# -----------------------------
-def ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False).mean()
-
-def rsi(close: pd.Series, length: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = ema(gain, length)
-    avg_loss = ema(loss, length)
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def cci(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 20) -> pd.Series:
-    tp = (high + low + close) / 3.0
-    sma_tp = tp.rolling(length).mean()
-    mad = (tp - sma_tp).abs().rolling(length).mean()
-    return (tp - sma_tp) / (0.015 * mad.replace(0, np.nan))
-
-def willr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
-    hh = high.rolling(length).max()
-    ll = low.rolling(length).min()
-    denom = (hh - ll).replace(0, np.nan)
-    return -100 * (hh - close) / denom
-
-def cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, length: int = 20) -> pd.Series:
-    denom = (high - low).replace(0, np.nan)
-    mfm = ((close - low) - (high - close)) / denom
-    mfv = mfm * volume
-    return mfv.rolling(length).sum() / volume.rolling(length).sum()
-
-def tsi(close: pd.Series, fast: int = 6, slow: int = 3, signal: int = 6) -> pd.Series:
-    mom = close.diff()
-    num = ema(ema(mom, slow), fast)
-    den = ema(ema(mom.abs(), slow), fast)
-    return 100 * (num / den.replace(0, np.nan))
-
-# -----------------------------
-# Feature Computation
-# -----------------------------
-def compute_features(df: pd.DataFrame, params: Dict) -> pd.DataFrame:
-    out = df.copy()
-    
-    if PANDAS_TA_AVAILABLE:
-        try:
-            out["RSI"] = ta.rsi(out["Close"], length=params.get('rsi_len', 14))
-            out["CCI"] = ta.cci(out["High"], out["Low"], out["Close"], length=params.get('cci_len', 20))
-            out["WILLR"] = ta.willr(out["High"], out["Low"], out["Close"], length=params.get('willr_len', 14))
-            out["CMF"] = ta.cmf(out["High"], out["Low"], out["Close"], out["Volume"], length=params.get('cmf_len', 20))
-            out["TSI"] = tsi(out["Close"], fast=params.get('tsi_fast', 6), slow=params.get('tsi_slow', 3))
-        except Exception:
-            out["TSI"] = tsi(out["Close"], fast=params.get('tsi_fast', 6), slow=params.get('tsi_slow', 3))
-            out["RSI"] = rsi(out["Close"], length=params.get('rsi_len', 14))
-            out["CCI"] = cci(out["High"], out["Low"], out["Close"], length=params.get('cci_len', 20))
-            out["WILLR"] = willr(out["High"], out["Low"], out["Close"], length=params.get('willr_len', 14))
-            out["CMF"] = cmf(out["High"], out["Low"], out["Close"], out["Volume"], length=params.get('cmf_len', 20))
-    else:
-        out["TSI"] = tsi(out["Close"], fast=params.get('tsi_fast', 6), slow=params.get('tsi_slow', 3))
-        out["RSI"] = rsi(out["Close"], length=params.get('rsi_len', 14))
-        out["CCI"] = cci(out["High"], out["Low"], out["Close"], length=params.get('cci_len', 20))
-        out["WILLR"] = willr(out["High"], out["Low"], out["Close"], length=params.get('willr_len', 14))
-        out["CMF"] = cmf(out["High"], out["Low"], out["Close"], out["Volume"], length=params.get('cmf_len', 20))
-
-    pv = out["Close"] * out["Volume"]
-    out["VWAP_PROXY"] = pv.rolling(params.get('vwap_len', 20)).sum() / out["Volume"].rolling(params.get('vwap_len', 20)).sum()
-    
-    upper_wick = out["High"] - np.maximum(out["Open"], out["Close"])
-    rng = (out["High"] - out["Low"]).replace(0, np.nan)
-    out["UPPER_WICK_PCT"] = (upper_wick / rng).clip(lower=0, upper=1)
-    
-    out["BEAR_DIV"] = ((out["Close"] > out["Close"].shift(1)) & (out["RSI"] < out["RSI"].shift(1))).astype(int)
-    
-    return out
-
-def apply_thresholds(df: pd.DataFrame, params: Dict) -> pd.DataFrame:
-    out = df.copy()
-    
-    vwap_1 = params.get('vwap_1', 0.01)
-    vwap_2 = params.get('vwap_2', 0.02)
-    out["VW_STRETCH"] = 0
-    out.loc[out["Close"] > out["VWAP_PROXY"] * (1 + vwap_2), "VW_STRETCH"] = 2
-    out.loc[(out["Close"] > out["VWAP_PROXY"] * (1 + vwap_1)) & (out["Close"] <= out["VWAP_PROXY"] * (1 + vwap_2)), "VW_STRETCH"] = 1
-    
-    wick_thresh = params.get('wick_thresh', 0.50)
-    out["CANDLE_EXHAUST"] = (out["UPPER_WICK_PCT"] >= wick_thresh).astype(int)
-    
-    out["S_TSI"] = (out["TSI"] > float(params['tsi_thr'])).astype(int)
-    out["S_RSI"] = (out["RSI"] > float(params['rsi_thr'])).astype(int)
-    out["S_CCI"] = (out["CCI"] > float(params['cci_thr'])).astype(int)
-    out["S_WILLR"] = (out["WILLR"] > float(params['willr_thr'])).astype(int)
-    out["S_CMF"] = (out["CMF"] < float(params['cmf_thr'])).astype(int)
-    
-    if params.get('use_cci_regress', True):
-        days = params.get('cci_regress_days', 2)
-        cci_diff = out["CCI"].diff()
-        out["CCI_REGRESS"] = ((cci_diff < 0).rolling(int(days)).sum() == int(days)).fillna(False).astype(int)
-        out["S_CCI_REGRESS"] = out["CCI_REGRESS"]
-    else:
-        out["S_CCI_REGRESS"] = 0
-        
-    out["SCORE"] = (
-        out["S_TSI"] + out["S_RSI"] + out["S_CCI"] + out["S_WILLR"] + out["S_CMF"] +
-        out["VW_STRETCH"] + out["CANDLE_EXHAUST"] + out["BEAR_DIV"] + out["S_CCI_REGRESS"]
-    )
-    
-    out["MAX_SCORE"] = 9 if params.get('use_cci_regress', True) else 8
-    out["PROB_PCT"] = (out["SCORE"] / out["MAX_SCORE"] * 100).clip(0, 100)
-    
-    return out
-
-def backtest_drop_window(df: pd.DataFrame, min_score: int, drop_pct: float, exit_window: int = 2) -> Dict:
-    df = df.sort_index().copy()
-    
-    df["RET_D1"] = df["Close"].shift(-1) / df["Close"] - 1
-    df["RET_D2"] = df["Close"].shift(-2) / df["Close"] - 1
-    
-    df["SIGNAL"] = df["SCORE"] >= min_score
-    
-    target = -abs(drop_pct) / 100.0
-    df["HIT_D1"] = df["SIGNAL"] & (df["RET_D1"] <= target)
-    df["HIT_D2"] = df["SIGNAL"] & (df["RET_D2"] <= target)
-    df["HIT_EITHER"] = df["SIGNAL"] & ((df["RET_D1"] <= target) | (df["RET_D2"] <= target))
-    
-    signals = int(df["SIGNAL"].sum())
-    if signals == 0:
-        return {"signals": 0, "prob_either_pct": 0, "expectancy": 0, "latest": df.iloc[-1] if not df.empty else None}
-    
-    prob_d1 = df["HIT_D1"].sum() / signals * 100
-    prob_d2 = df["HIT_D2"].sum() / signals * 100
-    prob_either = df["HIT_EITHER"].sum() / signals * 100
-    
-    hit_returns = df.loc[df["HIT_EITHER"], ["RET_D1", "RET_D2"]].min(axis=1)
-    avg_drop = hit_returns.mean() * 100 if not hit_returns.empty else 0
-    
-    miss_mask = df["SIGNAL"] & ~df["HIT_EITHER"]
-    miss_returns = df.loc[miss_mask, ["RET_D1", "RET_D2"]].max(axis=1)
-    avg_gain = miss_returns.mean() * 100 if not miss_returns.empty else 0
-    
-    hit_rate = prob_either / 100
-    expectancy = (hit_rate * avg_drop) + ((1 - hit_rate) * avg_gain)
-    
-    return {
-        "signals": signals,
-        "prob_day1_pct": round(prob_d1, 1),
-        "prob_day2_pct": round(prob_d2, 1),
-        "prob_either_pct": round(prob_either, 1),
-        "avg_drop_when_hit": round(avg_drop, 2),
-        "avg_gain_when_miss": round(avg_gain, 2),
-        "expectancy": round(expectancy, 3),
-        "latest": df.iloc[-1]
+def normalize_col_name(col: str) -> str:
+    c = str(col).strip().upper().replace("$", "")
+    c = c.replace(" ", "_")
+    if c in {"DATE", "DATETIME", "TIME"}:
+        return "Date"
+    aliases = {
+        "NYAD": "NYAD",
+        "ADLINE": "NYAD",
+        "ADVANCE_DECLINE": "NYAD",
+        "NYSI": "NYSI",
+        "SUMMATION": "NYSI",
+        "NYHL": "NYHL",
+        "NHNL": "NYHL",
+        "NEW_HIGHS_NEW_LOWS": "NYHL",
+        "RSP": "RSP",
+        "RSP_CLOSE": "RSP",
+        "BPSPX": "BPSPX",
+        "BULLISH_PERCENT": "BPSPX",
+        "SPXA50R": "SPXA50R",
+        "SPXA_50R": "SPXA50R",
+        "PCT_ABOVE_50DMA": "SPXA50R",
+        "CLOSE": "Value",
+        "LAST": "Value",
+        "VALUE": "Value",
     }
+    return aliases.get(c, c)
 
-# -----------------------------
-# Single Symbol Optimization
-# -----------------------------
-def optimize_single_symbol(ticker: str, df: pd.DataFrame, n_combos: int, drop_pct: float, min_signals: int) -> Dict:
-    param_space = {
-        'tsi_thr': list(range(85, 100, 1)),
-        'cci_thr': list(range(100, 201, 5)),
-        'rsi_thr': list(range(60, 86, 1)),
-        'willr_thr': list(range(-30, -9, 1)),
-        'cmf_thr': [round(x, 2) for x in np.arange(-0.10, 0.11, 0.02)],
-        'cci_regress_days': [1, 2, 3],
-        'min_score_trigger': list(range(5, 9)),
-        'use_cci_regress': [True, False]
-    }
-    
-    results = []
-    for _ in range(n_combos):
-        params = {k: random.choice(v) for k, v in param_space.items()}
-        params.update({'rsi_len': 14, 'cci_len': 20, 'willr_len': 14, 'cmf_len': 20, 
-                       'tsi_fast': 6, 'tsi_slow': 3, 'vwap_len': 20, 'vwap_1': 0.01, 
-                       'vwap_2': 0.02, 'wick_thresh': 0.50})
-        
-        feat = apply_thresholds(df, params)
-        bt = backtest_drop_window(feat, params['min_score_trigger'], drop_pct, exit_window=2)
-        
-        if bt['signals'] >= min_signals:
-            score = (0.5 * bt['prob_either_pct']) + (0.5 * (-bt['expectancy'] * 10))
-            results.append({**params, **bt, 'score': score, 'ticker': ticker})
-            
-    top = sorted(results, key=lambda x: x['score'], reverse=True)[:3]
-    if not top:
-        return {'ticker': ticker, 'personal_best': [], 'avg_prob': 0, 'avg_expectancy': 0, 'status': 'no_edge'}
-        
-    return {
-        'ticker': ticker,
-        'personal_best': top,
-        'avg_prob': round(np.mean([r['prob_either_pct'] for r in top]), 1),
-        'avg_expectancy': round(np.mean([r['expectancy'] for r in top]), 3),
-        'status': 'complete'
-    }
 
-# -----------------------------
-# Checkpoint Functions
-# -----------------------------
-def save_checkpoint(results: List[Dict], completed_tickers: List[str], checkpoint_file: str = CHECKPOINT_FILE):
-    """Save progress every N tickers"""
-    checkpoint = {
-        'completed_tickers': completed_tickers,
-        'results': results,
-        'timestamp': date.today().isoformat()
-    }
-    with open(checkpoint_file, 'w') as f:
-        json.dump(checkpoint, f, default=str)
-
-def load_checkpoint(checkpoint_file: str = CHECKPOINT_FILE) -> Optional[Dict]:
-    """Load previous progress if exists"""
-    if os.path.exists(checkpoint_file):
-        try:
-            with open(checkpoint_file, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return None
+def infer_series_name(df: pd.DataFrame, fallback: str) -> Optional[str]:
+    cols = {normalize_col_name(c): c for c in df.columns}
+    for series in EXPECTED_SERIES:
+        if series in cols:
+            return series
+    stem = fallback.upper().replace("$", "")
+    for series in EXPECTED_SERIES:
+        if series in stem:
+            return series
     return None
 
-def clear_checkpoint(checkpoint_file: str = CHECKPOINT_FILE):
-    """Clear checkpoint after successful completion"""
-    if os.path.exists(checkpoint_file):
-        os.remove(checkpoint_file)
+
+def extract_single_series_from_df(df: pd.DataFrame, fallback_name: str) -> Optional[pd.DataFrame]:
+    if df.empty:
+        return None
+
+    renamed = {c: normalize_col_name(c) for c in df.columns}
+    df = df.rename(columns=renamed).copy()
+
+    date_col = None
+    for c in df.columns:
+        if c == "Date":
+            date_col = c
+            break
+    if date_col is None:
+        return None
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date")
+
+    series_name = infer_series_name(df, fallback_name)
+    value_col = None
+
+    if series_name and series_name in df.columns:
+        value_col = series_name
+    elif "Value" in df.columns:
+        value_col = "Value"
+    else:
+        candidates = [c for c in df.columns if c != "Date"]
+        numeric_candidates = [c for c in candidates if pd.api.types.is_numeric_dtype(df[c])]
+        if not numeric_candidates and candidates:
+            # try coercion
+            for c in candidates:
+                coerced = safe_numeric(df[c])
+                if coerced.notna().sum() > 0:
+                    df[c] = coerced
+                    numeric_candidates.append(c)
+        if len(numeric_candidates) == 1:
+            value_col = numeric_candidates[0]
+        elif series_name and series_name in candidates:
+            value_col = series_name
+        elif candidates:
+            value_col = candidates[0]
+
+    if value_col is None:
+        return None
+
+    if series_name is None:
+        series_name = fallback_name.upper()
+        if series_name not in EXPECTED_SERIES:
+            return None
+
+    out = df[["Date", value_col]].copy()
+    out.columns = ["Date", series_name]
+    out[series_name] = safe_numeric(out[series_name])
+    out = out.dropna(subset=[series_name]).drop_duplicates(subset=["Date"], keep="last")
+    return out
+
+
+def read_csv_like(blob: bytes, filename: str) -> Optional[pd.DataFrame]:
+    lower = filename.lower()
+    try:
+        if lower.endswith(".csv"):
+            return pd.read_csv(io.BytesIO(blob))
+        if lower.endswith((".xlsx", ".xls")):
+            return pd.read_excel(io.BytesIO(blob))
+        if lower.endswith(".txt"):
+            return pd.read_csv(io.BytesIO(blob), sep=None, engine="python")
+    except Exception:
+        return None
+    return None
+
+
+def load_series_from_zip(zip_bytes: bytes) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for name in zf.namelist():
+            if name.endswith("/"):
+                continue
+            blob = zf.read(name)
+            df = read_csv_like(blob, name)
+            if df is None:
+                continue
+            parsed = extract_single_series_from_df(df, fallback_name=name)
+            if parsed is None:
+                continue
+            series_name = [c for c in parsed.columns if c != "Date"][0]
+            out[series_name] = parsed
+    return out
+
+
+def load_snapshot(file) -> Dict[str, pd.DataFrame]:
+    blob = file.getvalue()
+    df = read_csv_like(blob, file.name)
+    if df is None:
+        return {}
+
+    renamed = {c: normalize_col_name(c) for c in df.columns}
+    df = df.rename(columns=renamed).copy()
+    if "Date" not in df.columns:
+        return {}
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date")
+
+    found: Dict[str, pd.DataFrame] = {}
+    for s in EXPECTED_SERIES:
+        if s in df.columns:
+            tmp = df[["Date", s]].copy()
+            tmp[s] = safe_numeric(tmp[s])
+            tmp = tmp.dropna(subset=[s]).drop_duplicates(subset=["Date"], keep="last")
+            if not tmp.empty:
+                found[s] = tmp
+
+    # If the snapshot is single-series, still allow it.
+    if not found:
+        parsed = extract_single_series_from_df(df, fallback_name=file.name)
+        if parsed is not None:
+            s = [c for c in parsed.columns if c != "Date"][0]
+            found[s] = parsed
+    return found
+
+
+def merge_series(series_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    merged = None
+    for _, sdf in series_dict.items():
+        if merged is None:
+            merged = sdf.copy()
+        else:
+            merged = merged.merge(sdf, on="Date", how="outer")
+    if merged is None:
+        return pd.DataFrame(columns=["Date"] + EXPECTED_SERIES)
+    merged = merged.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+    return merged
+
+
+def append_snapshot(base: pd.DataFrame, snapshot_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    snap = merge_series(snapshot_dict)
+    if snap.empty:
+        return base
+    if base.empty:
+        out = snap
+    else:
+        out = pd.concat([base, snap], ignore_index=True)
+    out = out.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+    return out
+
+
+def rolling_zscore(series: pd.Series, window: int) -> pd.Series:
+    mean = series.rolling(window).mean()
+    std = series.rolling(window).std(ddof=0).replace(0, np.nan)
+    return (series - mean) / std
+
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def true_strength_index(series: pd.Series, long_span: int = 25, short_span: int = 13, signal_span: int = 7) -> Tuple[pd.Series, pd.Series]:
+    delta = series.diff()
+    abs_delta = delta.abs()
+    double_smoothed = ema(ema(delta, long_span), short_span)
+    double_abs = ema(ema(abs_delta, long_span), short_span)
+    tsi = 100 * double_smoothed / double_abs.replace(0, np.nan)
+    signal = ema(tsi, signal_span)
+    return tsi, signal
+
+
+def bollinger_percent_b(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.Series:
+    ma = series.rolling(window).mean()
+    std = series.rolling(window).std(ddof=0)
+    upper = ma + num_std * std
+    lower = ma - num_std * std
+    denom = (upper - lower).replace(0, np.nan)
+    return (series - lower) / denom
+
+
+def adx_from_close(close: pd.Series, window: int = 14) -> pd.Series:
+    # Close-only approximation for breadth series. Good enough for persistence scoring.
+    high = close * (1 + 0.002)
+    low = close * (1 - 0.002)
+    prev_close = close.shift(1)
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+
+    plus_dm = (high - prev_high).clip(lower=0)
+    minus_dm = (prev_low - low).clip(lower=0)
+    plus_dm = plus_dm.where(plus_dm > minus_dm, 0.0)
+    minus_dm = minus_dm.where(minus_dm > plus_dm, 0.0)
+
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1 / window, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / window, adjust=False).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1 / window, adjust=False).mean() / atr.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / window, adjust=False).mean()
+    return adx
+
+
+def minmax_to_0_100(series: pd.Series, low: float, high: float) -> pd.Series:
+    scaled = (series - low) / (high - low)
+    return 100 * scaled.clip(0, 1)
+
+
+def tanh_to_0_100(series: pd.Series, scale: float = 1.5) -> pd.Series:
+    x = np.tanh(series / scale)
+    return 50 + 50 * x
+
+
+def compute_features(series: pd.Series, prefix: str) -> pd.DataFrame:
+    tsi, tsi_signal = true_strength_index(series)
+    roc20 = series.pct_change(20) * 100
+    z63 = rolling_zscore(series, 63)
+    roc_z63 = rolling_zscore(roc20, 63)
+    pct_b = bollinger_percent_b(series, 20, 2.0)
+    adx14 = adx_from_close(series, 14)
+    slope10 = series.diff(10)
+    slope_z = rolling_zscore(slope10, 63)
+
+    pos_score = 0.6 * tanh_to_0_100(z63, 1.75) + 0.4 * (pct_b * 100).clip(0, 100)
+    trend_score = 0.5 * ((tsi + 100) / 2).clip(0, 100) + 0.25 * minmax_to_0_100(adx14, 10, 40) + 0.25 * tanh_to_0_100(slope_z, 1.5)
+    accel_score = 0.65 * tanh_to_0_100(roc_z63, 1.5) + 0.35 * tanh_to_0_100(tsi - tsi_signal, 8.0)
+    master = 0.35 * pos_score + 0.40 * trend_score + 0.25 * accel_score
+
+    out = pd.DataFrame({
+        f"{prefix}_raw": series,
+        f"{prefix}_z63": z63,
+        f"{prefix}_roc20": roc20,
+        f"{prefix}_roc_z63": roc_z63,
+        f"{prefix}_pctb": pct_b,
+        f"{prefix}_tsi": tsi,
+        f"{prefix}_tsi_signal": tsi_signal,
+        f"{prefix}_adx14": adx14,
+        f"{prefix}_slope10": slope10,
+        f"{prefix}_pos_score": pos_score,
+        f"{prefix}_trend_score": trend_score,
+        f"{prefix}_accel_score": accel_score,
+        f"{prefix}_master_score": master,
+    })
+    return out
+
+
+def maybe_cumulate(df: pd.DataFrame, mode_map: Dict[str, str]) -> pd.DataFrame:
+    out = df.copy()
+    for col, mode in mode_map.items():
+        if col in out.columns and mode == "Daily delta → cumulative":
+            out[col] = out[col].fillna(0).cumsum()
+    return out
+
+
+def build_model_frame(df: pd.DataFrame, include_rsp: bool, rsp_weight: float) -> pd.DataFrame:
+    model = df[["Date"]].copy()
+
+    weights = DEFAULT_WEIGHTS.copy()
+    total = sum(weights.values())
+    weights = {k: v / total for k, v in weights.items()}
+
+    for col in OSCILLATOR_SERIES:
+        if col in df.columns:
+            feats = compute_features(df[col], col)
+            model = pd.concat([model, feats], axis=1)
+
+    breadth_master = None
+    for col in OSCILLATOR_SERIES:
+        score_col = f"{col}_master_score"
+        if score_col in model.columns:
+            contrib = model[score_col] * weights[col]
+            breadth_master = contrib if breadth_master is None else breadth_master.add(contrib, fill_value=0)
+    model["Breadth_Ultimate"] = breadth_master
+
+    if include_rsp and "RSP" in df.columns:
+        rsp_feats = compute_features(df["RSP"], "RSP")
+        model = pd.concat([model, rsp_feats], axis=1)
+        model["Ultimate_With_RSP"] = (
+            (1 - rsp_weight) * model["Breadth_Ultimate"] + rsp_weight * model["RSP_master_score"]
+        )
+    else:
+        model["Ultimate_With_RSP"] = model["Breadth_Ultimate"]
+
+    model["Ultimate_5d_Change"] = model["Ultimate_With_RSP"].diff(5)
+    model["Breadth_5d_Change"] = model["Breadth_Ultimate"].diff(5)
+
+    model["State"] = model["Ultimate_With_RSP"].apply(label_state)
+    return model
+
+
+def label_state(score: float) -> str:
+    if pd.isna(score):
+        return "Insufficient data"
+    if score >= 75:
+        return "Expansion"
+    if score >= 60:
+        return "Constructive"
+    if score >= 45:
+        return "Repair / Neutral"
+    if score >= 30:
+        return "Stress"
+    return "Washout"
+
+
+def similarity_backtest(model: pd.DataFrame, price_series: pd.Series, target_col: str, k: int = 20, lookahead: Tuple[int, int, int] = (5, 10, 20), min_gap: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    feature_cols = [
+        target_col,
+        "Ultimate_5d_Change",
+        "Breadth_Ultimate",
+        "Breadth_5d_Change",
+        "NYAD_master_score",
+        "NYSI_master_score",
+        "NYHL_master_score",
+        "BPSPX_master_score",
+        "SPXA50R_master_score",
+        "BPSPX_roc_z63",
+        "SPXA50R_roc_z63",
+    ]
+    feature_cols = [c for c in feature_cols if c in model.columns]
+
+    hist = model.copy()
+    for h in lookahead:
+        hist[f"fwd_{h}d"] = price_series.shift(-h) / price_series - 1
+    hist = hist.dropna(subset=feature_cols + [f"fwd_{lookahead[-1]}d"])
+    if len(hist) < 100:
+        return pd.DataFrame(), hist
+
+    current = hist.iloc[-1]
+    candidate_pool = hist.iloc[:-min_gap].copy()
+    if candidate_pool.empty:
+        return pd.DataFrame(), hist
+
+    X = candidate_pool[feature_cols].copy()
+    cur = current[feature_cols]
+
+    mu = X.mean()
+    sigma = X.std(ddof=0).replace(0, np.nan)
+    Xs = (X - mu) / sigma
+    cs = (cur - mu) / sigma
+    dist = np.sqrt(((Xs - cs) ** 2).sum(axis=1))
+
+    candidate_pool = candidate_pool.assign(distance=dist)
+    candidate_pool = candidate_pool.sort_values("distance").head(k)
+    candidate_pool["similarity"] = 1 / (1 + candidate_pool["distance"])
+
+    cols = ["Date", "similarity", "distance"] + [f"fwd_{h}d" for h in lookahead]
+    return candidate_pool[cols].reset_index(drop=True), hist
+
+
+def weighted_forward_stats(analogs: pd.DataFrame, horizons: Tuple[int, int, int] = (5, 10, 20)) -> Dict[str, float]:
+    if analogs.empty:
+        return {}
+    w = analogs["similarity"].clip(lower=1e-9)
+    out: Dict[str, float] = {}
+    for h in horizons:
+        vals = analogs[f"fwd_{h}d"]
+        out[f"mean_{h}d"] = np.average(vals, weights=w)
+        out[f"median_{h}d"] = float(vals.median())
+        out[f"winrate_{h}d"] = np.average((vals > 0).astype(float), weights=w)
+        out[f"p10_{h}d"] = float(vals.quantile(0.10))
+        out[f"p90_{h}d"] = float(vals.quantile(0.90))
+    return out
+
+
+def format_pct(x: Optional[float]) -> str:
+    if x is None or pd.isna(x):
+        return "n/a"
+    return f"{x * 100:.2f}%"
+
+
+def nearest_available_date(dates: pd.Series, selected_date) -> Optional[pd.Timestamp]:
+    if dates.empty:
+        return None
+    d = pd.Timestamp(selected_date)
+    valid = dates.dropna().sort_values().unique()
+    if len(valid) == 0:
+        return None
+    idx = np.searchsorted(valid, d.to_datetime64(), side="right") - 1
+    if idx < 0:
+        return pd.Timestamp(valid[0])
+    return pd.Timestamp(valid[idx])
+
+
+def plot_main(model: pd.DataFrame, source_df: pd.DataFrame, use_rsp: bool) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=model["Date"], y=model["Breadth_Ultimate"], name="Breadth Ultimate", mode="lines"))
+    if use_rsp and "Ultimate_With_RSP" in model.columns:
+        fig.add_trace(go.Scatter(x=model["Date"], y=model["Ultimate_With_RSP"], name="Ultimate + RSP", mode="lines"))
+    if use_rsp and "RSP" in source_df.columns:
+        rsp_z = rolling_zscore(source_df["RSP"], 63)
+        rsp_norm = 50 + 18 * rsp_z.clip(-2.75, 2.75)
+        fig.add_trace(go.Scatter(x=source_df["Date"], y=rsp_norm, name="RSP overlay (normalized)", mode="lines", yaxis="y"))
+    fig.update_layout(
+        title="Ultimate Breadth Oscillator",
+        xaxis_title="Date",
+        yaxis_title="Score (0-100)",
+        hovermode="x unified",
+        height=520,
+    )
+    for level, label in [(75, "Expansion"), (60, "Constructive"), (45, "Neutral/Repair"), (30, "Stress")]:
+        fig.add_hline(y=level, line_dash="dot", opacity=0.35, annotation_text=label, annotation_position="right")
+    return fig
+
+
+def plot_components(model: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    for col in OSCILLATOR_SERIES:
+        mcol = f"{col}_master_score"
+        if mcol in model.columns:
+            fig.add_trace(go.Scatter(x=model["Date"], y=model[mcol], name=col, mode="lines"))
+    fig.update_layout(title="Per-Series Master Scores", xaxis_title="Date", yaxis_title="Score (0-100)", hovermode="x unified", height=420)
+    return fig
+
+
+def describe_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for col in EXPECTED_SERIES:
+        if col in df.columns:
+            rows.append({
+                "Series": col,
+                "Start": df.loc[df[col].notna(), "Date"].min(),
+                "End": df.loc[df[col].notna(), "Date"].max(),
+                "Rows": int(df[col].notna().sum()),
+                "Latest": df[col].dropna().iloc[-1] if df[col].notna().any() else np.nan,
+            })
+    return pd.DataFrame(rows)
+
 
 # -----------------------------
-# Parallel Optimization Engine
+# UI
 # -----------------------------
-def run_optimization_parallel(tickers: List[str], years: int, n_combos: int, drop_pct: float, 
-                               min_signals: int, max_workers: int = 8, checkpoint_interval: int = 50) -> Dict:
-    """Run optimization with parallel processing + checkpointing"""
-    
-    end_dt = date.today()
-    start_dt = end_dt - timedelta(days=365 * years)
-    
-    # Check for existing checkpoint
-    checkpoint = load_checkpoint()
-    if checkpoint:
-        completed_tickers = checkpoint.get('completed_tickers', [])
-        existing_results = checkpoint.get('results', [])
-        tickers_remaining = [t for t in tickers if t not in completed_tickers]
-        st.info(f"📁 Resuming from checkpoint: {len(completed_tickers)} completed, {len(tickers_remaining)} remaining")
-    else:
-        completed_tickers = []
-        existing_results = []
-        tickers_remaining = tickers
-    
-    # Fetch data for remaining tickers
-    symbol_data = {}
-    fetch_progress = st.progress(0)
-    
-    for i, tkr in enumerate(tickers_remaining):
-        df = fetch_daily_ohlcv(tkr, start_dt.isoformat(), (end_dt + timedelta(1)).isoformat())
-        if not df.empty:
-            feat = compute_features(df, {})
-            symbol_data[tkr] = feat
-        
-        if (i + 1) % 10 == 0:
-            fetch_progress.progress(min((i + 1) / len(tickers_remaining) * 0.3, 1.0))
-    fetch_progress.empty()
-    
-    # Optimize in parallel
-    all_results = existing_results.copy()
-    optimize_progress = st.progress(0)
-    status_text = st.empty()
-    
-    batch_results = []
-    batch_tickers = []
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(optimize_single_symbol, tkr, df, n_combos, drop_pct, min_signals): tkr 
-                   for tkr, df in symbol_data.items()}
-        
-        completed = 0
-        total = len(futures)
-        
-        for future in as_completed(futures):
-            tkr = futures[future]
-            try:
-                result = future.result()
-                batch_results.append(result)
-                batch_tickers.append(tkr)
-                completed += 1
-                
-                # Update progress
-                progress = 0.3 + (completed / total * 0.7)
-                optimize_progress.progress(min(progress, 1.0))
-                status_text.text(f"⚡ Optimizing: {completed}/{total} ETFs | Last: {tkr}")
-                
-                # Checkpoint every N tickers
-                if len(batch_tickers) >= checkpoint_interval:
-                    all_results.extend(batch_results)
-                    completed_tickers.extend(batch_tickers)
-                    save_checkpoint(all_results, completed_tickers)
-                    st.success(f"💾 Checkpoint saved: {len(completed_tickers)} ETFs complete")
-                    batch_results = []
-                    batch_tickers = []
-                    
-            except Exception as e:
-                st.error(f"❌ Error optimizing {tkr}: {str(e)}")
-                completed += 1
-    
-    # Final save
-    all_results.extend(batch_results)
-    completed_tickers.extend(batch_tickers)
-    save_checkpoint(all_results, completed_tickers)
-    
-    optimize_progress.empty()
-    status_text.empty()
-    
-    # Clear checkpoint on successful completion
-    if len(completed_tickers) >= len(tickers):
-        clear_checkpoint()
-        st.success("✅ Optimization complete! Checkpoint cleared.")
-    
-    # Aggregate results
-    consensus = []
-    if all_results:
-        all_winners = []
-        for res in all_results:
-            for p in res.get('personal_best', []):
-                sig = f"TSI>{p['tsi_thr']}_CCI>{p['cci_thr']}_RSI>{p['rsi_thr']}_Reg={p['use_cci_regress']}"
-                all_winners.append({'sig': sig, 'params': p, 'prob': p['prob_either_pct']})
-        
-        from collections import Counter
-        counts = Counter(w['sig'] for w in all_winners)
-        for sig, count in counts.most_common(5):
-            example = next((w['params'] for w in all_winners if f"TSI>{w['params']['tsi_thr']}" in sig), None)
-            if example:
-                avg_prob = np.mean([w['prob'] for w in all_winners if w['sig'] == sig])
-                consensus.append({'signature': sig, 'count': count, 'avg_prob': round(avg_prob, 1), 'params': example})
-    
-    high_edge = sorted([r for r in all_results if r.get('avg_prob', 0) > 0], 
-                       key=lambda x: x['avg_prob'], reverse=True)[:20]
-    
-    return {
-        'symbol_results': all_results,
-        'consensus': consensus,
-        'high_edge': high_edge,
-        'completed_count': len(completed_tickers),
-        'total_count': len(tickers)
+st.title("Breadth Ultimate Oscillator for NYAD / NYSI / NYHL")
+st.caption("Upload a historical ZIP, then optionally append a daily snapshot. Core breadth lines can be cumulative or built from daily deltas. BPSPX and SPXA50R are treated as raw, non-cumulative breadth overlays.")
+
+with st.sidebar:
+    st.header("Inputs")
+    hist_zip = st.file_uploader("Historical ZIP", type=["zip"])
+    daily_file = st.file_uploader("Daily snapshot", type=["csv", "xlsx", "xls", "txt"])
+
+    st.header("Series mode")
+    st.write("Tell the app whether each uploaded core breadth series is already cumulative or should be cumulatively built from daily values.")
+    mode_map = {
+        s: st.selectbox(
+            f"{s} mode",
+            ["Already cumulative", "Daily delta → cumulative"],
+            index=0,
+            key=f"mode_{s}",
+        )
+        for s in CUMULATIVE_CORE_SERIES + ["RSP"]
     }
 
-# -----------------------------
-# UI Layout
-# -----------------------------
-st.set_page_config(page_title="ETF Mean-Reversion Optimizer", layout="wide")
-st.title("📉 ETF Mean-Reversion Optimizer & Screener")
+    st.header("Model")
+    use_bpspx = st.checkbox("Add BPSPX to oscillator + analog", value=True)
+    use_spxa50r = st.checkbox("Add SPXA50R to oscillator + analog", value=True)
+    include_rsp = st.checkbox("Add RSP to final oscillator", value=True)
+    rsp_weight = st.slider("RSP weight in final oscillator", min_value=0.05, max_value=0.40, value=0.20, step=0.05)
+    analog_k = st.slider("Number of analogs", min_value=10, max_value=50, value=20, step=5)
 
-# Initialize Session State
-if 'opt_results' not in st.session_state:
-    st.session_state.opt_results = None
-if 'live_params' not in st.session_state:
-    st.session_state.live_params = None
-if 'optimization_complete' not in st.session_state:
-    st.session_state.optimization_complete = False
+    st.header("Historical lookup")
+    enable_history_lookup = st.checkbox("Enable calendar lookup", value=True)
 
-tab1, tab2 = st.tabs(["🔍 Optimize Parameters", "💎 Live Screener"])
+    show_raw = st.checkbox("Show raw merged data table", value=False)
 
-# -----------------------------
-# TAB 1: OPTIMIZE
-# -----------------------------
-with tab1:
-    st.header("Batch Optimization Engine")
-    st.markdown("""
-    **Bearish Mode:** Finds overheated ETFs that historically drop ≥ X% within 1-2 days.
-    
-    - ✅ Parallel processing (8 workers)
-    - ✅ Checkpoint every 50 ETFs (resume if interrupted)
-    - ✅ Per-symbol sweet spots + aggregate consensus
-    """)
-    
-    # Input Section
-    col1, col2 = st.columns(2)
-    with col1:
-        paste_tickers = st.text_area(
-            "Paste ETF/Stock Tickers (up to 500, one per line)",
-            height=200,
-            placeholder="SPY\nQQQ\nIWM\nTLT\nGLD\n..."
+if not hist_zip:
+    st.info("Upload your historical ZIP to begin. The ZIP can contain separate files for NYAD, NYSI, NYHL, and optionally RSP.")
+    st.stop()
+
+try:
+    hist_series = load_series_from_zip(hist_zip.getvalue())
+except Exception as e:
+    st.error(f"Could not read ZIP: {e}")
+    st.stop()
+
+if not hist_series:
+    st.error("No usable series were found in the ZIP. Include files with a Date column and one value column for NYAD, NYSI, NYHL, or RSP.")
+    st.stop()
+
+merged = merge_series(hist_series)
+if daily_file is not None:
+    snapshot_series = load_snapshot(daily_file)
+    merged = append_snapshot(merged, snapshot_series)
+
+merged = merged.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+merged = maybe_cumulate(merged, mode_map)
+merged = merged.reset_index(drop=True)
+
+present = [c for c in CUMULATIVE_CORE_SERIES if c in merged.columns]
+missing_breadth = [c for c in CUMULATIVE_CORE_SERIES if c not in merged.columns]
+if missing_breadth:
+    st.warning(f"Missing breadth series: {', '.join(missing_breadth)}. The model works best when NYAD, NYSI, and NYHL are all present.")
+
+if not use_bpspx and "BPSPX" in merged.columns:
+    merged = merged.drop(columns=["BPSPX"])
+if not use_spxa50r and "SPXA50R" in merged.columns:
+    merged = merged.drop(columns=["SPXA50R"])
+
+model = build_model_frame(merged, include_rsp=include_rsp, rsp_weight=rsp_weight)
+
+left, right = st.columns([1.15, 0.85])
+with left:
+    st.plotly_chart(plot_main(model, merged, include_rsp), use_container_width=True)
+with right:
+    current = model.iloc[-1]
+    st.subheader("Current score")
+    st.metric("Breadth Ultimate", f"{current['Breadth_Ultimate']:.1f}", f"{model['Breadth_Ultimate'].diff().iloc[-1]:.1f}")
+    if include_rsp and "Ultimate_With_RSP" in model.columns:
+        st.metric("Ultimate + RSP", f"{current['Ultimate_With_RSP']:.1f}", f"{model['Ultimate_With_RSP'].diff().iloc[-1]:.1f}")
+    st.metric("State", current["State"])
+    for s in OSCILLATOR_SERIES:
+        col = f"{s}_master_score"
+        if col in model.columns:
+            st.metric(f"{s} score", f"{current[col]:.1f}")
+    if include_rsp and "RSP_master_score" in model.columns:
+        st.metric("RSP score", f"{current['RSP_master_score']:.1f}")
+
+st.plotly_chart(plot_components(model), use_container_width=True)
+
+if enable_history_lookup:
+    st.subheader("Historical calendar lookup")
+    valid_dates = model["Date"].dropna().sort_values()
+    if not valid_dates.empty:
+        default_date = valid_dates.iloc[-1].date()
+        selected_date = st.date_input(
+            "Pick a historical date",
+            value=default_date,
+            min_value=valid_dates.iloc[0].date(),
+            max_value=valid_dates.iloc[-1].date(),
         )
-        use_fallback = st.checkbox("Use fallback list (35 ETFs) for testing", value=False)
-    
-    with col2:
-        opt_years = st.slider("Historical Lookback (Years)", 5, 25, 20)
-        drop_pct = st.number_input("Target Drop % (Bearish)", 0.5, 5.0, 1.0, 0.1)
-        n_combos = st.slider("Parameter Combos per ETF", 50, 500, 150)
-        min_signals = st.slider("Min Signals Required", 5, 50, 15)
-        max_workers = st.slider("Parallel Workers", 1, 16, 8)
-    
-    # Parse Tickers
-    if use_fallback:
-        tickers = FALLBACK_ETFS
-    else:
-        tickers = [t.strip().upper() for t in paste_tickers.replace(",", "\n").split("\n") if t.strip()]
-        tickers = list(dict.fromkeys(tickers))[:500]
-    
-    st.write(f"📊 **{len(tickers)} tickers** queued for optimization")
-    
-    # Check for existing checkpoint
-    existing_checkpoint = load_checkpoint()
-    if existing_checkpoint:
-        st.warning(f"💾 Found checkpoint from {existing_checkpoint.get('timestamp', 'unknown')}: {len(existing_checkpoint.get('completed_tickers', []))} ETFs already processed")
-        if st.button("🗑️ Clear Checkpoint & Start Fresh"):
-            clear_checkpoint()
-            st.rerun()
-    
-    # Run Button
-    if st.button("🚀 Run Optimization", type="primary", disabled=len(tickers) == 0):
-        if len(tickers) == 0:
-            st.error("Please enter tickers or use fallback list")
-        else:
-            with st.spinner("Starting optimization..."):
-                try:
-                    results = run_optimization_parallel(
-                        tickers=tickers,
-                        years=opt_years,
-                        n_combos=n_combos,
-                        drop_pct=drop_pct,
-                        min_signals=min_signals,
-                        max_workers=max_workers,
-                        checkpoint_interval=50
-                    )
-                    
-                    st.session_state.opt_results = results
-                    st.session_state.optimization_complete = True
-                    st.session_state.drop_pct = drop_pct
-                    
-                    st.success(f"✅ Optimization Complete! {results['completed_count']}/{results['total_count']} ETFs processed")
-                    
-                except Exception as e:
-                    st.error(f"❌ Optimization failed: {str(e)}")
-                    st.info("Checkpoint saved. Refresh and click 'Run Optimization' to resume.")
-    
-    # Display Results
-    if st.session_state.opt_results:
-        results = st.session_state.opt_results
-        
-        st.divider()
-        st.subheader("📊 Aggregate Results")
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("ETFs Processed", f"{results['completed_count']}/{results['total_count']}")
-        c2.metric("Avg Probability (1-2 Day Drop)", f"{np.mean([r['avg_prob'] for r in results['symbol_results'] if r['avg_prob'] > 0]):.1f}%")
-        c3.metric("High-Edge ETFs (>65% Prob)", f"{len([r for r in results['symbol_results'] if r['avg_prob'] >= 65])}")
-        c4.metric("Target Drop", f"-{st.session_state.get('drop_pct', 1.0)}%")
-        
-        # Consensus Params
-        if results['consensus']:
-            st.subheader("🌐 Top Consensus Parameter Sets")
-            for i, cons in enumerate(results['consensus'][:3], 1):
-                with st.expander(f"#{i} | Frequency: {cons['count']} ETFs | Avg Prob: {cons['avg_prob']}%"):
-                    p = cons['params']
-                    st.write(f"""
-                    - **TSI >** {p['tsi_thr']}
-                    - **CCI >** {p['cci_thr']}
-                    - **RSI >** {p['rsi_thr']}
-                    - **W%R >** {p['willr_thr']}
-                    - **CMF <** {p['cmf_thr']}
-                    - **CCI Regressing:** {p['use_cci_regress']} ({p['cci_regress_days']} days)
-                    - **Min Score:** {p['min_score_trigger']}
-                    """)
-                    if st.button(f"Apply # {i} to Screener", key=f"apply_cons_{i}"):
-                        st.session_state.live_params = p
-                        st.session_state.param_source = "consensus"
-                        st.success(f"✅ Consensus #{i} loaded! Switch to Live Screener tab.")
-        
-        # High-Edge Symbols
-        if results['high_edge']:
-            st.subheader("🎯 High-Edge ETFs (Top 20)")
-            high_edge_df = pd.DataFrame([
-                {
-                    'Ticker': r['ticker'],
-                    'Avg Prob (1-2d)': r['avg_prob'],
-                    'Avg Expectancy': r['avg_expectancy'],
-                    'Status': r['status']
-                }
-                for r in results['high_edge']
-            ])
-            st.dataframe(high_edge_df.style.format({
-                'Avg Prob (1-2d)': '{:.1f}%',
-                'Avg Expectancy': '{:.3f}%'
-            }), use_container_width=True, height=400)
-            
-            # Per-symbol detail
-            st.subheader("🔍 View Individual ETF Sweet Spots")
-            selected_ticker = st.selectbox("Select ETF", options=[r['ticker'] for r in results['symbol_results']])
-            selected_result = next((r for r in results['symbol_results'] if r['ticker'] == selected_ticker), None)
-            
-            if selected_result and selected_result.get('personal_best'):
-                st.write(f"**{selected_ticker}** — Personal Best Parameters")
-                best = selected_result['personal_best'][0]
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.metric("Probability (1-2 Day Drop)", f"{best['prob_either_pct']}%")
-                    st.metric("Expectancy", f"{best['expectancy']}%")
-                    st.metric("Total Signals", best['signals'])
-                with c2:
-                    st.write(f"""
-                    - TSI > {best['tsi_thr']}
-                    - CCI > {best['cci_thr']}
-                    - RSI > {best['rsi_thr']}
-                    - Min Score: {best['min_score_trigger']}
-                    """)
-                if st.button(f"Apply {selected_ticker}'s Params to Screener", key=f"apply_{selected_ticker}"):
-                    st.session_state.live_params = best
-                    st.session_state.param_source = "personal"
-                    st.session_state.param_ticker = selected_ticker
-                    st.success(f"✅ {selected_ticker}'s personal params loaded!")
+        anchor_date = nearest_available_date(model["Date"], selected_date)
+        hist_row = model.loc[model["Date"] == anchor_date].iloc[-1]
+        hist_source = merged.loc[merged["Date"] == anchor_date].iloc[-1] if (merged["Date"] == anchor_date).any() else None
+        selected_target = "Ultimate_With_RSP" if include_rsp and "Ultimate_With_RSP" in model.columns else "Breadth_Ultimate"
 
-# -----------------------------
-# TAB 2: LIVE SCREENER
-# -----------------------------
-with tab2:
-    st.header("💎 Live Diamond Screener")
-    
-    if not st.session_state.optimization_complete:
-        st.warning("⚠️ Run optimization first to load sweet spot parameters!")
-        st.stop()
-    
-    # Param Source Info
-    if st.session_state.live_params:
-        source = st.session_state.get('param_source', 'unknown')
-        if source == "personal":
-            st.info(f"🎯 Using **personalized params** for {st.session_state.get('param_ticker', 'ETF')}")
-        else:
-            st.info("🌐 Using **consensus params** from optimization")
-    else:
-        st.info("🌐 Using default consensus params (run optimization to customize)")
-        st.session_state.live_params = {
-            'tsi_thr': 93, 'cci_thr': 125, 'rsi_thr': 71, 'willr_thr': -19,
-            'cmf_thr': 0.01, 'use_cci_regress': True, 'cci_regress_days': 2,
-            'min_score_trigger': 7, 'rsi_len': 14, 'cci_len': 20, 'willr_len': 14,
-            'cmf_len': 20, 'tsi_fast': 6, 'tsi_slow': 3, 'vwap_len': 20,
-            'vwap_1': 0.01, 'vwap_2': 0.02, 'wick_thresh': 0.50
-        }
-    
-    # Get tickers from optimization results
-    if st.session_state.opt_results:
-        screener_tickers = [r['ticker'] for r in st.session_state.opt_results['symbol_results']]
-    else:
-        screener_tickers = FALLBACK_ETFS
-    
-    # Scan Button
-    if st.button("🔍 Scan Live EOD Data", type="primary"):
-        with st.spinner("Fetching live EOD data..."):
-            end_dt = date.today()
-            start_dt = end_dt - timedelta(days=365)
-            
-            live_results = []
-            progress = st.progress(0)
-            
-            for i, tkr in enumerate(screener_tickers[:100]):  # Limit to 100 for speed
-                df = fetch_daily_ohlcv(tkr, start_dt.isoformat(), (end_dt + timedelta(1)).isoformat())
-                if df.empty:
-                    continue
-                
-                feat = apply_thresholds(df, st.session_state.live_params)
-                latest = feat.iloc[-1]
-                
-                if latest['SCORE'] >= st.session_state.live_params['min_score_trigger']:
-                    # Get historical stats from optimization
-                    opt_result = next((r for r in st.session_state.opt_results['symbol_results'] if r['ticker'] == tkr), None)
-                    hist_prob = opt_result['avg_prob'] if opt_result else 0
-                    
-                    live_results.append({
-                        'Ticker': tkr,
-                        'Score': int(latest['SCORE']),
-                        'Prob% (Historical)': hist_prob,
-                        'TSI': round(latest['TSI'], 1),
-                        'RSI': round(latest['RSI'], 1),
-                        'CCI': round(latest['CCI'], 0),
-                        'W%R': round(latest['WILLR'], 1),
-                        'CMF': round(latest['CMF'], 3),
-                        'Close': round(latest['Close'], 2)
-                    })
-                
-                if (i + 1) % 10 == 0:
-                    progress.progress(min((i + 1) / min(100, len(screener_tickers)), 1.0))
-            
-            progress.empty()
-            
-            if live_results:
-                st.session_state.live_results = pd.DataFrame(live_results).sort_values(
-                    ['Prob% (Historical)', 'Score'], ascending=[False, False]
-                )
-                st.success(f"✅ Found {len(live_results)} Diamond signals!")
+        st.caption(f"Using nearest available row on or before the selected date: **{anchor_date.date()}**")
+        h1, h2, h3, h4 = st.columns(4)
+        with h1:
+            st.metric("Historical oscillator", f"{hist_row[selected_target]:.1f}")
+        with h2:
+            st.metric("Historical breadth score", f"{hist_row['Breadth_Ultimate']:.1f}")
+        with h3:
+            st.metric("Historical state", hist_row["State"])
+        with h4:
+            if hist_source is not None and "RSP" in hist_source.index and pd.notna(hist_source["RSP"]):
+                st.metric("RSP price", f"{hist_source['RSP']:.2f}")
             else:
-                st.warning("No signals found with current params. Try lowering thresholds.")
-    
-    # Display Live Results
-    if 'live_results' in st.session_state and st.session_state.live_results is not None:
-        df_live = st.session_state.live_results
-        
-        st.subheader("📊 Live Diamond Signals")
-        
-        # Highlight high-prob diamonds
-        def highlight_diamonds(row):
-            if row['Prob% (Historical)'] >= 65:
-                return ['background-color: #ffd6d6'] * len(row)
-            elif row['Score'] >= 7:
-                return ['background-color: #e7f7e7'] * len(row)
-            return [''] * len(row)
-        
-        styled = df_live.style.apply(highlight_diamonds, axis=1).format({
-            'Prob% (Historical)': '{:.1f}%',
-            'Close': '${:.2f}',
-            'TSI': '{:.1f}',
-            'RSI': '{:.1f}',
-            'CCI': '{:.0f}',
-            'W%R': '{:.1f}',
-            'CMF': '{:.3f}'
-        })
-        
-        st.dataframe(styled, use_container_width=True, height=400)
-        
-        # Diamond Details
-        if len(df_live) > 0:
-            st.subheader("💎 Diamond Details")
-            selected = st.selectbox("Select ETF for Details", options=df_live['Ticker'].tolist())
-            selected_row = df_live[df_live['Ticker'] == selected].iloc[0]
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Historical Drop Probability (1-2 Days)", f"{selected_row['Prob% (Historical)']}%")
-            c2.metric("Current Score", f"{selected_row['Score']}/9")
-            c3.metric("Close Price", f"${selected_row['Close']}")
-            
-            st.write("**Why This ETF Triggered:**")
-            reasons = []
-            if selected_row['TSI'] > st.session_state.live_params['tsi_thr']:
-                reasons.append(f"✓ TSI > {st.session_state.live_params['tsi_thr']} (current: {selected_row['TSI']})")
-            if selected_row['RSI'] > st.session_state.live_params['rsi_thr']:
-                reasons.append(f"✓ RSI > {st.session_state.live_params['rsi_thr']} (current: {selected_row['RSI']})")
-            if selected_row['CCI'] > st.session_state.live_params['cci_thr']:
-                reasons.append(f"✓ CCI > {st.session_state.live_params['cci_thr']} (current: {selected_row['CCI']})")
-            if selected_row['W%R'] > st.session_state.live_params['willr_thr']:
-                reasons.append(f"✓ W%R > {st.session_state.live_params['willr_thr']} (current: {selected_row['W%R']})")
-            
-            st.markdown("\n".join(reasons) if reasons else "- No specific reasons identified")
-            
-            # Chart
-            if PLOTLY_AVAILABLE:
-                st.subheader("📈 Price Chart")
-                df_chart = fetch_daily_ohlcv(selected, (date.today() - timedelta(days=180)).isoformat(), 
-                                            (date.today() + timedelta(1)).isoformat())
-                if not df_chart.empty:
-                    fig = go.Figure(data=[go.Candlestick(
-                        x=df_chart.index,
-                        open=df_chart['Open'],
-                        high=df_chart['High'],
-                        low=df_chart['Low'],
-                        close=df_chart['Close'],
-                        name=selected
-                    )])
-                    fig.update_layout(height=400, xaxis_rangeslider_visible=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                st.metric("RSP price", "n/a")
 
-# -----------------------------
-# Footer
-# -----------------------------
-st.divider()
-st.caption("""
-**Strategy:** Bearish mean-reversion. Signal triggers on overheated conditions. 
-Historical probability shows % of times ETF dropped ≥ target within 1-2 days after signal.
-**Execution:** Buy puts / Sell calls at EOD on signal. Exit Day+1 or Day+2 on target drop.
-""")
+        detail_rows = []
+        for s in OSCILLATOR_SERIES:
+            mcol = f"{s}_master_score"
+            if mcol in model.columns:
+                raw_val = hist_source[s] if hist_source is not None and s in hist_source.index else np.nan
+                detail_rows.append({
+                    "Series": s,
+                    "Raw": raw_val,
+                    "Score": hist_row[mcol],
+                })
+        if include_rsp and "RSP_master_score" in model.columns:
+            raw_val = hist_source["RSP"] if hist_source is not None and "RSP" in hist_source.index else np.nan
+            detail_rows.append({"Series": "RSP", "Raw": raw_val, "Score": hist_row["RSP_master_score"]})
+        if detail_rows:
+            st.dataframe(pd.DataFrame(detail_rows), use_container_width=True)
+
+with st.expander("Data coverage"):
+    st.dataframe(describe_dataset(merged), use_container_width=True)
+
+# Analog engine
+st.subheader("Analog prediction score")
+if "RSP" not in merged.columns:
+    st.info("Analog forward returns require RSP in the uploaded data.")
+else:
+    target_col = "Ultimate_With_RSP" if include_rsp and "Ultimate_With_RSP" in model.columns else "Breadth_Ultimate"
+    analogs, hist = similarity_backtest(model, merged["RSP"], target_col=target_col, k=analog_k)
+    stats = weighted_forward_stats(analogs)
+
+    c1, c2, c3 = st.columns(3)
+    if stats:
+        with c1:
+            st.metric("5d expected", format_pct(stats.get("mean_5d")), f"Win rate {stats.get('winrate_5d', np.nan) * 100:.0f}%")
+            st.metric("5d median", format_pct(stats.get("median_5d")))
+        with c2:
+            st.metric("10d expected", format_pct(stats.get("mean_10d")), f"Win rate {stats.get('winrate_10d', np.nan) * 100:.0f}%")
+            st.metric("10d median", format_pct(stats.get("median_10d")))
+        with c3:
+            st.metric("20d expected", format_pct(stats.get("mean_20d")), f"Win rate {stats.get('winrate_20d', np.nan) * 100:.0f}%")
+            st.metric("20d median", format_pct(stats.get("median_20d")))
+
+        summary = {
+            "current_state": current["State"],
+            "current_score": float(current[target_col]),
+            "expected_5d": stats.get("mean_5d"),
+            "expected_10d": stats.get("mean_10d"),
+            "expected_20d": stats.get("mean_20d"),
+            "winrate_5d": stats.get("winrate_5d"),
+            "winrate_10d": stats.get("winrate_10d"),
+            "winrate_20d": stats.get("winrate_20d"),
+            "analogs_used": len(analogs),
+        }
+        st.code(json.dumps(summary, indent=2, default=str), language="json")
+    else:
+        st.warning("Not enough overlapping history to build analogs yet. Add more data, especially RSP.")
+
+    if not analogs.empty:
+        analogs_display = analogs.copy()
+        for h in [5, 10, 20]:
+            analogs_display[f"fwd_{h}d"] = analogs_display[f"fwd_{h}d"].map(lambda x: f"{x * 100:.2f}%")
+        analogs_display["similarity"] = analogs_display["similarity"].map(lambda x: f"{x:.3f}")
+        analogs_display["distance"] = analogs_display["distance"].map(lambda x: f"{x:.3f}")
+        st.dataframe(analogs_display, use_container_width=True)
+
+        analog_fig = go.Figure()
+        for h in [5, 10, 20]:
+            analog_fig.add_trace(go.Histogram(x=analogs[f"fwd_{h}d"] * 100, name=f"{h}d", opacity=0.6))
+        analog_fig.update_layout(barmode="overlay", title="Analog forward return distribution", xaxis_title="Forward return %", yaxis_title="Count", height=420)
+        st.plotly_chart(analog_fig, use_container_width=True)
+
+if show_raw:
+    st.subheader("Merged source data")
+    st.dataframe(merged.tail(250), use_container_width=True)
+
+with st.expander("Expected file formats"):
+    st.markdown(
+        """
+        **Historical ZIP**
+        - Separate CSV/XLSX/TXT files are easiest.
+        - Each file should have a `Date` column.
+        - Each file can have either:
+          - a single value column, or
+          - a named series column like `NYAD`, `NYSI`, `NYHL`, `BPSPX`, `SPXA50R`, `RSP`.
+
+        **Daily snapshot**
+        - Can be one file containing `Date, NYAD, NYSI, NYHL, BPSPX, SPXA50R, RSP`.
+        - Or a single-series file with `Date` and one value column.
+
+        **Cumulative behavior**
+        - For **NYAD / NYSI / NYHL**, if your uploaded numbers are already cumulative, leave the sidebar setting at **Already cumulative**.
+        - If you upload daily net values and want the app to build the running line, switch that series to **Daily delta → cumulative**.
+        - **BPSPX** and **SPXA50R** are treated as raw, non-cumulative inputs and are never cumulatively summed.
+        """
+    )
