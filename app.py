@@ -8,8 +8,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from scipy.optimize import differential_evolution
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import TimeSeriesSplit
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -402,6 +400,9 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
     if len(available_cols) < 2:
         return {'error': 'Need at least 2 breadth series for optimization'}
     
+    if 'RSP' not in df.columns:
+        return {'error': 'RSP column required for optimization'}
+    
     def objective_function(weights, train_data, horizon):
         weight_dict = {col: weights[i] for i, col in enumerate(available_cols)}
         composite = create_weighted_composite(train_data, weight_dict, available_cols)
@@ -424,7 +425,7 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
         return -metrics['blended_score'] + weight_penalty
     
     # Walk-forward testing
-    window_size = 252
+    window_size = min(252, len(df) // 3)
     rebalance_freq = 21
     horizon = 5
     
@@ -433,6 +434,8 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
     regime_performance = {'Bull': [], 'Bear': [], 'Range': [], 'High Vol': []}
     
     df['regime'] = detect_market_regime(df['RSP'])
+    
+    print(f"Running walk-forward optimization with {len(df)} days of data...")
     
     for i in range(window_size, len(df) - horizon, rebalance_freq):
         train_data = df.iloc[i - window_size:i]
@@ -443,37 +446,41 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
         
         bounds = [(MIN_WEIGHT, MAX_WEIGHT) for _ in available_cols]
         
-        result = differential_evolution(
-            objective_function,
-            bounds,
-            args=(train_data, horizon),
-            maxiter=50,
-            popsize=10,
-            seed=42,
-            disp=False
-        )
-        
-        optimal_weights = result.x
-        optimal_weights = optimal_weights / optimal_weights.sum()
-        weights_dict = {col: optimal_weights[i] for i, col in enumerate(available_cols)}
-        weight_history.append({'date': test_data['Date'].iloc[0], **weights_dict})
-        
-        composite_test = create_weighted_composite(test_data, weights_dict, available_cols)
-        forward_returns_test = test_data['RSP'].shift(-horizon) / test_data['RSP'] - 1
-        
-        valid_idx = composite_test.notna() & forward_returns_test.notna()
-        if valid_idx.sum() > 0:
-            metrics = calculate_robust_metrics(composite_test[valid_idx], forward_returns_test[valid_idx])
+        try:
+            result = differential_evolution(
+                objective_function,
+                bounds,
+                args=(train_data, horizon),
+                maxiter=30,  # Reduced for speed
+                popsize=8,
+                seed=42,
+                disp=False
+            )
             
-            walk_forward_results.append({
-                'period_start': test_data['Date'].iloc[0],
-                'period_end': test_data['Date'].iloc[-1],
-                **metrics
-            })
+            optimal_weights = result.x
+            optimal_weights = optimal_weights / optimal_weights.sum()
+            weights_dict = {col: optimal_weights[i] for i, col in enumerate(available_cols)}
+            weight_history.append({'date': test_data['Date'].iloc[0], **weights_dict})
             
-            test_regime = test_data.loc[valid_idx, 'regime'].iloc[0] if len(test_data) > 0 else 'Range'
-            if test_regime in regime_performance:
-                regime_performance[test_regime].append(metrics['blended_score'])
+            composite_test = create_weighted_composite(test_data, weights_dict, available_cols)
+            forward_returns_test = test_data['RSP'].shift(-horizon) / test_data['RSP'] - 1
+            
+            valid_idx = composite_test.notna() & forward_returns_test.notna()
+            if valid_idx.sum() > 0:
+                metrics = calculate_robust_metrics(composite_test[valid_idx], forward_returns_test[valid_idx])
+                
+                walk_forward_results.append({
+                    'period_start': test_data['Date'].iloc[0],
+                    'period_end': test_data['Date'].iloc[-1],
+                    **metrics
+                })
+                
+                test_regime = test_data.loc[valid_idx, 'regime'].iloc[0] if len(test_data) > 0 else 'Range'
+                if test_regime in regime_performance:
+                    regime_performance[test_regime].append(metrics['blended_score'])
+        except Exception as e:
+            print(f"Optimization failed for period {i}: {e}")
+            continue
     
     if not walk_forward_results:
         return {'error': 'Insufficient data for walk-forward optimization'}
@@ -574,8 +581,7 @@ with st.sidebar:
     
     st.header("🤖 Weight Optimizer")
     st.caption("Finds optimal weights to predict RSP using walk-forward testing")
-    if st.button("🔍 Find Optimal Weights", type="primary"):
-        st.session_state.opt_results = None  # Clear previous
+    run_opt = st.button("🔍 Find Optimal Weights", type="primary")
 
 if historical_file is None:
     st.info("📂 Upload a historical ZIP or CSV to begin.")
@@ -598,7 +604,7 @@ merged = append_snapshot(history, snapshot_file, pd.Timestamp(snapshot_date))
 merged = prepare_series(merged, nyad_cumulative=nyad_cumulative, nyhl_cumulative=nyhl_cumulative)
 
 # Run optimization if button was clicked
-if st.session_state.opt_results is None and st.sidebar.button("🔍 Find Optimal Weights", key="run_opt"):
+if run_opt:
     with st.spinner("Running walk-forward optimization across multiple periods... This may take a minute..."):
         if 'RSP' in merged.columns and len(merged) > 500:
             opt_results = run_breadth_optimization_robust(merged)
@@ -725,9 +731,10 @@ if st.session_state.opt_results is not None:
     col3.metric("Profit Factor", f"{perf['profit_factor']:.2f}")
     
     # Weight stability chart
-    st.subheader("Weight Stability Over Time")
-    st.line_chart(opt['weight_history'])
-    st.caption(f"Weight Stability Score: {opt['weight_stability']['stability_score']:.2f} (higher = more stable)")
+    if len(opt['weight_history']) > 1:
+        st.subheader("Weight Stability Over Time")
+        st.line_chart(opt['weight_history'])
+        st.caption(f"Weight Stability Score: {opt['weight_stability']['stability_score']:.2f} (higher = more stable)")
     
     # Regime consistency
     if opt['regime_consistency']:
