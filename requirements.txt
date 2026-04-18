@@ -5,5 +5,4 @@ scikit-learn==1.4.2
 scipy==1.13.1
 yfinance==0.2.40
 plotly==5.22.0
-
 git+https://github.com/defeat-beta/defeatbeta-api.git
