@@ -165,6 +165,36 @@ def get_benchmark(symbol: str, years: int = 5) -> Optional[pd.Series]:
     return hist["close"].rename("bench_close")
 
 
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_live_daily(symbol: str, lookback_days: int = 260) -> Optional[pd.DataFrame]:
+    try:
+        df = yf.download(symbol, period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower() for c in df.columns]
+        else:
+            df.columns = [str(c).lower() for c in df.columns]
+        needed = ["open", "high", "low", "close", "volume"]
+        if not all(c in df.columns for c in needed):
+            return None
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[needed].apply(pd.to_numeric, errors="coerce").dropna(subset=["open", "high", "low", "close"])
+        return df.tail(lookback_days)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_live_benchmark(symbol: str, lookback_days: int = 260) -> Optional[pd.Series]:
+    hist = get_live_daily(symbol, lookback_days=lookback_days)
+    if hist is None or hist.empty:
+        return None
+    return hist["close"].rename("bench_close")
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_yf_option_candidates(symbol: str) -> Optional[pd.DataFrame]:
     try:
@@ -507,11 +537,31 @@ if run_scan:
         if feat is None or feat.empty:
             debug_rows.append({"symbol": symbol, "status": "no history returned"})
             continue
-        analogs = find_analogs(feat, n=analog_count)
-        if analogs.empty:
-            debug_rows.append({"symbol": symbol, "status": "no analog rows after feature filtering", "rows": len(feat)})
+        live_df = get_live_daily(symbol)
+        if live_df is None or live_df.empty:
+            debug_rows.append({"symbol": symbol, "status": "no live daily data returned", "rows": len(feat)})
             continue
-        current = feat.iloc[-1]
+        live_bench = get_live_benchmark(benchmark_symbol)
+        live_feat = build_features(live_df, live_bench)
+        live_feat = add_returns(live_feat)
+        current = live_feat.iloc[-1].copy()
+        feat_for_analogs = feat.copy()
+        for col in FEATURE_COLS:
+            if col not in feat_for_analogs.columns:
+                feat_for_analogs[col] = 0.0
+            if col not in current.index:
+                current[col] = 0.0
+        analog_base = feat_for_analogs.copy()
+        current_frame = pd.DataFrame([current], columns=analog_base.columns.intersection(current.index))
+        for col in analog_base.columns:
+            if col not in current_frame.columns:
+                current_frame[col] = np.nan
+        current_frame = current_frame[analog_base.columns]
+        analog_input = pd.concat([analog_base, current_frame], axis=0)
+        analogs = find_analogs(analog_input, n=analog_count, exclusion_gap=1)
+        if analogs.empty:
+            debug_rows.append({"symbol": symbol, "status": "no analog rows after feature filtering", "rows": len(feat), "live_rows": len(live_df)})
+            continue
         stats = weighted_stats(analogs)
         conf = confidence_score(analogs, current, stats)
         rows.append({
