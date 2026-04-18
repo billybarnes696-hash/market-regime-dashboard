@@ -76,20 +76,12 @@ def bbpct(close: pd.Series, n: int = 20) -> pd.Series:
     return (close - lower) / width
 
 
-def anchored_vwap(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
-    if len(df) < lookback:
-        lookback = len(df)
-    if lookback < 2:
-        return pd.Series(index=df.index, dtype=float)
-    recent_idx = df["low"].iloc[-lookback:].idxmin()
-    anchor_pos = df.index.get_loc(recent_idx)
-    sub = df.iloc[anchor_pos:].copy()
-    tp = (sub["high"] + sub["low"] + sub["close"]) / 3.0
-    vol = sub["volume"].replace(0, np.nan)
-    avwap = (tp * vol).cumsum() / vol.cumsum()
-    out = pd.Series(index=df.index, dtype=float)
-    out.loc[sub.index] = avwap
-    return out
+def rolling_vwap(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol = df["volume"].replace(0, np.nan)
+    num = (tp * vol).rolling(lookback, min_periods=max(5, lookback // 2)).sum()
+    den = vol.rolling(lookback, min_periods=max(5, lookback // 2)).sum()
+    return num / den
 
 
 def rsi(close: pd.Series, n: int = 14) -> pd.Series:
@@ -136,14 +128,30 @@ def get_history(symbol: str, years: int = 5) -> Optional[pd.DataFrame]:
         df = t.price()
         df = df.rename(columns={"report_date": "date", "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
         needed = ["date", "open", "high", "low", "close", "volume"]
+        if all(c in df.columns for c in needed):
+            df = df[needed].copy()
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"]).set_index("date").sort_index()
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna(subset=["open", "high", "low", "close"])
+            if not df.empty:
+                return df.tail(252 * years)
+    except Exception:
+        pass
+    try:
+        df = yf.download(symbol, period=f"{years}y", interval="1d", auto_adjust=False, progress=False, threads=False)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower() for c in df.columns]
+        else:
+            df.columns = [str(c).lower() for c in df.columns]
+        needed = ["open", "high", "low", "close", "volume"]
         if not all(c in df.columns for c in needed):
             return None
-        df = df[needed].copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"]).set_index("date").sort_index()
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["open", "high", "low", "close"])
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[needed].apply(pd.to_numeric, errors="coerce").dropna(subset=["open", "high", "low", "close"])
         return df.tail(252 * years)
     except Exception:
         return None
@@ -244,7 +252,7 @@ def build_features(df: pd.DataFrame, bench: Optional[pd.Series]) -> pd.DataFrame
     out["RSI14"] = rsi(out["close"], 14)
     out["RSI14_slope_3"] = out["RSI14"].diff(3)
 
-    out["VWAP"] = anchored_vwap(out)
+    out["VWAP"] = rolling_vwap(out, 20)
     out["EXT_VWAP"] = (out["close"] - out["VWAP"]) / out["VWAP"]
     out["SMA10"] = out["close"].rolling(10).mean()
     out["SMA20"] = out["close"].rolling(20).mean()
@@ -539,14 +547,14 @@ if run_scan:
         st.error("No valid symbols were processed. Check data availability, benchmark selection, or cached feature stores.")
         if debug_rows:
             st.subheader("Debug")
-            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(debug_rows), width="stretch")
     else:
         results = pd.DataFrame(rows).sort_values(["Confidence", "DipProb_1d", "DipProb_5d"], ascending=False)
         st.subheader("Ranked setups")
-        st.dataframe(results, use_container_width=True)
+        st.dataframe(results, width="stretch")
         if debug_rows:
             with st.expander("Skipped symbols / debug details"):
-                st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(debug_rows), width="stretch")
 
         selected = st.selectbox("Inspect ticker", results["symbol"].tolist())
         if selected:
@@ -554,11 +562,11 @@ if run_scan:
             with col1:
                 st.subheader(f"{selected} analog details")
                 analogs = analog_map[selected][["close", "ret1", "ret2", "ret5", "similarity", "state_747", "bear_kiss_score", "candle_score"]].tail(15)
-                st.dataframe(analogs, use_container_width=True)
+                st.dataframe(analogs, width="stretch")
             with col2:
                 st.subheader("Best put candidates")
                 opt = get_yf_option_candidates(selected)
                 if opt is None:
                     st.info("No option data available right now.")
                 else:
-                    st.dataframe(opt[["contractSymbol", "strike", "lastPrice", "bid", "ask", "spread", "volume", "openInterest", "liq_score"]], use_container_width=True)
+                    st.dataframe(opt[["contractSymbol", "strike", "lastPrice", "bid", "ask", "spread", "volume", "openInterest", "liq_score"]], width="stretch")
