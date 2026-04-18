@@ -266,8 +266,9 @@ def build_features(df: pd.DataFrame, bench: Optional[pd.Series]) -> pd.DataFrame
         out["RS_SLOPE_5"] = out["RS_LINE"].diff(5) / out["RS_LINE"].shift(5)
         out["RS_SLOPE_10"] = out["RS_LINE"].diff(10) / out["RS_LINE"].shift(10)
     else:
-        out["RS_SLOPE_5"] = np.nan
-        out["RS_SLOPE_10"] = np.nan
+        out["RS_LINE"] = 1.0
+        out["RS_SLOPE_5"] = 0.0
+        out["RS_SLOPE_10"] = 0.0
 
     for tcol, pcol, scol, codecol in [
         ("TSI_424", "pinned_424", "state_424", "state_424_code"),
@@ -334,6 +335,13 @@ def load_or_build_feature_store(symbol: str, years: int, benchmark_symbol: str) 
     bench = get_benchmark(benchmark_symbol, years=years)
     feat = build_features(df, bench)
     feat = add_returns(feat)
+    # Make the store robust even if benchmark data is unavailable or partially missing.
+    for col in ["RS_LINE", "RS_SLOPE_5", "RS_SLOPE_10"]:
+        if col not in feat.columns:
+            feat[col] = 0.0 if col != "RS_LINE" else 1.0
+    feat["RS_LINE"] = feat["RS_LINE"].fillna(1.0)
+    feat["RS_SLOPE_5"] = feat["RS_SLOPE_5"].fillna(0.0)
+    feat["RS_SLOPE_10"] = feat["RS_SLOPE_10"].fillna(0.0)
     try:
         feat.to_parquet(path)
     except Exception:
@@ -342,7 +350,19 @@ def load_or_build_feature_store(symbol: str, years: int, benchmark_symbol: str) 
 
 
 def find_analogs(df: pd.DataFrame, n: int = 30, exclusion_gap: int = 20) -> pd.DataFrame:
-    base = df.dropna(subset=FEATURE_COLS + ["ret1", "ret2", "ret5"]).copy()
+    working = df.copy()
+    # Keep the analog engine alive even when some optional context columns are unavailable.
+    fill_defaults = {
+        "RS_LINE": 1.0,
+        "RS_SLOPE_5": 0.0,
+        "RS_SLOPE_10": 0.0,
+        "ADX14": 0.0,
+        "ADX14_slope_3": 0.0,
+    }
+    for col, default in fill_defaults.items():
+        if col in working.columns:
+            working[col] = working[col].fillna(default)
+    base = working.dropna(subset=FEATURE_COLS + ["ret1", "ret2", "ret5"]).copy()
     if len(base) < 100:
         return pd.DataFrame()
     current = base.iloc[-1]
@@ -473,12 +493,15 @@ if run_scan:
     analog_map: Dict[str, pd.DataFrame] = {}
 
     progress = st.progress(0)
+    debug_rows = []
     for i, symbol in enumerate(tickers, start=1):
         feat = load_or_build_feature_store(symbol, years, benchmark_symbol)
         if feat is None or feat.empty:
+            debug_rows.append({"symbol": symbol, "status": "no history returned"})
             continue
         analogs = find_analogs(feat, n=analog_count)
         if analogs.empty:
+            debug_rows.append({"symbol": symbol, "status": "no analog rows after feature filtering", "rows": len(feat)})
             continue
         current = feat.iloc[-1]
         stats = weighted_stats(analogs)
@@ -513,11 +536,17 @@ if run_scan:
     progress.empty()
 
     if not rows:
-        st.error("No valid symbols were processed. Check data availability or package setup.")
+        st.error("No valid symbols were processed. Check data availability, benchmark selection, or cached feature stores.")
+        if debug_rows:
+            st.subheader("Debug")
+            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
     else:
         results = pd.DataFrame(rows).sort_values(["Confidence", "DipProb_1d", "DipProb_5d"], ascending=False)
         st.subheader("Ranked setups")
         st.dataframe(results, use_container_width=True)
+        if debug_rows:
+            with st.expander("Skipped symbols / debug details"):
+                st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
 
         selected = st.selectbox("Inspect ticker", results["symbol"].tolist())
         if selected:
