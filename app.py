@@ -1,47 +1,68 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import yfinance as yf
+
 from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import cdist
-from defeatbeta import Ticker
-import yfinance as yf
+
+from defeatbeta_api import Ticker
 
 st.set_page_config(layout="wide")
 
+st.title("Diamond Scanner")
+
 # -----------------------------
-# Indicators
+# Indicator Functions
 # -----------------------------
 
 def tsi(series, r, s, signal=7):
-    momentum = series.diff()
-    ema1 = momentum.ewm(span=r).mean()
+
+    m = series.diff()
+
+    ema1 = m.ewm(span=r).mean()
     ema2 = ema1.ewm(span=s).mean()
-    abs_mom = momentum.abs()
-    ema3 = abs_mom.ewm(span=r).mean()
+
+    abs_m = m.abs()
+
+    ema3 = abs_m.ewm(span=r).mean()
     ema4 = ema3.ewm(span=s).mean()
-    tsi_val = 100 * ema2 / ema4
-    tsi_signal = tsi_val.ewm(span=signal).mean()
-    return tsi_val, tsi_signal
+
+    tsi = 100 * ema2 / ema4
+    sig = tsi.ewm(span=signal).mean()
+
+    return tsi, sig
 
 
 def cci(df, n=20):
-    tp = (df['high'] + df['low'] + df['close']) / 3
+
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+
     ma = tp.rolling(n).mean()
+
     md = tp.rolling(n).apply(lambda x: np.mean(np.abs(x - x.mean())))
+
     return (tp - ma) / (0.015 * md)
 
 
-def bb_pct(close, n=20):
-    ma = close.rolling(n).mean()
-    sd = close.rolling(n).std()
+def bbpct(close):
+
+    ma = close.rolling(20).mean()
+
+    sd = close.rolling(20).std()
+
     upper = ma + 2 * sd
     lower = ma - 2 * sd
+
     return (close - lower) / (upper - lower)
 
 
 def anchored_vwap(df):
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    vol = df['volume']
+
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+
+    vol = df["volume"]
+
     return (tp * vol).cumsum() / vol.cumsum()
 
 
@@ -50,64 +71,78 @@ def anchored_vwap(df):
 # -----------------------------
 
 @st.cache_data(ttl=86400)
-def get_historical(symbol, years=5):
-    t = Ticker(symbol)
-    df = t.price("daily")
-    df = df.rename(columns={
-        "report_date": "date",
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "volume": "volume"
-    })
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.set_index("date")
-    return df.tail(252 * years)
+def get_history(symbol, years=5):
+
+    try:
+
+        t = Ticker(symbol)
+
+        df = t.price("daily")
+
+        df = df.rename(columns={
+            "report_date": "date"
+        })
+
+        df["date"] = pd.to_datetime(df["date"])
+
+        df = df.set_index("date")
+
+        df = df.rename(columns=str.lower)
+
+        return df.tail(252 * years)
+
+    except:
+
+        st.warning(f"Failed to load {symbol}")
+
+        return None
 
 
 # -----------------------------
 # Feature Engineering
 # -----------------------------
 
-def compute_features(df):
+def build_features(df):
 
-    df["TSI_424"], df["TSI_424_sig"] = tsi(df["close"], 4, 2)
-    df["TSI_747"], df["TSI_747_sig"] = tsi(df["close"], 7, 4)
-    df["TSI_1377"], df["TSI_1377_sig"] = tsi(df["close"], 13, 7)
+    df["TSI_424"], _ = tsi(df["close"], 4, 2)
+    df["TSI_747"], _ = tsi(df["close"], 7, 4)
+    df["TSI_1377"], _ = tsi(df["close"], 13, 7)
 
-    df["CCI_20"] = cci(df, 20)
-    df["CCI_15"] = cci(df, 15)
+    df["CCI20"] = cci(df, 20)
 
-    df["BBP"] = bb_pct(df["close"])
+    df["BBP"] = bbpct(df["close"])
 
     df["VWAP"] = anchored_vwap(df)
+
     df["EXT_VWAP"] = (df["close"] - df["VWAP"]) / df["VWAP"]
 
     df["SMA10"] = df["close"].rolling(10).mean()
+
     df["EXT_SMA10"] = (df["close"] - df["SMA10"]) / df["SMA10"]
 
-    # Candle score
-    df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
-    df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
+    df["upper_wick"] = df["high"] - df[["open","close"]].max(axis=1)
+
+    df["lower_wick"] = df[["open","close"]].min(axis=1) - df["low"]
 
     df["candle_score"] = (
-        (df["upper_wick"] > df["lower_wick"]).astype(int) +
-        (df["close"] < df["open"]).astype(int)
+        (df["upper_wick"] > df["lower_wick"]).astype(int)
+        + (df["close"] < df["open"]).astype(int)
     )
 
     return df
 
 
 # -----------------------------
-# Forward returns
+# Forward Returns
 # -----------------------------
 
-def add_forward_returns(df):
+def add_returns(df):
 
-    df["fwd_1d"] = df["close"].shift(-1) / df["close"] - 1
-    df["fwd_2d"] = df["close"].shift(-2) / df["close"] - 1
-    df["fwd_5d"] = df["close"].shift(-5) / df["close"] - 1
+    df["ret1"] = df["close"].shift(-1) / df["close"] - 1
+
+    df["ret2"] = df["close"].shift(-2) / df["close"] - 1
+
+    df["ret5"] = df["close"].shift(-5) / df["close"] - 1
 
     return df
 
@@ -116,33 +151,34 @@ def add_forward_returns(df):
 # Analog Search
 # -----------------------------
 
-def find_analogs(df, current_row, n=30):
+def find_analogs(df):
 
     features = [
         "TSI_424",
         "TSI_747",
         "TSI_1377",
-        "CCI_20",
+        "CCI20",
         "BBP",
         "EXT_VWAP",
         "EXT_SMA10",
         "candle_score"
     ]
 
-    X = df[features].dropna()
+    df = df.dropna()
+
+    X = df[features]
+
     scaler = StandardScaler()
+
     X_scaled = scaler.fit_transform(X)
 
-    current_vec = scaler.transform([current_row[features]])
+    current = X_scaled[-1]
 
-    dist = cdist(current_vec, X_scaled)[0]
+    dist = cdist([current], X_scaled)[0]
 
-    df_sub = df.loc[X.index].copy()
-    df_sub["distance"] = dist
+    df["distance"] = dist
 
-    analogs = df_sub.nsmallest(n, "distance")
-
-    return analogs
+    return df.nsmallest(30, "distance")
 
 
 # -----------------------------
@@ -151,25 +187,20 @@ def find_analogs(df, current_row, n=30):
 
 def forecast(analogs):
 
-    result = {}
+    stats = {}
 
-    for horizon in ["fwd_1d", "fwd_2d", "fwd_5d"]:
+    for col in ["ret1","ret2","ret5"]:
 
-        returns = analogs[horizon].dropna()
+        r = analogs[col]
 
-        prob = (returns < 0).mean()
-        mean = returns.mean()
-        median = returns.median()
-
-        result[horizon] = {
-            "prob": prob,
-            "mean": mean,
-            "median": median
+        stats[col] = {
+            "prob": (r < 0).mean(),
+            "median": r.median()
         }
 
-    confidence = min(len(analogs) / 30, 1)
+    confidence = min(len(analogs)/30,1)
 
-    return result, confidence
+    return stats, confidence
 
 
 # -----------------------------
@@ -178,14 +209,14 @@ def forecast(analogs):
 
 def get_options(symbol):
 
-    ticker = yf.Ticker(symbol)
-    expirations = ticker.options
+    t = yf.Ticker(symbol)
 
-    if len(expirations) == 0:
+    if len(t.options) == 0:
         return None
 
-    exp = expirations[0]
-    chain = ticker.option_chain(exp)
+    exp = t.options[0]
+
+    chain = t.option_chain(exp)
 
     puts = chain.puts
 
@@ -195,55 +226,62 @@ def get_options(symbol):
 
 
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 
-st.title("Diamond Scanner v1")
-
 symbols = st.text_input(
-    "Tickers (comma separated)",
+    "Tickers",
     "QQQ,SMH,NVDA,MSFT,AMZN"
 )
 
-symbols = [s.strip().upper() for s in symbols.split(",")]
+symbols = [x.strip().upper() for x in symbols.split(",")]
 
-results = []
+rows = []
 
-for symbol in symbols:
+for s in symbols:
 
-    df = get_historical(symbol)
-    df = compute_features(df)
-    df = add_forward_returns(df)
+    df = get_history(s)
 
-    current = df.iloc[-1]
+    if df is None:
+        continue
 
-    analogs = find_analogs(df, current)
+    df = build_features(df)
 
-    forecast_stats, confidence = forecast(analogs)
+    df = add_returns(df)
 
-    results.append({
-        "symbol": symbol,
-        "DipProb_1d": forecast_stats["fwd_1d"]["prob"],
-        "DipProb_2d": forecast_stats["fwd_2d"]["prob"],
-        "DipProb_5d": forecast_stats["fwd_5d"]["prob"],
-        "ExpRet_1d": forecast_stats["fwd_1d"]["median"],
-        "ExpRet_5d": forecast_stats["fwd_5d"]["median"],
-        "Confidence": confidence
+    analogs = find_analogs(df)
+
+    stats, conf = forecast(analogs)
+
+    rows.append({
+
+        "symbol": s,
+
+        "DipProb_1d": stats["ret1"]["prob"],
+
+        "DipProb_2d": stats["ret2"]["prob"],
+
+        "DipProb_5d": stats["ret5"]["prob"],
+
+        "ExpRet_1d": stats["ret1"]["median"],
+
+        "ExpRet_5d": stats["ret5"]["median"],
+
+        "Confidence": conf
+
     })
 
-results_df = pd.DataFrame(results)
+results = pd.DataFrame(rows)
 
-st.dataframe(
-    results_df.sort_values("DipProb_1d", ascending=False),
-    use_container_width=True
-)
+st.dataframe(results.sort_values("DipProb_1d", ascending=False))
 
-selected = st.selectbox("Inspect ticker", results_df["symbol"])
+selected = st.selectbox("Inspect ticker", results["symbol"])
 
 if selected:
 
-    options = get_options(selected)
+    st.subheader("Option Candidates")
 
-    st.subheader("Best Put Candidates")
+    opt = get_options(selected)
 
-    st.dataframe(options)
+    if opt is not None:
+        st.dataframe(opt)
