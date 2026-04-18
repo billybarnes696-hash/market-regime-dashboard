@@ -11,19 +11,33 @@ st.set_page_config(page_title="Breadth Oscillator Dashboard", layout="wide")
 
 SERIES = ["NYAD", "NYSI", "NYHL", "NYMO", "RSP"]
 
+
 def normalize_name(name: str) -> str:
-    return str(name).strip().replace("$", "").replace("^", "").replace("-", "").replace("_", "").replace(" ", "").upper()
+    return (
+        str(name)
+        .strip()
+        .replace("$", "")
+        .replace("^", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+        .upper()
+    )
+
 
 def to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
+
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=max(1, int(span)), adjust=False).mean()
+
 
 def rolling_zscore(series: pd.Series, window: int) -> pd.Series:
     mean = series.rolling(window, min_periods=max(10, window // 4)).mean()
     std = series.rolling(window, min_periods=max(10, window // 4)).std(ddof=0).replace(0, np.nan)
     return ((series - mean) / std).clip(-5, 5)
+
 
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
@@ -34,6 +48,7 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+
 def tsi(series: pd.Series, long_len: int = 25, short_len: int = 13, signal_len: int = 7):
     momentum = series.diff()
     abs_momentum = momentum.abs()
@@ -43,11 +58,13 @@ def tsi(series: pd.Series, long_len: int = 25, short_len: int = 13, signal_len: 
     sig = ema(out, signal_len)
     return out, sig
 
+
 def cci(series: pd.Series, length: int = 20) -> pd.Series:
     sma = series.rolling(length, min_periods=max(5, length // 3)).mean()
     mad = series.rolling(length, min_periods=max(5, length // 3)).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
     mad = pd.Series(mad, index=series.index).replace(0, np.nan)
     return (series - sma) / (0.015 * mad)
+
 
 def bb_percent(series: pd.Series, length: int = 20, num_std: float = 2.0) -> pd.Series:
     ma = series.rolling(length, min_periods=max(5, length // 3)).mean()
@@ -57,9 +74,11 @@ def bb_percent(series: pd.Series, length: int = 20, num_std: float = 2.0) -> pd.
     width = (upper - lower).replace(0, np.nan)
     return (series - lower) / width
 
+
 def detect_symbol_table(df: pd.DataFrame) -> bool:
     cols = [normalize_name(c) for c in df.columns]
     return any(c in cols for c in ["SYMBOL", "TICKER"]) and any(c in cols for c in ["CLOSE", "VALUE", "LAST"])
+
 
 def parse_symbol_table(df: pd.DataFrame, snapshot_date: pd.Timestamp) -> pd.DataFrame:
     temp = df.copy()
@@ -81,7 +100,59 @@ def parse_symbol_table(df: pd.DataFrame, snapshot_date: pd.Timestamp) -> pd.Data
         row[rec["symbol"]] = float(rec["value"])
     return pd.DataFrame([row])
 
+
+def parse_stockcharts_daily_csv(raw: bytes) -> pd.DataFrame:
+    text = raw.decode("utf-8-sig", errors="ignore")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return pd.DataFrame()
+
+    first = [x.strip() for x in lines[0].split(",")]
+    second = [x.strip() for x in lines[1].split(",")]
+
+    symbol = None
+    if first:
+        symbol = normalize_name(first[0])
+    if symbol not in SERIES:
+        return pd.DataFrame()
+
+    cols = []
+    for i in range(max(len(first), len(second))):
+        a = first[i].strip() if i < len(first) else ""
+        b = second[i].strip() if i < len(second) else ""
+        if normalize_name(b) == "DATE" or normalize_name(a) == "DATE":
+            cols.append("Date")
+        elif normalize_name(b) == "CLOSE":
+            cols.append(symbol)
+        else:
+            cols.append(f"drop_{i}")
+
+    data = []
+    for ln in lines[2:]:
+        parts = [x.strip() for x in ln.split(",")]
+        if len(parts) < len(cols):
+            parts += [""] * (len(cols) - len(parts))
+        row = dict(zip(cols, parts[: len(cols)]))
+        data.append(row)
+
+    df = pd.DataFrame(data)
+    keep_cols = [c for c in ["Date", symbol] if c in df.columns]
+    if not keep_cols or "Date" not in keep_cols:
+        return pd.DataFrame()
+
+    out = df[keep_cols].copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out[symbol] = to_num(out[symbol])
+    out = out.dropna(subset=["Date"]).sort_values("Date")
+    return out
+
+
 def parse_csv_bytes(raw: bytes, snapshot_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    # First try the special StockCharts format used in the ZIP the user uploaded
+    sc = parse_stockcharts_daily_csv(raw)
+    if not sc.empty:
+        return sc
+
     df = pd.read_csv(io.BytesIO(raw))
     if detect_symbol_table(df):
         if snapshot_date is None:
@@ -113,6 +184,7 @@ def parse_csv_bytes(raw: bytes, snapshot_date: pd.Timestamp | None = None) -> pd
         if c in out.columns:
             out[c] = to_num(out[c])
     return out.dropna(subset=["Date"]).sort_values("Date")
+
 
 def load_uploaded(uploaded_file, snapshot_date: pd.Timestamp | None = None) -> pd.DataFrame:
     if uploaded_file is None:
@@ -154,6 +226,7 @@ def load_uploaded(uploaded_file, snapshot_date: pd.Timestamp | None = None) -> p
 
     return merged.sort_values("Date").drop_duplicates("Date").reset_index(drop=True)
 
+
 def append_snapshot(history: pd.DataFrame, snapshot_file, snapshot_date: pd.Timestamp) -> pd.DataFrame:
     if snapshot_file is None:
         return history.copy()
@@ -163,6 +236,7 @@ def append_snapshot(history: pd.DataFrame, snapshot_file, snapshot_date: pd.Time
     snap["Date"] = pd.to_datetime(snapshot_date)
     out = pd.concat([history, snap], ignore_index=True)
     return out.sort_values("Date").drop_duplicates("Date", keep="last").reset_index(drop=True)
+
 
 def prepare_series(df: pd.DataFrame, nyad_cumulative: bool, nyhl_cumulative: bool) -> pd.DataFrame:
     work = df.copy().sort_values("Date").reset_index(drop=True)
@@ -174,6 +248,7 @@ def prepare_series(df: pd.DataFrame, nyad_cumulative: bool, nyhl_cumulative: boo
     if "NYHL" in work.columns and not nyhl_cumulative:
         work["NYHL"] = work["NYHL"].fillna(0).cumsum()
     return work
+
 
 def build_composite(df: pd.DataFrame, weights: dict[str, float], z_window: int, smooth_span: int) -> pd.DataFrame:
     work = df.copy()
@@ -195,6 +270,7 @@ def build_composite(df: pd.DataFrame, weights: dict[str, float], z_window: int, 
     work["Breadth_Composite"] = ema(composite_raw, smooth_span)
     return work
 
+
 def add_oscillators(df: pd.DataFrame, rsi_len: int, tsi_long: int, tsi_short: int, tsi_signal: int, cci_len: int, bb_len: int, bb_std: float) -> pd.DataFrame:
     work = df.copy()
     base = work["Breadth_Composite"]
@@ -203,6 +279,7 @@ def add_oscillators(df: pd.DataFrame, rsi_len: int, tsi_long: int, tsi_short: in
     work["Composite_CCI"] = cci(base, cci_len)
     work["Composite_BBP"] = bb_percent(base, bb_len, bb_std)
     return work
+
 
 def regime_label(row: pd.Series) -> str:
     rsi_v = row.get("Composite_RSI", np.nan)
@@ -219,13 +296,15 @@ def regime_label(row: pd.Series) -> str:
         return "Constructive / Trending" if improving else "Constructive / Fading"
     return "Expansion / Strong" if improving else "Exhaustion Risk"
 
+
 def trim_years(df: pd.DataFrame, years: int) -> pd.DataFrame:
     end = df["Date"].max()
     start = end - pd.DateOffset(years=years)
     return df[df["Date"] >= start].copy()
 
+
 st.title("NYAD + NYSI + NYHL + NYMO Breadth Oscillator")
-st.caption("Holistic breadth composite with adjustable weights and default oscillator intervals, tracked against RSP.")
+st.caption("Holistic breadth composite with adjustable weights and default oscillator intervals, tracked against RSP. Defaults below are set for daily input data where NYAD and NYHL need to be cumulated.")
 
 with st.sidebar:
     st.header("Uploads")
@@ -234,9 +313,9 @@ with st.sidebar:
     snapshot_file = st.file_uploader("Daily snapshot (optional)", type=["zip", "csv"])
 
     st.header("Series handling")
-    st.caption("Use these if uploaded NYAD/NYHL are daily values rather than already-cumulative lines.")
-    nyad_cumulative = st.checkbox("NYAD already cumulative", value=True)
-    nyhl_cumulative = st.checkbox("NYHL already cumulative", value=True)
+    st.caption("For your ZIP, NYAD and NYHL are daily values, so these default to unchecked and will be cumulated.")
+    nyad_cumulative = st.checkbox("NYAD already cumulative", value=False)
+    nyhl_cumulative = st.checkbox("NYHL already cumulative", value=False)
 
     st.header("Weights")
     nyad_w = st.slider("NYAD %", 0, 100, 25, 1)
@@ -360,7 +439,7 @@ st.markdown("""
 **Requirements / assumptions**
 - `NYSI` is treated as already cumulative.
 - `NYMO` is treated as daily, non-cumulative.
-- `NYAD` and `NYHL` can be either already cumulative or daily values to cumulate, using the sidebar toggles.
+- For your uploaded ZIP, `NYAD` and `NYHL` are daily values and default to being cumulated inside the app.
 - Default weights are 25% each.
 - `RSP` is used for comparison on the main chart and is not blended into the breadth composite.
 """)
