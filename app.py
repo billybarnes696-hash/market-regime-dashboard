@@ -2,10 +2,12 @@
 import io
 import zipfile
 from pathlib import Path
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 from scipy.optimize import differential_evolution
 import warnings
@@ -385,22 +387,30 @@ def calculate_robust_metrics(composite: pd.Series, forward_returns: pd.Series) -
     }
 
 
-def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
+def run_breadth_optimization_robust(df: pd.DataFrame, optimization_years: int = 5) -> dict:
     """
     ROBUST optimization with walk-forward testing and guardrails against overfitting
+    Uses only the last N years of data for optimization
     """
+    
+    # Limit data to optimization lookback period
+    end_date = df["Date"].max()
+    start_date = end_date - pd.DateOffset(years=optimization_years)
+    opt_df = df[df["Date"] >= start_date].copy()
+    
+    print(f"Optimizing on {optimization_years} years of data ({len(opt_df)} days)")
     
     # Guardrail 1: Define bounds (prevent extreme weights)
     MIN_WEIGHT = 0.05   # 5% minimum
     MAX_WEIGHT = 0.50   # 50% maximum
     
     breadth_cols = ['NYAD', 'NYSI', 'NYHL', 'NYMO']
-    available_cols = [c for c in breadth_cols if c in df.columns]
+    available_cols = [c for c in breadth_cols if c in opt_df.columns]
     
     if len(available_cols) < 2:
         return {'error': 'Need at least 2 breadth series for optimization'}
     
-    if 'RSP' not in df.columns:
+    if 'RSP' not in opt_df.columns:
         return {'error': 'RSP column required for optimization'}
     
     def objective_function(weights, train_data, horizon):
@@ -425,7 +435,7 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
         return -metrics['blended_score'] + weight_penalty
     
     # Walk-forward testing
-    window_size = min(252, len(df) // 3)
+    window_size = min(252, len(opt_df) // 3)
     rebalance_freq = 21
     horizon = 5
     
@@ -433,13 +443,11 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
     weight_history = []
     regime_performance = {'Bull': [], 'Bear': [], 'Range': [], 'High Vol': []}
     
-    df['regime'] = detect_market_regime(df['RSP'])
+    opt_df['regime'] = detect_market_regime(opt_df['RSP'])
     
-    print(f"Running walk-forward optimization with {len(df)} days of data...")
-    
-    for i in range(window_size, len(df) - horizon, rebalance_freq):
-        train_data = df.iloc[i - window_size:i]
-        test_data = df.iloc[i:i + rebalance_freq]
+    for i in range(window_size, len(opt_df) - horizon, rebalance_freq):
+        train_data = opt_df.iloc[i - window_size:i]
+        test_data = opt_df.iloc[i:i + rebalance_freq]
         
         if len(test_data) < 10:
             continue
@@ -451,8 +459,8 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
                 objective_function,
                 bounds,
                 args=(train_data, horizon),
-                maxiter=30,  # Reduced for speed
-                popsize=8,
+                maxiter=20,  # Reduced for speed
+                popsize=6,   # Reduced for speed
                 seed=42,
                 disp=False
             )
@@ -479,7 +487,6 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
                 if test_regime in regime_performance:
                     regime_performance[test_regime].append(metrics['blended_score'])
         except Exception as e:
-            print(f"Optimization failed for period {i}: {e}")
             continue
     
     if not walk_forward_results:
@@ -535,6 +542,21 @@ def run_breadth_optimization_robust(df: pd.DataFrame) -> dict:
     }
 
 
+def normalize_for_oscillator(rsp_series: pd.Series, oscillator_series: pd.Series) -> pd.Series:
+    """Normalize RSP to same scale as oscillator for visual comparison"""
+    # Remove NaN values for scaling
+    rsp_clean = rsp_series.dropna()
+    osc_clean = oscillator_series.dropna()
+    
+    if len(rsp_clean) == 0 or len(osc_clean) == 0:
+        return rsp_series
+    
+    # Scale RSP to match oscillator's range and mean
+    rsp_normalized = (rsp_series - rsp_clean.min()) / (rsp_clean.max() - rsp_clean.min())
+    rsp_normalized = rsp_normalized * (osc_clean.max() - osc_clean.min()) + osc_clean.min()
+    return rsp_normalized
+
+
 # ============================================================================
 # STREAMLIT UI
 # ============================================================================
@@ -545,6 +567,8 @@ st.caption("Holistic breadth composite with adjustable weights and institutional
 # Initialize session state
 if 'opt_results' not in st.session_state:
     st.session_state.opt_results = None
+if 'combined_oscillator' not in st.session_state:
+    st.session_state.combined_oscillator = False
 
 with st.sidebar:
     st.header("📁 Uploads")
@@ -580,8 +604,22 @@ with st.sidebar:
     lookback_years = st.slider("Chart lookback (years)", 1, 20, 2, 1)
     
     st.header("🤖 Weight Optimizer")
-    st.caption("Finds optimal weights to predict RSP using walk-forward testing")
+    optimization_lookback = st.selectbox(
+        "Optimization lookback (years)",
+        options=[1, 2, 5, 20],
+        index=2,  # Default to 5 years
+        help="Use last N years of data to find optimal weights. 5 years recommended."
+    )
+    st.caption(f"Will use last {optimization_lookback} year(s) of data for optimization")
+    
     run_opt = st.button("🔍 Find Optimal Weights", type="primary")
+    
+    st.header("🔄 Combined Signal")
+    st.session_state.combined_oscillator = st.checkbox(
+        "Show Combined Oscillator + RSP",
+        value=False,
+        help="Creates a blended signal weighting breadth composite and RSP momentum"
+    )
 
 if historical_file is None:
     st.info("📂 Upload a historical ZIP or CSV to begin.")
@@ -605,16 +643,16 @@ merged = prepare_series(merged, nyad_cumulative=nyad_cumulative, nyhl_cumulative
 
 # Run optimization if button was clicked
 if run_opt:
-    with st.spinner("Running walk-forward optimization across multiple periods... This may take a minute..."):
-        if 'RSP' in merged.columns and len(merged) > 500:
-            opt_results = run_breadth_optimization_robust(merged)
+    with st.spinner(f"Running walk-forward optimization on last {optimization_lookback} year(s) of data... This may take 30-90 seconds..."):
+        if 'RSP' in merged.columns and len(merged) > 100:
+            opt_results = run_breadth_optimization_robust(merged, optimization_years=optimization_lookback)
             if 'error' not in opt_results:
                 st.session_state.opt_results = opt_results
-                st.success("Optimization complete!")
+                st.success(f"Optimization complete using last {optimization_lookback} year(s) of data!")
             else:
                 st.error(f"Optimization failed: {opt_results['error']}")
         else:
-            st.error("Need at least 500 days of data with RSP column for optimization")
+            st.error("Need at least 100 days of data with RSP column for optimization")
 
 # Use optimized weights if available, otherwise use manual weights
 if st.session_state.opt_results is not None and 'recommended_weights' in st.session_state.opt_results:
@@ -625,7 +663,7 @@ if st.session_state.opt_results is not None and 'recommended_weights' in st.sess
         "NYHL": opt_weights.get("NYHL", nyhl_w / 100),
         "NYMO": opt_weights.get("NYMO", nymo_w / 100),
     }
-    st.sidebar.success("✨ Using optimized weights")
+    st.sidebar.success(f"✨ Using optimized weights ({optimization_lookback}y lookback)")
 else:
     weights = {"NYAD": nyad_w / 100, "NYSI": nysi_w / 100, "NYHL": nyhl_w / 100, "NYMO": nymo_w / 100}
 
@@ -639,8 +677,38 @@ if "Breadth_Composite" not in model.columns:
 model = add_oscillators(model, rsi_len, tsi_long, tsi_short, tsi_signal, cci_len, bb_len, bb_std)
 model["State"] = model.apply(regime_label, axis=1)
 
+# Add combined oscillator if checkbox is checked
+if st.session_state.combined_oscillator:
+    # Calculate RSP momentum (rate of change)
+    rsp_momentum = model["RSP"].pct_change(10)  # 10-day momentum
+    rsp_momentum_norm = (rsp_momentum - rsp_momentum.min()) / (rsp_momentum.max() - rsp_momentum.min()) * 2 - 1
+    
+    # Combined signal: 70% breadth composite + 30% RSP momentum
+    model["Combined_Signal"] = model["Breadth_Composite"] * 0.7 + rsp_momentum_norm * 0.3
+    model["Combined_RSI"] = rsi(model["Combined_Signal"], rsi_len)
+    model["Combined_TSI"], model["Combined_TSI_Signal"] = tsi(model["Combined_Signal"], tsi_long, tsi_short, tsi_signal)
+
 latest = model.iloc[-1]
 view = trim_years(model, lookback_years)
+
+# Calendar Date Picker for Historical View
+st.subheader("📅 Historical Date Lookup")
+col1, col2 = st.columns([2, 3])
+with col1:
+    lookup_date = st.date_input(
+        "Select a date to view oscillator values",
+        value=model["Date"].max().date(),
+        min_value=model["Date"].min().date(),
+        max_value=model["Date"].max().date()
+    )
+with col2:
+    if lookup_date:
+        lookup_data = model[model["Date"].dt.date == lookup_date]
+        if not lookup_data.empty:
+            lookup_row = lookup_data.iloc[0]
+            st.metric("Market State on this date", lookup_row.get("State", "N/A"))
+        else:
+            st.warning("No data for selected date")
 
 # Metrics row
 m1, m2, m3, m4, m5 = st.columns(5)
@@ -654,55 +722,99 @@ st.markdown(f"**📌 Current state:** {latest['State']}")
 
 # Main chart
 fig_main = go.Figure()
-fig_main.add_trace(go.Scatter(x=view["Date"], y=view["Breadth_Composite"], mode="lines", name="Breadth Composite"))
+
+if st.session_state.combined_oscillator and "Combined_Signal" in view.columns:
+    fig_main.add_trace(go.Scatter(x=view["Date"], y=view["Combined_Signal"], mode="lines", name="Combined Signal", line=dict(color="purple", width=2)))
+    fig_main.add_trace(go.Scatter(x=view["Date"], y=view["Breadth_Composite"], mode="lines", name="Breadth Composite", line=dict(color="blue", width=1.5, dash="dot")))
+else:
+    fig_main.add_trace(go.Scatter(x=view["Date"], y=view["Breadth_Composite"], mode="lines", name="Breadth Composite", line=dict(color="blue", width=2)))
+
 if "RSP" in view.columns:
     # Normalize RSP for comparison
     rsp_norm = view["RSP"] / view["RSP"].iloc[0] * view["Breadth_Composite"].iloc[0]
-    fig_main.add_trace(go.Scatter(x=view["Date"], y=rsp_norm, mode="lines", name="RSP (normalized)", yaxis="y2"))
+    fig_main.add_trace(go.Scatter(x=view["Date"], y=rsp_norm, mode="lines", name="RSP (normalized)", line=dict(color="red", width=1.5), yaxis="y2"))
+
 fig_main.update_layout(
     title="Breadth Composite vs RSP (normalized)",
     height=460,
     xaxis_title="Date",
-    yaxis_title="Breadth Composite",
+    yaxis_title="Breadth Composite / Combined Signal",
     yaxis2=dict(title="RSP", overlaying="y", side="right", showgrid=False),
-    legend=dict(orientation="h"),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
 )
 st.plotly_chart(fig_main, width="stretch")
 
-# Oscillator charts
+# Oscillator charts with RSP overlay
 left, right = st.columns(2)
+
+# Normalize RSP for each oscillator
+rsp_for_rsi = normalize_for_oscillator(view["RSP"], view["Composite_RSI"])
+rsp_for_tsi = normalize_for_oscillator(view["RSP"], view["Composite_TSI"])
+rsp_for_cci = normalize_for_oscillator(view["RSP"], view["Composite_CCI"])
+rsp_for_bbp = normalize_for_oscillator(view["RSP"], view["Composite_BBP"])
+
 with left:
+    # RSI Chart with RSP overlay
     fig_rsi = go.Figure()
-    fig_rsi.add_trace(go.Scatter(x=view["Date"], y=view["Composite_RSI"], mode="lines", name="Composite RSI"))
-    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
-    fig_rsi.add_hline(y=50, line_dash="dot", line_color="gray")
-    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
-    fig_rsi.update_layout(title="Composite RSI", height=300)
+    fig_rsi.add_trace(go.Scatter(x=view["Date"], y=view["Composite_RSI"], mode="lines", name="Composite RSI", line=dict(color="blue", width=2)))
+    fig_rsi.add_trace(go.Scatter(x=view["Date"], y=rsp_for_rsi, mode="lines", name="RSP (normalized)", line=dict(color="red", width=1.5, dash="dot")))
+    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5)
+    fig_rsi.add_hline(y=50, line_dash="dot", line_color="gray", opacity=0.5)
+    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5)
+    fig_rsi.update_layout(title="Composite RSI vs RSP", height=300, legend=dict(orientation="h", yanchor="bottom", y=1.02))
     st.plotly_chart(fig_rsi, width="stretch")
     
+    # CCI Chart with RSP overlay
     fig_cci = go.Figure()
-    fig_cci.add_trace(go.Scatter(x=view["Date"], y=view["Composite_CCI"], mode="lines", name="Composite CCI"))
-    fig_cci.add_hline(y=100, line_dash="dash", line_color="red")
-    fig_cci.add_hline(y=0, line_dash="dot", line_color="gray")
-    fig_cci.add_hline(y=-100, line_dash="dash", line_color="green")
-    fig_cci.update_layout(title="Composite CCI", height=300)
+    fig_cci.add_trace(go.Scatter(x=view["Date"], y=view["Composite_CCI"], mode="lines", name="Composite CCI", line=dict(color="blue", width=2)))
+    fig_cci.add_trace(go.Scatter(x=view["Date"], y=rsp_for_cci, mode="lines", name="RSP (normalized)", line=dict(color="red", width=1.5, dash="dot")))
+    fig_cci.add_hline(y=100, line_dash="dash", line_color="red", opacity=0.5)
+    fig_cci.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
+    fig_cci.add_hline(y=-100, line_dash="dash", line_color="green", opacity=0.5)
+    fig_cci.update_layout(title="Composite CCI vs RSP", height=300, legend=dict(orientation="h", yanchor="bottom", y=1.02))
     st.plotly_chart(fig_cci, width="stretch")
 
 with right:
+    # TSI Chart with RSP overlay
     fig_tsi = go.Figure()
-    fig_tsi.add_trace(go.Scatter(x=view["Date"], y=view["Composite_TSI"], mode="lines", name="Composite TSI"))
-    fig_tsi.add_trace(go.Scatter(x=view["Date"], y=view["Composite_TSI_Signal"], mode="lines", name="TSI Signal"))
-    fig_tsi.add_hline(y=0, line_dash="dot", line_color="gray")
-    fig_tsi.update_layout(title="Composite TSI", height=300)
+    fig_tsi.add_trace(go.Scatter(x=view["Date"], y=view["Composite_TSI"], mode="lines", name="Composite TSI", line=dict(color="blue", width=2)))
+    fig_tsi.add_trace(go.Scatter(x=view["Date"], y=view["Composite_TSI_Signal"], mode="lines", name="TSI Signal", line=dict(color="lightblue", width=1.5)))
+    fig_tsi.add_trace(go.Scatter(x=view["Date"], y=rsp_for_tsi, mode="lines", name="RSP (normalized)", line=dict(color="red", width=1.5, dash="dot")))
+    fig_tsi.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
+    fig_tsi.update_layout(title="Composite TSI vs RSP", height=300, legend=dict(orientation="h", yanchor="bottom", y=1.02))
     st.plotly_chart(fig_tsi, width="stretch")
     
+    # BB% Chart with RSP overlay
     fig_bbp = go.Figure()
-    fig_bbp.add_trace(go.Scatter(x=view["Date"], y=view["Composite_BBP"], mode="lines", name="Composite BB%"))
-    fig_bbp.add_hline(y=1.0, line_dash="dash", line_color="red")
-    fig_bbp.add_hline(y=0.5, line_dash="dot", line_color="gray")
-    fig_bbp.add_hline(y=0.0, line_dash="dash", line_color="green")
-    fig_bbp.update_layout(title="Composite BB%", height=300)
+    fig_bbp.add_trace(go.Scatter(x=view["Date"], y=view["Composite_BBP"], mode="lines", name="Composite BB%", line=dict(color="blue", width=2)))
+    fig_bbp.add_trace(go.Scatter(x=view["Date"], y=rsp_for_bbp, mode="lines", name="RSP (normalized)", line=dict(color="red", width=1.5, dash="dot")))
+    fig_bbp.add_hline(y=1.0, line_dash="dash", line_color="red", opacity=0.5)
+    fig_bbp.add_hline(y=0.5, line_dash="dot", line_color="gray", opacity=0.5)
+    fig_bbp.add_hline(y=0.0, line_dash="dash", line_color="green", opacity=0.5)
+    fig_bbp.update_layout(title="Composite BB% vs RSP", height=300, legend=dict(orientation="h", yanchor="bottom", y=1.02))
     st.plotly_chart(fig_bbp, width="stretch")
+
+# Combined oscillator additional charts if enabled
+if st.session_state.combined_oscillator and "Combined_RSI" in view.columns:
+    st.subheader("📊 Combined Oscillator + RSP Signal")
+    col_left, col_right = st.columns(2)
+    
+    with col_left:
+        fig_combined_rsi = go.Figure()
+        fig_combined_rsi.add_trace(go.Scatter(x=view["Date"], y=view["Combined_RSI"], mode="lines", name="Combined RSI", line=dict(color="purple", width=2)))
+        fig_combined_rsi.add_hline(y=70, line_dash="dash", line_color="red")
+        fig_combined_rsi.add_hline(y=50, line_dash="dot", line_color="gray")
+        fig_combined_rsi.add_hline(y=30, line_dash="dash", line_color="green")
+        fig_combined_rsi.update_layout(title="Combined Signal RSI", height=300)
+        st.plotly_chart(fig_combined_rsi, width="stretch")
+    
+    with col_right:
+        fig_combined_tsi = go.Figure()
+        fig_combined_tsi.add_trace(go.Scatter(x=view["Date"], y=view["Combined_TSI"], mode="lines", name="Combined TSI", line=dict(color="purple", width=2)))
+        fig_combined_tsi.add_trace(go.Scatter(x=view["Date"], y=view["Combined_TSI_Signal"], mode="lines", name="Signal", line=dict(color="lightpurple", width=1.5)))
+        fig_combined_tsi.add_hline(y=0, line_dash="dot", line_color="gray")
+        fig_combined_tsi.update_layout(title="Combined Signal TSI", height=300)
+        st.plotly_chart(fig_combined_tsi, width="stretch")
 
 # Optimization results display
 if st.session_state.opt_results is not None:
@@ -743,6 +855,22 @@ if st.session_state.opt_results is not None:
         regime_df.columns = ['Blended Score']
         st.dataframe(regime_df, width="stretch")
 
+# Historical lookup table for selected date
+if lookup_date and not lookup_data.empty:
+    st.subheader(f"📊 Oscillator Values for {lookup_date}")
+    lookup_row = lookup_data.iloc[0]
+    
+    hist_col1, hist_col2, hist_col3, hist_col4 = st.columns(4)
+    hist_col1.metric("RSI", f"{lookup_row.get('Composite_RSI', 'n/a'):.1f}" if pd.notna(lookup_row.get('Composite_RSI')) else "n/a")
+    hist_col2.metric("TSI", f"{lookup_row.get('Composite_TSI', 'n/a'):.1f}" if pd.notna(lookup_row.get('Composite_TSI')) else "n/a")
+    hist_col3.metric("CCI", f"{lookup_row.get('Composite_CCI', 'n/a'):.1f}" if pd.notna(lookup_row.get('Composite_CCI')) else "n/a")
+    hist_col4.metric("BB%", f"{lookup_row.get('Composite_BBP', 'n/a'):.2f}" if pd.notna(lookup_row.get('Composite_BBP')) else "n/a")
+    
+    st.write(f"**Market State:** {lookup_row.get('State', 'N/A')}")
+    
+    if "RSP" in lookup_row:
+        st.write(f"**RSP Close:** ${lookup_row['RSP']:.2f}" if pd.notna(lookup_row['RSP']) else "RSP: n/a")
+
 # Latest values table
 st.subheader("Latest breadth values")
 display_df = pd.DataFrame({
@@ -769,4 +897,6 @@ st.markdown("""
 - Optimizer uses walk-forward testing with 5-day prediction horizon
 - Blended objective: directional accuracy (30%) + Sharpe (25%) + Profit Factor (20%) + Calmar (15%) + median return (10%)
 - Weights constrained to 5-50% each to prevent overfitting
+- Red dotted line on oscillators shows normalized RSP for divergence detection
+- Combined signal blends 70% breadth composite + 30% RSP momentum
 """)
