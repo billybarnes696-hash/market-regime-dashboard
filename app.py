@@ -572,7 +572,8 @@ def find_analogs(hist_df: pd.DataFrame, current_row: pd.Series, n: int = 30, exc
     )
     # Slight recency boost: more recent analogs tend to be more useful for short-horizon options timing.
     if isinstance(pool.index, pd.DatetimeIndex) and hasattr(current_row.name, 'to_pydatetime'):
-        age_days = (pd.Timestamp(current_row.name) - pool.index).days.clip(lower=1)
+        age_delta = pd.Timestamp(current_row.name) - pd.to_datetime(pool.index)
+        age_days = np.maximum((age_delta / np.timedelta64(1, "D")).astype(float), 1.0)
         pool["recency_penalty"] = np.clip(age_days / 2520.0, 0, 0.20)
     else:
         pool["recency_penalty"] = 0.0
