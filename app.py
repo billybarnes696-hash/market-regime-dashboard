@@ -480,18 +480,60 @@ def centered_pct(series: pd.Series) -> pd.Series:
     return (series.fillna(0.5) - 0.5) * 2
 
 
-def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
+def rolling_zscore(series: pd.Series, window: int, clip: float = 3.0) -> pd.Series:
+    series = pd.to_numeric(series, errors="coerce")
+    mean = series.rolling(window, min_periods=max(20, window // 5)).mean()
+    std = series.rolling(window, min_periods=max(20, window // 5)).std()
+    z = (series - mean) / std.replace(0, np.nan)
+    return z.clip(-clip, clip)
+
+
+def smooth_norm(series: pd.Series, window: int, clip: float = 3.0, ema_span: int = 3) -> pd.Series:
+    z = rolling_zscore(series, window=window, clip=clip)
+    smooth = ema(z.fillna(0.0), ema_span)
+    return np.tanh(smooth)
+
+
+def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str, use_smooth_hourly: bool = True) -> pd.DataFrame:
     spans = {"hourly": (5, 13, 5), "daily": (8, 21, 7), "weekly": (5, 13, 5)}
+
     def pct_col(name: str) -> pd.Series:
         return centered_pct(out[name]) if name in out.columns else pd.Series(0.0, index=out.index, dtype=float)
+
+    def smooth_col(name: str, window: int, ema_span: int = 3, scale: float = 1.0) -> pd.Series:
+        if name not in out.columns:
+            return pd.Series(0.0, index=out.index, dtype=float)
+        return smooth_norm(out[name], window=window, ema_span=ema_span) * scale
+
     fast, slow, sig = spans[timeframe_name]
-    stretch = 0.18 * pct_col("rsi_14_pctile") + 0.18 * pct_col("cci_20_pctile") + 0.14 * pct_col("pct_b_pctile") + 0.12 * pct_col("atr_stretch_pctile") + 0.10 * pct_col("dist_ema20_pctile")
-    momentum = 0.20 * pct_col("tsi_pctile") + 0.08 * np.tanh(out.get("price_slope_3", pd.Series(0.0, index=out.index)).fillna(0) * 25)
-    rs_part = 0.10 * np.tanh(out.get("rs_bench_slope_5", pd.Series(0.0, index=out.index)).fillna(0) * 25)
-    quality = 1 + 0.15 * pct_col("adx_14_pctile")
-    if "dist_vwap_pctile" in out.columns:
-        stretch = stretch + 0.10 * centered_pct(out["dist_vwap_pctile"].fillna(0.5))
-    out["uo_base"] = (stretch + momentum + rs_part) * quality
+
+    if timeframe_name == "hourly" and use_smooth_hourly:
+        smooth_window = 72
+        stretch = (
+            0.18 * smooth_col("rsi_14", smooth_window, ema_span=3)
+            + 0.18 * smooth_col("cci_20", smooth_window, ema_span=3)
+            + 0.14 * smooth_col("pct_b", smooth_window, ema_span=3)
+            + 0.12 * smooth_col("atr_stretch", smooth_window, ema_span=4)
+            + 0.10 * smooth_col("dist_ema20_pct", smooth_window, ema_span=4)
+        )
+        if "dist_vwap_pct" in out.columns:
+            stretch = stretch + 0.10 * smooth_col("dist_vwap_pct", smooth_window, ema_span=3)
+        momentum = (
+            0.20 * smooth_col("tsi", smooth_window, ema_span=3)
+            + 0.08 * np.tanh(ema(out.get("price_slope_3", pd.Series(0.0, index=out.index)).fillna(0), 3) * 30)
+        )
+        rs_part = 0.10 * np.tanh(ema(out.get("rs_bench_slope_5", pd.Series(0.0, index=out.index)).fillna(0), 3) * 30)
+        quality = 1 + 0.12 * smooth_col("adx_14", smooth_window, ema_span=4)
+        out["uo_base"] = ema((stretch + momentum + rs_part) * quality, 3)
+    else:
+        stretch = 0.18 * pct_col("rsi_14_pctile") + 0.18 * pct_col("cci_20_pctile") + 0.14 * pct_col("pct_b_pctile") + 0.12 * pct_col("atr_stretch_pctile") + 0.10 * pct_col("dist_ema20_pctile")
+        momentum = 0.20 * pct_col("tsi_pctile") + 0.08 * np.tanh(out.get("price_slope_3", pd.Series(0.0, index=out.index)).fillna(0) * 25)
+        rs_part = 0.10 * np.tanh(out.get("rs_bench_slope_5", pd.Series(0.0, index=out.index)).fillna(0) * 25)
+        quality = 1 + 0.15 * pct_col("adx_14_pctile")
+        if "dist_vwap_pctile" in out.columns:
+            stretch = stretch + 0.10 * centered_pct(out["dist_vwap_pctile"].fillna(0.5))
+        out["uo_base"] = (stretch + momentum + rs_part) * quality
+
     out["uo"] = ema(out["uo_base"], fast) - ema(out["uo_base"], slow)
     out["uo_signal"] = ema(out["uo"], sig)
     out["uo_hist"] = out["uo"] - out["uo_signal"]
@@ -504,7 +546,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     return out
 
 
-def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None, use_smooth_hourly: bool = True) -> pd.DataFrame:
     if df.empty:
         return df.copy()
     out = df.copy().sort_index()
@@ -545,7 +587,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     for col in ["rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14", "dist_ema20_pct", "volume_ratio", "dist_vwap_pct"]:
         if col in out.columns:
             out[f"{col}_pctile"] = rolling_percentile(out[col], win)
-    return add_ultimate_oscillator(out, timeframe_name)
+    return add_ultimate_oscillator(out, timeframe_name, use_smooth_hourly=use_smooth_hourly)
 
 
 def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
@@ -715,8 +757,9 @@ def get_option_candidates(symbol: str, option_type: str, max_expirations: int = 
         return pd.DataFrame()
 
 
-def plot_timeframe_dashboard(symbol: str, hourly_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame) -> None:
-    fig = make_subplots(rows=4, cols=1, vertical_spacing=0.06, subplot_titles=[f"{symbol} Daily Price", "Hourly Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"], row_heights=[0.42, 0.19, 0.19, 0.20])
+def plot_timeframe_dashboard(symbol: str, hourly_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_label: Optional[str] = None) -> None:
+    title_suffix = f" (as of {asof_label})" if asof_label else ""
+    fig = make_subplots(rows=4, cols=1, vertical_spacing=0.06, subplot_titles=[f"{symbol} Daily Price{title_suffix}", "Hourly Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"], row_heights=[0.42, 0.19, 0.19, 0.20])
     if not daily_df.empty:
         d = daily_df.tail(220)
         fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Daily"), row=1, col=1)
@@ -766,6 +809,7 @@ with st.sidebar:
     mc_sims = st.slider("Monte Carlo simulations", 500, 5000, 1000, 500)
     show_options = st.checkbox("Show option chains", value=False)
     force_refresh = st.checkbox("Force refresh Yahoo cache", value=False)
+    use_smooth_hourly = st.checkbox("Smooth hourly oscillator", value=True)
     run_analysis = st.button("Run Analysis", type="primary", width='stretch')
 
 st.info("This version prefers persisted uploads and local cache first. Yahoo is used mainly to fill gaps or seed cache.")
@@ -820,9 +864,9 @@ for idx, symbol in enumerate(symbols):
         })
         continue
 
-    daily_df = add_forward_returns(enrich_price_features(daily_df, "daily", benchmark_daily))
-    weekly_df = enrich_price_features(weekly_df, "weekly", benchmark_daily)
-    hourly_df = add_forward_returns(enrich_price_features(hourly_df, "hourly", benchmark_daily))
+    daily_df = add_forward_returns(enrich_price_features(daily_df, "daily", benchmark_daily, use_smooth_hourly=use_smooth_hourly))
+    weekly_df = enrich_price_features(weekly_df, "weekly", benchmark_daily, use_smooth_hourly=use_smooth_hourly)
+    hourly_df = add_forward_returns(enrich_price_features(hourly_df, "hourly", benchmark_daily, use_smooth_hourly=use_smooth_hourly))
 
     hourly_row = hourly_df.iloc[-1] if not hourly_df.empty else pd.Series(dtype=float)
     daily_row = daily_df.iloc[-1]
@@ -881,6 +925,7 @@ for idx, symbol in enumerate(symbols):
         "history_source": data["history_source"],
         "degraded_hourly": data["degraded_hourly"],
         "fetch_meta": meta,
+        "use_smooth_hourly": use_smooth_hourly,
     }
 
 progress.empty()
@@ -902,10 +947,36 @@ if valid_symbols:
     st.subheader("Detailed Analysis")
     selected_symbol = st.selectbox("Select symbol", valid_symbols)
     data = detail_data[selected_symbol]
-    hc, hconf, hreason = data["hourly_call"]
-    dc, dconf, dreason = data["daily_call"]
-    wc, wconf, wreason = data["weekly_call"]
-    cc, creason = data["combined"]
+
+    available_dates = pd.to_datetime(data["daily"].index).date
+    default_date = available_dates[-1]
+    analysis_date = st.date_input("Calendar lookback", value=default_date, min_value=available_dates[0], max_value=default_date, key=f"analysis_date_{selected_symbol}")
+    analysis_ts = pd.Timestamp(analysis_date)
+    analysis_ts_end = analysis_ts + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+    daily_view = data["daily"].loc[data["daily"].index <= analysis_ts].copy()
+    weekly_view = data["weekly"].loc[data["weekly"].index <= analysis_ts].copy()
+    hourly_view = data["hourly"].loc[data["hourly"].index <= analysis_ts_end].copy()
+
+    if daily_view.empty:
+        st.warning("No data available for the selected calendar date.")
+        st.stop()
+
+    hourly_row = hourly_view.iloc[-1] if not hourly_view.empty else pd.Series(dtype=float)
+    daily_row = daily_view.iloc[-1]
+    weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
+
+    hc, hconf, hreason = classify_timeframe_call(hourly_row, "hourly")
+    dc, dconf, dreason = classify_timeframe_call(daily_row, "daily")
+    wc, wconf, wreason = classify_timeframe_call(weekly_row, "weekly")
+    flags = detect_flags(hourly_row, daily_row, weekly_row)
+
+    daily_analogs = nearest_analogs(daily_view, DAILY_ANALOG_FEATURES, analog_count)
+    daily_analog_summary = summarize_analogs(daily_analogs)
+    hourly_analogs = nearest_analogs(hourly_view, HOURLY_ANALOG_FEATURES, min(analog_count, 12)) if (not data["degraded_hourly"] and not hourly_view.empty) else pd.DataFrame()
+    hourly_analog_summary = summarize_analogs(hourly_analogs)
+    cc, creason = combine_calls(hc, dc, wc, flags, daily_analog_summary, hourly_analog_summary)
+    sim_paths, mc_summary = monte_carlo_from_analogs(daily_analogs, 5, mc_sims)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Hourly", hc)
@@ -918,30 +989,30 @@ if valid_symbols:
     st.markdown(f"**Combined read:** {creason}")
     if data["degraded_hourly"]:
         st.warning("Hourly data is degraded fallback from daily bars. Timing calls are lower quality until hourly cache fills.")
+    st.caption(f"Analysis date: {analysis_ts.date()}")
     st.caption("Fetch meta: " + " | ".join([f"{k}={v}" for k, v in data["fetch_meta"].items()]))
 
-    flags_df = pd.DataFrame([{"Flag": k, "Detected": v} for k, v in data["flags"].items()])
+    flags_df = pd.DataFrame([{"Flag": k, "Detected": v} for k, v in flags.items()])
     st.dataframe(flags_df, width='stretch', hide_index=True)
-    plot_timeframe_dashboard(selected_symbol, data["hourly"], data["daily"], data["weekly"])
+    plot_timeframe_dashboard(selected_symbol, hourly_view, daily_view, weekly_view, asof_label=str(analysis_ts.date()))
 
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown("### Daily analogs")
-        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in data["daily_analog_summary"].items()})
-        if not data["daily_analogs"].empty:
-            show = data["daily_analogs"][[c for c in ["Close", "similarity", "distance", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"] if c in data["daily_analogs"].columns]].head(10).copy()
+        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in daily_analog_summary.items()})
+        if not daily_analogs.empty:
+            show = daily_analogs[[c for c in ["Close", "similarity", "distance", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"] if c in daily_analogs.columns]].head(10).copy()
             show.index = show.index.strftime("%Y-%m-%d")
             st.dataframe(show, width='stretch')
     with col_b:
         st.markdown("### Hourly analogs")
-        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in data["hourly_analog_summary"].items()})
-        if not data["hourly_analogs"].empty:
-            show = data["hourly_analogs"][[c for c in ["Close", "similarity", "distance", "fwd_ret_1", "fwd_ret_2"] if c in data["hourly_analogs"].columns]].head(10).copy()
+        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in hourly_analog_summary.items()})
+        if not hourly_analogs.empty:
+            show = hourly_analogs[[c for c in ["Close", "similarity", "distance", "fwd_ret_1", "fwd_ret_2"] if c in hourly_analogs.columns]].head(10).copy()
             show.index = show.index.astype(str)
             st.dataframe(show, width='stretch')
 
     st.markdown("### Monte Carlo (daily analog-conditioned)")
-    sim_paths = data["sim_paths"]
     if not sim_paths.empty:
         fig = go.Figure()
         x = sim_paths.index
@@ -950,7 +1021,7 @@ if valid_symbols:
         fig.add_trace(go.Scatter(x=x, y=sim_paths.quantile(0.50, axis=1), name="Median", line=dict(color="blue", width=2)))
         fig.update_layout(height=350, xaxis_title="Days Forward", yaxis_title="Cumulative Return")
         st.plotly_chart(fig, width='stretch')
-        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in data["mc_summary"].items()})
+        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in mc_summary.items()})
 
     if show_options and cc in {"CALL", "PUT", "CALL ON PULLBACK", "WAIT / HOURLY TOO HOT"}:
         option_type = "CALL" if "CALL" in cc else "PUT"
