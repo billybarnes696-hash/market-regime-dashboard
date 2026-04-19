@@ -1,6 +1,6 @@
 """
-Stock Analyzer Ultimate v1.0
-Merged from: Baller express
+Stock Analyzer Ultimate v2.0
+Merged from: Diamond Scanner Pro + Predictive Trading Analysis Engine
 
 Features:
 - Multi-timeframe (hourly/daily/weekly)
@@ -935,7 +935,7 @@ def get_option_candidates(symbol: str, option_type: str, max_expirations: int = 
         
         current_price = float(hist["Close"].iloc[-1])
         all_options = []
-        now = pd.Timestamp.utcnow().tz_localize(None)
+        now = pd.Timestamp.now('UTC').tz_localize(None)
         
         for exp_date in exps[:max_expirations]:
             chain = ticker.option_chain(exp_date)
@@ -1166,7 +1166,7 @@ def plot_price_and_oscillator(ticker: str, daily_df: pd.DataFrame, weekly_df: pd
     fig.update_yaxes(title_text="Percentile (%)", row=2, col=1)
     fig.update_yaxes(title_text="Value", row=3, col=1)
     
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def plot_monte_carlo(sim_paths: pd.DataFrame, mc_summary: Dict, ticker: str):
@@ -1189,7 +1189,7 @@ def plot_monte_carlo(sim_paths: pd.DataFrame, mc_summary: Dict, ticker: str):
         xaxis_title="Days Forward",
         yaxis_title="Cumulative Return",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # Display stats
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -1219,7 +1219,7 @@ def plot_analog_distribution(analogs: pd.DataFrame):
     fig.update_xaxes(title_text="Return (%)")
     fig.update_yaxes(title_text="Frequency")
     
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def describe_setup(states: Dict[str, str], flags: Dict[str, bool], analog_summary: Dict[str, float], tsi_pctile: float) -> str:
@@ -1265,7 +1265,7 @@ def describe_setup(states: Dict[str, str], flags: Dict[str, bool], analog_summar
 # MAIN APP
 # ============================================================================
 
-st.title("📊 Stock Analyzer Ultimate v1.0")
+st.title("📊 Stock Analyzer Ultimate v2.0")
 st.caption("Multi-timeframe | TSI 25,13,7 PRIMARY | Percentile-based | Option Chains | Calendar Backtesting")
 
 # Sidebar
@@ -1328,7 +1328,7 @@ with st.sidebar:
     show_options = st.checkbox("Show option chains (current mode only)", value=True)
     rebuild_cache = st.checkbox("Rebuild cache", value=False)
     
-    run_analysis = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
+    run_analysis = st.button("🚀 Run Analysis", type="primary", width='stretch')
 
 # Main content
 if not run_analysis:
@@ -1520,7 +1520,7 @@ else:
 
 results_df = pd.DataFrame(results_rows)
 if not results_df.empty:
-    st.dataframe(results_df, use_container_width=True, hide_index=True)
+    st.dataframe(results_df, width='stretch', hide_index=True)
     
     # Download button
     csv_buffer = results_df.to_csv(index=False).encode("utf-8")
@@ -1562,7 +1562,7 @@ if analysis_mode != "Calendar Backtest" and detail_data:
             
             # Flags
             flags_df = pd.DataFrame([{"Pattern": k.replace("_", " ").title(), "Detected": v} for k, v in data["flags"].items()])
-            st.dataframe(flags_df, use_container_width=True, hide_index=True)
+            st.dataframe(flags_df, width='stretch', hide_index=True)
             
             # Price chart
             st.subheader("📈 Price & Oscillator Charts")
@@ -1593,7 +1593,7 @@ if analysis_mode != "Calendar Backtest" and detail_data:
                 display_analogs = data["analogs"].copy()
                 if not display_analogs.empty:
                     display_analogs.index = display_analogs.index.strftime("%Y-%m-%d")
-                    st.dataframe(display_analogs[["Close", "similarity", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"]].head(10), use_container_width=True)
+                    st.dataframe(display_analogs[["Close", "similarity", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"]].head(10), width='stretch')
                 
                 # Analog distribution plot
                 plot_analog_distribution(data["analogs"])
@@ -1610,7 +1610,7 @@ if analysis_mode != "Calendar Backtest" and detail_data:
                 opts = get_option_candidates(selected_symbol, data["direction"])
                 if opts is not None and not opts.empty:
                     st.markdown(f"**{data['direction']} options based on TSI 25,13,7 signal**")
-                    st.dataframe(opts, use_container_width=True)
+                    st.dataframe(opts, width='stretch')
                 else:
                     st.info(f"No {data['direction']} options available for {selected_symbol}")
 
@@ -1636,7 +1636,7 @@ elif analysis_mode == "Calendar Backtest" and detail_data:
             
             # Display backtest results
             display_cols = ["date", "close", "tsi_pctile", "predicted_direction", "analog_pred_1d", "actual_ret_1d", "correct"]
-            st.dataframe(backtest_df[display_cols].tail(50), use_container_width=True)
+            st.dataframe(backtest_df[display_cols].tail(50), width='stretch')
             
             # Download backtest results
             csv_buffer = backtest_df.to_csv(index=False).encode("utf-8")
