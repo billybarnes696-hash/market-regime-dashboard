@@ -1,129 +1,129 @@
-# liquidity_profiler.py
+# liquidity_profiler_batched.py
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-from pathlib import Path
 import time
+from pathlib import Path
+from datetime import datetime
 
-st.set_page_config(layout="wide", page_title="Liquidity Profiler - Filter Stocks & ETFs")
+st.set_page_config(layout="wide", page_title="Liquidity Profiler - Batched (No Rate Limits)")
 
-st.title("💧 Liquidity Profiler")
-st.caption("Upload your stock/ETF list, filter for liquid instruments, and save the clean list for scanning")
+st.title("💧 Liquidity Profiler - Batched Version")
+st.caption("Processes symbols in small batches to avoid Yahoo Finance rate limits")
 
 # ============================================================================
 # LIQUIDITY CONFIGURATION
 # ============================================================================
 
 LIQUIDITY_CONFIG = {
-    "min_avg_volume": 500000,       # Minimum 500k average daily volume
-    "min_price": 5.00,              # Minimum $5 stock price
-    "min_market_cap_billions": 1.0, # Minimum $1B market cap
-    "max_spread_pct": 0.02,         # Maximum 2% bid-ask spread
-    "include_etfs": True,           # Include ETFs (if True, uses ETF volume filter)
-    "etf_min_volume": 1000000,      # If including ETFs, require 1M volume
-    "etf_min_price": 10.00,         # ETFs minimum price (higher threshold)
+    "min_avg_volume": 500000,
+    "min_price": 5.00,
+    "min_market_cap_billions": 1.0,
+    "max_spread_pct": 0.02,
+    "include_etfs": True,
+    "etf_min_volume": 1000000,
+    "etf_min_price": 10.00,
 }
 
-st.sidebar.header("⚙️ Liquidity Filters")
+# ============================================================================
+# SIDEBAR CONTROLS
+# ============================================================================
 
-# Allow user to adjust filters
-min_volume = st.sidebar.number_input("Min Avg Volume", value=LIQUIDITY_CONFIG["min_avg_volume"], step=100000)
-min_price = st.sidebar.number_input("Min Price ($)", value=LIQUIDITY_CONFIG["min_price"], step=1.0)
-min_mcap = st.sidebar.number_input("Min Market Cap ($B)", value=LIQUIDITY_CONFIG["min_market_cap_billions"], step=0.5)
-include_etfs = st.sidebar.checkbox("Include ETFs", value=LIQUIDITY_CONFIG["include_etfs"])
-etf_min_volume = st.sidebar.number_input("ETF Min Volume", value=LIQUIDITY_CONFIG["etf_min_volume"], step=250000)
-
-# Update config
-LIQUIDITY_CONFIG["min_avg_volume"] = int(min_volume)
-LIQUIDITY_CONFIG["min_price"] = float(min_price)
-LIQUIDITY_CONFIG["min_market_cap_billions"] = float(min_mcap)
-LIQUIDITY_CONFIG["include_etfs"] = include_etfs
-LIQUIDITY_CONFIG["etf_min_volume"] = int(etf_min_volume)
+with st.sidebar:
+    st.header("⚙️ Settings")
+    batch_size = st.slider("Batch size", 25, 200, 100, help="Smaller batches = slower but fewer rate limit errors")
+    delay_seconds = st.slider("Delay between batches (seconds)", 1, 10, 3, help="Longer delay = safer but slower")
+    resume_from = st.number_input("Resume from row #", 0, 5000, 0, help="Start from a specific row if previous run stopped")
+    
+    st.header("Liquidity Filters")
+    st.caption(f"Min Volume: {LIQUIDITY_CONFIG['min_avg_volume']:,}")
+    st.caption(f"Min Price: ${LIQUIDITY_CONFIG['min_price']}")
+    st.caption(f"Min Market Cap: ${LIQUIDITY_CONFIG['min_market_cap_billions']}B")
+    st.caption(f"Include ETFs: {LIQUIDITY_CONFIG['include_etfs']}")
 
 # ============================================================================
 # FUNCTIONS
 # ============================================================================
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_stock_info(symbol: str) -> dict:
-    """Fetch stock/ETF info from Yahoo Finance"""
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        
-        # Get metrics
-        avg_volume = info.get('averageVolume', 0)
-        current_price = info.get('regularMarketPrice', 0)
-        market_cap = info.get('marketCap', 0)
-        quote_type = info.get('quoteType', '')
-        
-        # Calculate spread (if available)
-        bid = info.get('bid', 0)
-        ask = info.get('ask', 0)
-        if bid > 0 and ask > 0:
-            spread_pct = (ask - bid) / ((ask + bid) / 2)
-        else:
-            spread_pct = 0.05  # Default high spread if unknown
-        
-        # Determine instrument type
-        is_etf = quote_type == 'ETF'
-        
-        return {
-            'symbol': symbol,
-            'price': current_price,
-            'avg_volume': avg_volume,
-            'market_cap_b': market_cap / 1e9,
-            'spread_pct': spread_pct,
-            'is_etf': is_etf,
-            'quote_type': quote_type,
-            'sector': info.get('sector', 'N/A'),
-            'industry': info.get('industry', 'N/A'),
-        }
-    except Exception as e:
-        return {
-            'symbol': symbol,
-            'price': 0,
-            'avg_volume': 0,
-            'market_cap_b': 0,
-            'spread_pct': 1.0,
-            'is_etf': False,
-            'quote_type': 'ERROR',
-            'sector': 'N/A',
-            'industry': 'N/A',
-            'error': str(e)[:50],
-        }
+def get_stock_info_batch(symbols: list, batch_num: int, total_batches: int) -> list:
+    """Fetch info for a batch of symbols with rate limit handling"""
+    results = []
+    
+    for i, symbol in enumerate(symbols):
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            
+            avg_volume = info.get('averageVolume', 0)
+            current_price = info.get('regularMarketPrice', 0)
+            market_cap = info.get('marketCap', 0)
+            quote_type = info.get('quoteType', '')
+            
+            bid = info.get('bid', 0)
+            ask = info.get('ask', 0)
+            if bid > 0 and ask > 0:
+                spread_pct = (ask - bid) / ((ask + bid) / 2)
+            else:
+                spread_pct = 0.05
+            
+            is_etf = quote_type == 'ETF'
+            
+            results.append({
+                'symbol': symbol,
+                'price': current_price,
+                'avg_volume': avg_volume,
+                'market_cap_b': market_cap / 1e9 if market_cap else 0,
+                'spread_pct': spread_pct,
+                'is_etf': is_etf,
+                'quote_type': quote_type,
+                'sector': info.get('sector', 'N/A'),
+                'industry': info.get('industry', 'N/A'),
+            })
+            
+            # Small delay between symbols within batch
+            time.sleep(0.05)
+            
+        except Exception as e:
+            results.append({
+                'symbol': symbol,
+                'price': 0,
+                'avg_volume': 0,
+                'market_cap_b': 0,
+                'spread_pct': 1.0,
+                'is_etf': False,
+                'quote_type': 'ERROR',
+                'sector': 'N/A',
+                'industry': 'N/A',
+                'error': str(e)[:50],
+            })
+    
+    return results
 
 
 def check_liquidity(info: dict) -> tuple:
     """Check if symbol passes liquidity filters"""
     
-    # Skip if no data
     if info.get('price', 0) == 0:
         return False, "No price data"
     
-    # ETF handling
     if info['is_etf']:
         if not LIQUIDITY_CONFIG['include_etfs']:
-            return False, "ETF excluded by filter"
-        
-        # ETF-specific filters
+            return False, "ETF excluded"
         if info['avg_volume'] < LIQUIDITY_CONFIG['etf_min_volume']:
-            return False, f"ETF volume too low ({info['avg_volume']:,} < {LIQUIDITY_CONFIG['etf_min_volume']:,})"
+            return False, f"ETF volume too low ({info['avg_volume']:,})"
         if info['price'] < LIQUIDITY_CONFIG['etf_min_price']:
-            return False, f"ETF price too low (${info['price']:.2f} < ${LIQUIDITY_CONFIG['etf_min_price']})"
+            return False, f"ETF price too low (${info['price']:.2f})"
     else:
-        # Stock filters
         if info['avg_volume'] < LIQUIDITY_CONFIG['min_avg_volume']:
-            return False, f"Volume too low ({info['avg_volume']:,} < {LIQUIDITY_CONFIG['min_avg_volume']:,})"
+            return False, f"Volume too low ({info['avg_volume']:,})"
         if info['price'] < LIQUIDITY_CONFIG['min_price']:
-            return False, f"Price too low (${info['price']:.2f} < ${LIQUIDITY_CONFIG['min_price']})"
+            return False, f"Price too low (${info['price']:.2f})"
         if info['market_cap_b'] < LIQUIDITY_CONFIG['min_market_cap_billions']:
-            return False, f"Market cap too low (${info['market_cap_b']:.1f}B < ${LIQUIDITY_CONFIG['min_market_cap_billions']}B)"
+            return False, f"Market cap too low (${info['market_cap_b']:.1f}B)"
         if info['spread_pct'] > LIQUIDITY_CONFIG['max_spread_pct']:
-            return False, f"Spread too wide ({info['spread_pct']:.1%} > {LIQUIDITY_CONFIG['max_spread_pct']:.1%})"
+            return False, f"Spread too wide ({info['spread_pct']:.1%})"
     
     return True, "PASS"
-
 
 # ============================================================================
 # MAIN UI
@@ -132,52 +132,72 @@ def check_liquidity(info: dict) -> tuple:
 uploaded_file = st.file_uploader("Upload CSV file with 'Symbol' column", type=["csv"])
 
 if uploaded_file is not None:
-    # Read uploaded file
     df = pd.read_csv(uploaded_file)
     
     if 'Symbol' not in df.columns:
         st.error("CSV must contain a 'Symbol' column")
         st.stop()
     
-    symbols = df['Symbol'].tolist()
-    st.write(f"Loaded **{len(symbols)}** symbols from file")
+    all_symbols = df['Symbol'].tolist()
+    total_symbols = len(all_symbols)
     
-    # Display preview
-    with st.expander("Preview uploaded data"):
-        st.dataframe(df.head(20), width='stretch')
+    st.write(f"Loaded **{total_symbols}** symbols")
     
-    # Run liquidity check
-    st.subheader("🔍 Running Liquidity Check...")
+    # Start from resume point
+    start_idx = resume_from
+    symbols_to_process = all_symbols[start_idx:]
     
+    st.info(f"Starting from row {start_idx} ({len(symbols_to_process)} symbols remaining)")
+    
+    # Calculate batches
+    batches = [symbols_to_process[i:i+batch_size] for i in range(0, len(symbols_to_process), batch_size)]
+    total_batches = len(batches)
+    
+    st.write(f"Will process **{total_batches} batches** of ~{batch_size} symbols each")
+    
+    # Progress tracking
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    results = []
-    for i, symbol in enumerate(symbols):
-        status_text.text(f"Checking {symbol} ({i+1}/{len(symbols)})")
-        info = get_stock_info(symbol)
-        passed, reason = check_liquidity(info)
+    all_results = []
+    
+    # Load existing results if resuming
+    if start_idx > 0 and Path("liquidity_results_partial.csv").exists():
+        existing = pd.read_csv("liquidity_results_partial.csv")
+        all_results = existing.to_dict('records')
+        st.info(f"Loaded {len(all_results)} existing results")
+    
+    for batch_num, batch in enumerate(batches):
+        batch_start = start_idx + batch_num * batch_size
+        status_text.text(f"Batch {batch_num+1}/{total_batches} - Symbols {batch_start+1}-{batch_start+len(batch)}")
         
-        results.append({
-            'symbol': symbol,
-            'pass': passed,
-            'reason': reason if not passed else 'PASS',
-            'price': info['price'],
-            'avg_volume': info['avg_volume'],
-            'market_cap_b': info['market_cap_b'],
-            'spread_pct': info['spread_pct'],
-            'is_etf': info['is_etf'],
-            'sector': info.get('sector', 'N/A'),
-            'industry': info.get('industry', 'N/A'),
-        })
+        # Process batch
+        batch_results = get_stock_info_batch(batch, batch_num+1, total_batches)
         
-        progress_bar.progress((i + 1) / len(symbols))
-        time.sleep(0.1)  # Rate limiting
+        # Check liquidity for each
+        for result in batch_results:
+            passed, reason = check_liquidity(result)
+            result['pass'] = passed
+            result['reason'] = reason if not passed else 'PASS'
+        
+        all_results.extend(batch_results)
+        
+        # Save progress after each batch
+        temp_df = pd.DataFrame(all_results)
+        temp_df.to_csv("liquidity_results_partial.csv", index=False)
+        
+        # Update progress
+        progress_bar.progress((batch_num + 1) / total_batches)
+        
+        # Delay between batches to avoid rate limits
+        if batch_num < total_batches - 1:
+            time.sleep(delay_seconds)
     
     status_text.text("Done!")
+    progress_bar.empty()
     
-    # Create results DataFrame
-    results_df = pd.DataFrame(results)
+    # Create final results DataFrame
+    results_df = pd.DataFrame(all_results)
     
     # Display summary
     st.subheader("📊 Liquidity Filter Results")
@@ -186,64 +206,58 @@ if uploaded_file is not None:
     failed_count = len(results_df) - passed_count
     
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Symbols", len(results_df))
+    col1.metric("Total Processed", len(results_df))
     col2.metric("✅ Liquid (Pass)", passed_count, delta=f"{passed_count/len(results_df)*100:.0f}%")
-    col3.metric("❌ Filtered Out", failed_count, delta=f"-{failed_count/len(results_df)*100:.0f}%")
+    col3.metric("❌ Filtered Out", failed_count)
     
-    # Show passed symbols
-    passed_symbols = results_df[results_df['pass'] == True]['symbol'].tolist()
-    st.success(f"**Liquid Symbols ({len(passed_symbols)}):** {', '.join(passed_symbols[:20])}{'...' if len(passed_symbols) > 20 else ''}")
+    # Get liquid symbols
+    liquid_symbols = results_df[results_df['pass'] == True]['symbol'].tolist()
     
-    # Detailed results table
-    with st.expander("View detailed results for all symbols"):
-        display_df = results_df.copy()
-        display_df['avg_volume'] = display_df['avg_volume'].apply(lambda x: f"{x:,.0f}")
-        display_df['market_cap_b'] = display_df['market_cap_b'].apply(lambda x: f"${x:.1f}B" if x > 0 else "N/A")
-        display_df['spread_pct'] = display_df['spread_pct'].apply(lambda x: f"{x:.2%}")
-        display_df['price'] = display_df['price'].apply(lambda x: f"${x:.2f}" if x > 0 else "N/A")
-        
-        st.dataframe(display_df, width='stretch', use_container_width=True)
+    st.success(f"**Liquid Symbols ({len(liquid_symbols)}):**")
     
-    # Save liquid symbols to file
-    if passed_symbols:
-        st.subheader("💾 Save Liquid Symbols")
-        
-        # Create filename
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"liquid_symbols_{timestamp}.txt"
-        
-        # Save as text file (one symbol per line)
-        file_content = "\n".join(passed_symbols)
-        
-        st.download_button(
-            label="📥 Download Liquid Symbols (TXT)",
-            data=file_content,
-            file_name=filename,
-            mime="text/plain"
-        )
-        
-        # Also show as comma-separated for easy copying
-        st.text_area("Copy these symbols for scanner:", ", ".join(passed_symbols), height=100)
-        
-        # Option to update scanner
-        st.info(f"Next: Use these {len(passed_symbols)} liquid symbols in your Diamond Scanner")
-        
-        # Show filtered out symbols with reasons
+    # Display in columns for easy copying
+    cols = st.columns(4)
+    for i, sym in enumerate(liquid_symbols):
+        cols[i % 4].markdown(f"`{sym}`")
+    
+    # Save final liquid symbols file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save as text file (one per line)
+    txt_content = "\n".join(liquid_symbols)
+    st.download_button(
+        label="📥 Download Liquid Symbols (TXT)",
+        data=txt_content,
+        file_name=f"liquid_symbols_{timestamp}.txt",
+        mime="text/plain"
+    )
+    
+    # Also save as CSV for reference
+    liquid_df = results_df[results_df['pass'] == True].copy()
+    csv_data = liquid_df.to_csv(index=False)
+    st.download_button(
+        label="📥 Download Detailed Results (CSV)",
+        data=csv_data,
+        file_name=f"liquidity_results_{timestamp}.csv",
+        mime="text/csv"
+    )
+    
+    # Show filtered out symbols
+    with st.expander(f"❌ Filtered out symbols ({len(results_df[results_df['pass'] == False])})"):
         failed_df = results_df[results_df['pass'] == False][['symbol', 'reason', 'price', 'avg_volume']]
-        if not failed_df.empty:
-            with st.expander(f"❌ Filtered out symbols ({len(failed_df)})"):
-                st.dataframe(failed_df, width='stretch', use_container_width=True)
-
-else:
-    st.info("👈 Upload a CSV file with a 'Symbol' column to begin")
+        st.dataframe(failed_df, width='stretch', use_container_width=True)
     
-    # Show expected format
-    with st.expander("📄 Expected CSV Format"):
-        st.code("""
-Symbol,Name,Exchange,Sector,Industry,SCTR,Universe,Close,Volume
-AAPL,Apple Inc.,NASD,Technology,Computer Hardware,85.2,lrg,175.50,50000000
-MSFT,Microsoft Corp.,NASD,Technology,Software,92.1,lrg,420.75,22000000
-NVDA,NVIDIA Corp.,NASD,Technology,Semiconductors,98.5,lrg,950.25,45000000
-        """)
-        st.caption("Only the 'Symbol' column is required. Other columns are optional.")
+    # Clean up partial file
+    Path("liquidity_results_partial.csv").unlink(missing_ok=True)
+    
+else:
+    st.info("👈 Upload a CSV file with a 'Symbol' column")
+    st.markdown("""
+    ### How to use:
+    1. Upload your CSV with stock/ETF symbols
+    2. Adjust batch size (100 is safe, 50 is safer)
+    3. Click 'Run' and wait
+    4. Download the liquid symbols list
+    
+    **The batched approach avoids Yahoo Finance rate limits**
+    """)
