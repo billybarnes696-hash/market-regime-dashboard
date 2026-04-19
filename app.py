@@ -131,9 +131,14 @@ def tsi(series: pd.Series, r: int, s: int, signal: int = 7) -> Tuple[pd.Series, 
 
 def cci(df: pd.DataFrame, n: int = 20) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    ma = tp.rolling(n).mean()
-    md = (tp - ma).abs().rolling(n).mean()
-    return (tp - ma) / (0.015 * md.replace(0, np.nan))
+    sma = tp.rolling(n, min_periods=n).mean()
+
+    def mean_deviation(x: pd.Series) -> float:
+        mean_x = float(np.mean(x))
+        return float(np.mean(np.abs(x - mean_x)))
+
+    md = tp.rolling(n, min_periods=n).apply(mean_deviation, raw=False)
+    return (tp - sma) / (0.015 * md.replace(0, np.nan))
 
 
 def bbpct(close: pd.Series, n: int = 20) -> pd.Series:
@@ -710,6 +715,21 @@ def weighted_stats(analogs: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     return stats
 
 
+def directional_edge(stats: Dict[str, Dict[str, float]], horizon: str, side: str) -> float:
+    bucket = stats[horizon]
+    if side == "PUT":
+        prob = float(bucket["down_prob"])
+        median = float(bucket["median"])
+        tail = float(bucket["p10"])
+        magnitude = max(abs(min(median, 0.0)), 0.35 * abs(min(tail, 0.0)))
+    else:
+        prob = float(bucket["up_prob"])
+        median = float(bucket["median"])
+        tail = float(bucket["p90"])
+        magnitude = max(max(median, 0.0), 0.35 * max(tail, 0.0))
+    return prob * magnitude
+
+
 def confidence_score(analogs: pd.DataFrame, current: pd.Series, stats: Dict[str, Dict[str, float]], side: str) -> float:
     if analogs.empty:
         return 0.0
@@ -967,6 +987,20 @@ def scan_symbol(symbol: str, current_row: pd.Series, hist_feat: pd.DataFrame, an
         conf = confidence_score(analogs, current_row, stats, side="CALL")
     else:
         conf = 40.0
+
+    bear_edge_1d = directional_edge(stats, "ret1", "PUT")
+    bear_edge_2d = directional_edge(stats, "ret2", "PUT")
+    bear_edge_5d = directional_edge(stats, "ret5", "PUT")
+    bull_edge_1d = directional_edge(stats, "ret1", "CALL")
+    bull_edge_2d = directional_edge(stats, "ret2", "CALL")
+    bull_edge_5d = directional_edge(stats, "ret5", "CALL")
+    if option_type == "PUT":
+        edge_score = bear_edge_2d
+    elif option_type == "CALL":
+        edge_score = bull_edge_2d
+    else:
+        edge_score = max(bear_edge_2d, bull_edge_2d)
+
     pos_size = position_size_pct(conf, float(current_row.get("ATR_pct", np.nan)))
     detail = {
         "symbol": symbol,
@@ -983,6 +1017,13 @@ def scan_symbol(symbol: str, current_row: pd.Series, hist_feat: pd.DataFrame, an
         "ExpRet_1d": round(stats["ret1"]["median"] * 100, 2),
         "ExpRet_2d": round(stats["ret2"]["median"] * 100, 2),
         "ExpRet_5d": round(stats["ret5"]["median"] * 100, 2),
+        "BearEdge_1d": round(bear_edge_1d * 100, 2),
+        "BearEdge_2d": round(bear_edge_2d * 100, 2),
+        "BearEdge_5d": round(bear_edge_5d * 100, 2),
+        "BullEdge_1d": round(bull_edge_1d * 100, 2),
+        "BullEdge_2d": round(bull_edge_2d * 100, 2),
+        "BullEdge_5d": round(bull_edge_5d * 100, 2),
+        "Edge Score": round(edge_score * 100, 2),
         "Confidence": round(conf, 1),
         "Position Size %": round(pos_size * 100, 1),
         "TSI_424": round(float(current_row.get("TSI_424", np.nan)), 2),
@@ -1107,7 +1148,7 @@ if run_scan:
         live_rows_map[symbol] = current_row
     progress.empty()
     if rows:
-        results = pd.DataFrame(rows).sort_values(["Confidence", "Bear Score", "Bull Score"], ascending=[False, False, False]).reset_index(drop=True)
+        results = pd.DataFrame(rows).sort_values(["Edge Score", "Confidence", "Bear Score", "Bull Score"], ascending=[False, False, False, False]).reset_index(drop=True)
         st.session_state.scan_results = results
         st.session_state.debug_rows = debug_rows
         st.session_state.detail_rows = detail_rows
@@ -1134,7 +1175,7 @@ if results is None or results.empty:
     st.stop()
 
 st.subheader("🏆 Ranked Setups")
-display_cols = ["symbol", "Signal", "Option Type", "Confidence", "Position Size %", "Bull Score", "Bear Score", "RipProb_1d", "RipProb_2d", "RipProb_5d", "DipProb_1d", "DipProb_2d", "DipProb_5d", "TSI_424", "TSI_747", "CCI15", "MFI14", "BBP", "StretchATR", "Expected Move %", "Market Regime", "Bull Kiss", "Bear Kiss", "State", "Why", "Row Date"]
+display_cols = ["symbol", "Signal", "Option Type", "Edge Score", "Confidence", "Position Size %", "Bull Score", "Bear Score", "RipProb_1d", "RipProb_2d", "RipProb_5d", "DipProb_1d", "DipProb_2d", "DipProb_5d", "BearEdge_2d", "BullEdge_2d", "TSI_424", "TSI_747", "CCI15", "MFI14", "BBP", "StretchATR", "Expected Move %", "Market Regime", "Bull Kiss", "Bear Kiss", "State", "Why", "Row Date"]
 display_cols = [c for c in display_cols if c in results.columns]
 st.dataframe(results[display_cols], width="stretch")
 
@@ -1151,7 +1192,7 @@ if selected:
     c1.metric("Signal", detail["Signal"])
     c2.metric("Bull Score", f"{detail['Bull Score']:.1f}")
     c3.metric("Bear Score", f"{detail['Bear Score']:.1f}")
-    c4.metric("Confidence", f"{detail['Confidence']:.0f}%")
+    c4.metric("Edge Score", f"{detail['Edge Score']:.2f}")
     c5, c6, c7, c8, c9, c10 = st.columns(6)
     c5.metric("TSI 4,2,4", f"{detail['TSI_424']:.2f}")
     c6.metric("TSI 7,4,7", f"{detail['TSI_747']:.2f}")
@@ -1169,6 +1210,7 @@ if selected:
         for r in detail["Bear Reasons"]:
             st.write(f"⚠️ {r}")
     st.markdown(f"**Market Regime:** {detail['Market Regime']}")
+    st.markdown(f"**Directional edge (2d):** Bear {detail['BearEdge_2d']:.2f} | Bull {detail['BullEdge_2d']:.2f}")
     st.markdown(f"**Why:** {detail['Why']}")
     st.write(f"Expected move: **{detail.get('Expected Move %', np.nan):.2f}%** | Suggested size: **{detail.get('Position Size %', np.nan):.1f}%** of max risk budget")
     option_type = detail["Option Type"]
