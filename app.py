@@ -1,4 +1,3 @@
-
 import io
 import re
 import time
@@ -11,16 +10,27 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
+from scipy.spatial.distance import cdist
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / "cache_store"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-YAHOO_CACHE_DIR = CACHE_DIR / "yahoo"
-YAHOO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-UPLOAD_CACHE_DIR = CACHE_DIR / "uploads"
-UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-st.set_page_config(page_title="Stable Market Engine v1", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stock Analyzer Ultimate v2.1", layout="wide", initial_sidebar_state="expanded")
+
+SECTOR_ETFS = {
+    "XLK": "Technology",
+    "XLF": "Financials",
+    "XLI": "Industrials",
+    "XLY": "Consumer Discretionary",
+    "XLP": "Consumer Staples",
+    "XLE": "Energy",
+    "XLV": "Health Care",
+    "XLB": "Materials",
+    "XLU": "Utilities",
+    "XLC": "Communication Services",
+    "SMH": "Semiconductors",
+}
 
 DAILY_ANALOG_FEATURES = [
     "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3", "uo_cross_up", "uo_cross_down",
@@ -127,20 +137,120 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return df.copy()
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    out = df.resample(rule).agg(agg)
-    return out.dropna(how="any")
+    return df.resample(rule).agg(agg).dropna(how="any")
 
 
 def compute_vwap(df: pd.DataFrame) -> pd.Series:
     typical = (df["High"] + df["Low"] + df["Close"]) / 3
     pv = typical * df["Volume"]
-    groups = df.index.date if isinstance(df.index, pd.DatetimeIndex) else np.arange(len(df))
+    if isinstance(df.index, pd.DatetimeIndex):
+        groups = df.index.date
+    else:
+        groups = np.arange(len(df))
     cum_pv = pv.groupby(groups).cumsum()
     cum_v = df["Volume"].groupby(groups).cumsum()
     return cum_pv / cum_v.replace(0, np.nan)
 
 
-def normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+
+
+def align_timestamp_to_index(index: pd.Index, ts_like) -> pd.Timestamp:
+    ts = pd.Timestamp(ts_like)
+    if isinstance(index, pd.DatetimeIndex):
+        if index.tz is not None:
+            if ts.tzinfo is None:
+                return ts.tz_localize(index.tz)
+            return ts.tz_convert(index.tz)
+        if ts.tzinfo is not None:
+            return ts.tz_localize(None)
+    return ts
+
+
+def slice_to_analysis_ts(df: pd.DataFrame, analysis_ts_end) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    ts = align_timestamp_to_index(df.index, analysis_ts_end)
+    return df.loc[df.index <= ts].copy()
+
+
+def re_enrich_sliced_views(hourly_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, benchmark_daily: pd.DataFrame):
+    daily_view = add_forward_returns(enrich_price_features(daily_df, "daily", benchmark_daily)) if not daily_df.empty else pd.DataFrame()
+    weekly_view = enrich_price_features(weekly_df, "weekly", benchmark_daily) if not weekly_df.empty else pd.DataFrame()
+    hourly_view = add_forward_returns(enrich_price_features(hourly_df, "hourly", benchmark_daily)) if not hourly_df.empty else pd.DataFrame()
+    return hourly_view, daily_view, weekly_view
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_yahoo_prices(ticker: str, interval: str, period: Optional[str] = None) -> pd.DataFrame:
+    ticker = str(ticker).strip().upper()
+    if not ticker or not re.fullmatch(r"[A-Z][A-Z0-9.\-\^=]{0,9}", ticker):
+        return pd.DataFrame()
+    for attempt in range(3):
+        try:
+            df = yf.download(
+                tickers=ticker,
+                interval=interval,
+                period=period or "1y",
+                progress=False,
+                auto_adjust=True,
+                threads=False,
+                group_by="column",
+                prepost=False,
+            )
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df.droplevel(0, axis=1)
+            if df is None or df.empty:
+                return pd.DataFrame()
+            df = df.rename(columns=str.title)
+            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[keep].dropna(how="all")
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index, errors="coerce")
+            df = df[~df.index.isna()].sort_index()
+            return df
+        except Exception as e:
+            msg = str(e).lower()
+            if "rate" in msg or "too many requests" in msg:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_defeat_history(ticker: str, years: int = 5) -> pd.DataFrame:
+    try:
+        try:
+            from defeatbeta_api import Ticker as DefeatTicker
+        except Exception:
+            from defeatbeta_api.data.ticker import Ticker as DefeatTicker
+    except Exception:
+        return pd.DataFrame()
+
+    try:
+        t = DefeatTicker(ticker)
+        df = t.price()
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        rename_map = {
+            "report_date": "Date", "date": "Date", "open": "Open", "high": "High",
+            "low": "Low", "close": "Close", "volume": "Volume",
+        }
+        df = df.rename(columns=rename_map)
+        needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        if not all(c in df.columns for c in needed):
+            return pd.DataFrame()
+        df = df[needed].copy()
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        return df.tail(int(years * 252 * 1.3))
+    except Exception:
+        return pd.DataFrame()
+
+
+def normalize_history_frame(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -164,10 +274,10 @@ def normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.rename(columns=rename_map)
     if "Date" not in out.columns:
         out = out.reset_index()
-        if "index" in out.columns and "Date" not in out.columns:
+        if "Date" not in out.columns and "index" in out.columns:
             out = out.rename(columns={"index": "Date"})
-    need = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    if not all(c in out.columns for c in need):
+    needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    if not all(c in out.columns for c in needed):
         return pd.DataFrame()
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
     out = out.dropna(subset=["Date"]).sort_values("Date")
@@ -181,6 +291,23 @@ def normalize_history_text(text_blob: str, fallback_ticker: str = "") -> Dict[st
     out: Dict[str, pd.DataFrame] = {}
     if not text_blob.strip():
         return out
+    lines = [line.rstrip() for line in text_blob.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return out
+    first_parts = [x.strip() for x in lines[0].split(",")]
+    second_parts = [x.strip() for x in lines[1].split(",")]
+    stockcharts_like = (
+        len(first_parts) == 2 and first_parts[0] and first_parts[1].lower().startswith(("daily", "weekly", "monthly"))
+        and len(second_parts) >= 5 and second_parts[0].lower() == "date"
+    )
+    if stockcharts_like:
+        ticker = first_parts[0].upper() or fallback_ticker.upper()
+        body = "\n".join(lines[1:])
+        df = pd.read_csv(io.StringIO(body), skipinitialspace=True)
+        norm = normalize_history_frame(df)
+        if ticker and not norm.empty:
+            out[ticker] = norm
+        return out
     try:
         df = pd.read_csv(io.StringIO(text_blob), skipinitialspace=True)
     except Exception:
@@ -189,40 +316,20 @@ def normalize_history_text(text_blob: str, fallback_ticker: str = "") -> Dict[st
     ticker_col = cols_lower.get("ticker") or cols_lower.get("symbol")
     if ticker_col is not None:
         for tkr, grp in df.groupby(ticker_col):
-            norm = normalize_ohlcv_columns(grp.drop(columns=[ticker_col]))
+            norm = normalize_history_frame(grp.drop(columns=[ticker_col]))
             tkr = str(tkr).strip().upper()
             if tkr and not norm.empty:
                 out[tkr] = norm
         return out
-    norm = normalize_ohlcv_columns(df)
+    norm = normalize_history_frame(df)
     ticker = fallback_ticker.upper()
     if ticker and not norm.empty:
         out[ticker] = norm
     return out
 
 
-def persist_uploaded_frame(ticker: str, df: pd.DataFrame) -> None:
-    if ticker and df is not None and not df.empty:
-        df.to_parquet(UPLOAD_CACHE_DIR / f"{ticker.upper()}.parquet")
-
-
-def load_persisted_uploads() -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    for fp in UPLOAD_CACHE_DIR.glob("*.parquet"):
-        try:
-            df = pd.read_parquet(fp)
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df.index = pd.to_datetime(df.index, errors="coerce")
-            df = df.sort_index()
-            if not df.empty:
-                out[fp.stem.upper()] = df[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]]
-        except Exception:
-            pass
-    return out
-
-
 def load_history_uploads(files) -> Dict[str, pd.DataFrame]:
-    history_map = load_persisted_uploads()
+    history_map: Dict[str, pd.DataFrame] = {}
     if not files:
         return history_map
     for file in files:
@@ -230,186 +337,38 @@ def load_history_uploads(files) -> Dict[str, pd.DataFrame]:
             file.seek(0)
         except Exception:
             pass
-        fallback_ticker = Path(file.name).stem.strip().upper()
+        ticker = Path(file.name).stem.strip().upper()
+        name = file.name.lower()
         parsed: Dict[str, pd.DataFrame] = {}
-        try:
-            if file.name.lower().endswith(".csv"):
-                parsed = normalize_history_text(file.getvalue().decode("utf-8", errors="ignore"), fallback_ticker=fallback_ticker)
-            else:
+        if name.endswith(".csv"):
+            try:
+                text_blob = file.getvalue().decode("utf-8", errors="ignore")
+                parsed = normalize_history_text(text_blob, fallback_ticker=ticker)
+            except Exception:
+                parsed = {}
+        else:
+            try:
                 raw = pd.read_excel(file)
                 cols_lower = {str(c).strip().lower(): c for c in raw.columns}
                 ticker_col = cols_lower.get("ticker") or cols_lower.get("symbol")
                 if ticker_col is not None:
                     for tkr, grp in raw.groupby(ticker_col):
-                        norm = normalize_ohlcv_columns(grp.drop(columns=[ticker_col]))
+                        norm = normalize_history_frame(grp.drop(columns=[ticker_col]))
                         tkr = str(tkr).strip().upper()
                         if tkr and not norm.empty:
                             parsed[tkr] = norm
                 else:
-                    norm = normalize_ohlcv_columns(raw)
-                    if fallback_ticker and not norm.empty:
-                        parsed[fallback_ticker] = norm
-        except Exception:
-            parsed = {}
+                    norm = normalize_history_frame(raw)
+                    if ticker and not norm.empty:
+                        parsed[ticker] = norm
+            except Exception:
+                parsed = {}
         for tkr, df in parsed.items():
             if tkr in history_map:
-                history_map[tkr] = pd.concat([history_map[tkr], df]).sort_index()
-                history_map[tkr] = history_map[tkr][~history_map[tkr].index.duplicated(keep="last")]
+                history_map[tkr] = pd.concat([history_map[tkr], df]).drop_duplicates().sort_index()
             else:
-                history_map[tkr] = df.sort_index()
-            persist_uploaded_frame(tkr, history_map[tkr])
+                history_map[tkr] = df
     return history_map
-
-
-def cache_file_for(ticker: str, interval: str) -> Path:
-    safe = re.sub(r"[^A-Z0-9._^=-]+", "_", ticker.upper())
-    return YAHOO_CACHE_DIR / f"{safe}_{interval}.parquet"
-
-
-def read_cached_market_data(ticker: str, interval: str, max_age_hours: float) -> pd.DataFrame:
-    fp = cache_file_for(ticker, interval)
-    if not fp.exists():
-        return pd.DataFrame()
-    age_hours = (time.time() - fp.stat().st_mtime) / 3600.0
-    if age_hours > max_age_hours:
-        return pd.DataFrame()
-    try:
-        df = pd.read_parquet(fp)
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df.sort_index()
-        return df[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]]
-    except Exception:
-        return pd.DataFrame()
-
-
-def write_cached_market_data(ticker: str, interval: str, df: pd.DataFrame) -> None:
-    if df is None or df.empty:
-        return
-    try:
-        df[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]].to_parquet(cache_file_for(ticker, interval))
-    except Exception:
-        pass
-
-
-def parse_yf_download(raw, symbols: List[str]) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    if raw is None or len(symbols) == 0:
-        return out
-    if isinstance(raw.columns, pd.MultiIndex):
-        # yfinance uses field first or symbol first depending on version/args
-        level0 = list(raw.columns.get_level_values(0).unique())
-        fields = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
-        if set(level0) & fields:
-            for sym in symbols:
-                try:
-                    part = raw.xs(sym, axis=1, level=1, drop_level=True).copy()
-                except Exception:
-                    continue
-                part = part.rename(columns=str.title)
-                keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in part.columns]
-                part = part[keep].dropna(how="all")
-                if not part.empty:
-                    out[sym] = part
-        else:
-            for sym in symbols:
-                try:
-                    part = raw[sym].copy()
-                except Exception:
-                    continue
-                part = part.rename(columns=str.title)
-                keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in part.columns]
-                part = part[keep].dropna(how="all")
-                if not part.empty:
-                    out[sym] = part
-    else:
-        part = raw.rename(columns=str.title)
-        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in part.columns]
-        part = part[keep].dropna(how="all")
-        if not part.empty and len(symbols) == 1:
-            out[symbols[0]] = part
-    for k, df in list(out.items()):
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index, errors="coerce")
-        out[k] = df[~df.index.isna()].sort_index()
-    return out
-
-
-def batch_download_yahoo(symbols: List[str], interval: str, period: str, max_age_hours: float = 12.0) -> Tuple[Dict[str, pd.DataFrame], Dict[str, str]]:
-    symbols = [s.upper() for s in symbols if re.fullmatch(r"[A-Z][A-Z0-9.\-\^=]{0,14}", s.upper())]
-    frames: Dict[str, pd.DataFrame] = {}
-    statuses: Dict[str, str] = {}
-    missing: List[str] = []
-    for sym in symbols:
-        cached = read_cached_market_data(sym, interval, max_age_hours=max_age_hours)
-        if not cached.empty:
-            frames[sym] = cached
-            statuses[sym] = f"cache:{len(cached)}"
-        else:
-            missing.append(sym)
-    if missing:
-        chunks = [missing[i:i + 25] for i in range(0, len(missing), 25)]
-        for chunk in chunks:
-            try:
-                raw = yf.download(
-                    tickers=" ".join(chunk),
-                    interval=interval,
-                    period=period,
-                    progress=False,
-                    auto_adjust=True,
-                    threads=False,
-                    group_by="column",
-                    prepost=False,
-                )
-                got = parse_yf_download(raw, chunk)
-                for sym in chunk:
-                    df = got.get(sym, pd.DataFrame())
-                    if not df.empty:
-                        frames[sym] = df
-                        statuses[sym] = f"yahoo_batch:{len(df)}"
-                        write_cached_market_data(sym, interval, df)
-                    else:
-                        statuses[sym] = "yahoo_batch_empty"
-                time.sleep(0.35)
-            except Exception as e:
-                msg = str(e).lower()
-                status = "yahoo_batch_rate_limited" if "rate" in msg or "too many requests" in msg else "yahoo_batch_error"
-                for sym in chunk:
-                    statuses[sym] = status
-    return frames, statuses
-
-
-def fetch_yahoo_single(ticker: str, interval: str, period: str, max_age_hours: float = 12.0) -> Tuple[pd.DataFrame, str]:
-    cached = read_cached_market_data(ticker, interval, max_age_hours=max_age_hours)
-    if not cached.empty:
-        return cached, f"cache:{len(cached)}"
-    for attempt in range(3):
-        try:
-            raw = yf.download(
-                tickers=ticker,
-                interval=interval,
-                period=period,
-                progress=False,
-                auto_adjust=True,
-                threads=False,
-                group_by="column",
-                prepost=False,
-            )
-            out = parse_yf_download(raw, [ticker.upper()]).get(ticker.upper(), pd.DataFrame())
-            if not out.empty:
-                write_cached_market_data(ticker, interval, out)
-                return out, f"yahoo_single:{len(out)}"
-            time.sleep(0.6 * (attempt + 1))
-        except Exception as e:
-            msg = str(e).lower()
-            if "rate" in msg or "too many requests" in msg:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            return pd.DataFrame(), "yahoo_single_error"
-    stale = read_cached_market_data(ticker, interval, max_age_hours=24 * 21)
-    if not stale.empty:
-        return stale, f"stale_cache:{len(stale)}"
-    return pd.DataFrame(), "yahoo_single_empty_or_rate_limited"
 
 
 def merge_history_with_recent(base_df: pd.DataFrame, recent_df: pd.DataFrame) -> pd.DataFrame:
@@ -417,140 +376,120 @@ def merge_history_with_recent(base_df: pd.DataFrame, recent_df: pd.DataFrame) ->
         return recent_df.copy() if recent_df is not None else pd.DataFrame()
     if recent_df is None or recent_df.empty:
         return base_df.copy()
-    cutoff = pd.to_datetime(base_df.index.max()) - pd.Timedelta(days=5)
+    cutoff = pd.to_datetime(base_df.index.max()) - pd.Timedelta(days=3)
     recent_only = recent_df[recent_df.index >= cutoff]
     merged = pd.concat([base_df, recent_only])
     merged = merged[~merged.index.duplicated(keep="last")].sort_index()
     return merged
 
 
-def fetch_daily_history_with_priority(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int, preloaded_daily: Dict[str, pd.DataFrame], preloaded_status: Dict[str, str]) -> Tuple[pd.DataFrame, str, Dict[str, str]]:
+def fetch_daily_history_with_priority(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int) -> Tuple[pd.DataFrame, str, Dict[str, str]]:
     tkr = ticker.upper()
-    meta = {
-        "upload_status": "not_matched",
-        "daily_cache_status": preloaded_status.get(tkr, "not_checked"),
-        "daily_rows": "0",
-        "history_note": "",
+    fetch_meta = {
+        "upload_status": "not_checked",
+        "defeat_status": "not_checked",
+        "yahoo_status": "not_checked",
     }
-    if tkr in uploaded_history and not uploaded_history[tkr].empty:
-        base = uploaded_history[tkr].copy()
-        meta["upload_status"] = f"matched:{len(base)}"
-        recent = preloaded_daily.get(tkr, pd.DataFrame())
-        merged = merge_history_with_recent(base, recent)
-        meta["daily_rows"] = str(len(merged))
-        meta["history_note"] = "upload_primary"
-        return merged, "upload" if recent.empty else "upload+yahoo_gap", meta
-    daily = preloaded_daily.get(tkr, pd.DataFrame())
-    if not daily.empty:
-        meta["daily_rows"] = str(len(daily))
-        meta["history_note"] = "batch_or_cache_primary"
-        return daily, "yahoo_batch_or_cache", meta
-    single, single_status = fetch_yahoo_single(tkr, "1d", period=f"{max(years, 5)}y", max_age_hours=24)
-    meta["daily_cache_status"] = f"{meta['daily_cache_status']} | {single_status}"
-    if not single.empty:
-        meta["daily_rows"] = str(len(single))
-        meta["history_note"] = "single_fallback"
-        return single, "yahoo_single_fallback", meta
-    meta["history_note"] = "daily_unavailable"
-    return pd.DataFrame(), "none", meta
 
-
-def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int, preloaded_daily: Dict[str, pd.DataFrame], preloaded_daily_status: Dict[str, str], preloaded_hourly: Dict[str, pd.DataFrame], preloaded_hourly_status: Dict[str, str]) -> Dict[str, object]:
-    daily, history_source, meta = fetch_daily_history_with_priority(ticker, uploaded_history, years, preloaded_daily, preloaded_daily_status)
-    if daily.empty:
-        meta["hourly_status"] = "skipped_no_daily"
-        return {"hourly": pd.DataFrame(), "daily": pd.DataFrame(), "weekly": pd.DataFrame(), "history_source": history_source, "degraded_hourly": True, "fetch_meta": meta}
-    hourly = preloaded_hourly.get(ticker.upper(), pd.DataFrame())
-    if hourly.empty:
-        hourly, single_hourly_status = fetch_yahoo_single(ticker.upper(), "1h", period="60d", max_age_hours=8)
-        meta["hourly_status"] = single_hourly_status
+    if tkr in uploaded_history:
+        base = uploaded_history.get(tkr, pd.DataFrame())
+        if base is not None and not base.empty:
+            fetch_meta["upload_status"] = f"matched:{len(base)}"
+            recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
+            fetch_meta["yahoo_status"] = "gap_ok" if recent is not None and not recent.empty else "gap_empty"
+            merged = merge_history_with_recent(base, recent)
+            source = "upload+yahoo_gap" if recent is not None and not recent.empty and len(merged) > len(base) else "upload"
+            fetch_meta["daily_rows"] = str(len(merged))
+            return merged, source, fetch_meta
+        fetch_meta["upload_status"] = "matched_empty"
     else:
-        meta["hourly_status"] = preloaded_hourly_status.get(ticker.upper(), f"batch:{len(hourly)}")
+        fetch_meta["upload_status"] = "not_matched"
+
+    defeat_df = fetch_defeat_history(tkr, years=max(years, 5))
+    if defeat_df is not None and not defeat_df.empty:
+        fetch_meta["defeat_status"] = f"ok:{len(defeat_df)}"
+        recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
+        fetch_meta["yahoo_status"] = "gap_ok" if recent is not None and not recent.empty else "gap_empty"
+        merged = merge_history_with_recent(defeat_df, recent)
+        source = "defeatbeta+yahoo_gap" if recent is not None and not recent.empty and len(merged) > len(defeat_df) else "defeatbeta"
+        fetch_meta["daily_rows"] = str(len(merged))
+        return merged, source, fetch_meta
+    fetch_meta["defeat_status"] = "empty"
+
+    yahoo_df = fetch_yahoo_prices(tkr, "1d", period=f"{max(years, 5)}y")
+    if yahoo_df is not None and not yahoo_df.empty:
+        fetch_meta["yahoo_status"] = f"ok:{len(yahoo_df)}"
+        fetch_meta["daily_rows"] = str(len(yahoo_df))
+        return yahoo_df, "yahoo_only", fetch_meta
+
+    fetch_meta["yahoo_status"] = "empty_or_rate_limited"
+    fetch_meta["daily_rows"] = "0"
+    return pd.DataFrame(), "none", fetch_meta
+
+
+def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int) -> Dict[str, pd.DataFrame]:
+    daily, history_source, fetch_meta = fetch_daily_history_with_priority(ticker, uploaded_history, years)
+    hourly = fetch_yahoo_prices(ticker, "1h", period="60d")
     degraded = False
-    if hourly.empty:
+    if daily.empty:
+        fetch_meta["hourly_status"] = "skipped_no_daily"
+        return {
+            "hourly": pd.DataFrame(),
+            "daily": pd.DataFrame(),
+            "weekly": pd.DataFrame(),
+            "history_source": history_source,
+            "degraded_hourly": True,
+            "fetch_meta": fetch_meta,
+        }
+    if hourly is None or hourly.empty:
         degraded = True
+        fetch_meta["hourly_status"] = "empty_or_rate_limited_using_daily_fallback"
+        # Degraded placeholder, not true hourly timing
         hourly = resample_ohlcv(daily.tail(120), "B")
-        meta["hourly_status"] = f"{meta['hourly_status']} | degraded_from_daily"
+    else:
+        fetch_meta["hourly_status"] = f"ok:{len(hourly)}"
     weekly = resample_ohlcv(daily, "W-FRI")
-    meta["weekly_rows"] = str(len(weekly))
-    return {"hourly": hourly, "daily": daily, "weekly": weekly, "history_source": history_source, "degraded_hourly": degraded, "fetch_meta": meta}
+    fetch_meta["weekly_rows"] = str(len(weekly))
+    return {
+        "hourly": hourly,
+        "daily": daily,
+        "weekly": weekly,
+        "history_source": history_source,
+        "degraded_hourly": degraded,
+        "fetch_meta": fetch_meta,
+    }
 
 
 def centered_pct(series: pd.Series) -> pd.Series:
     return (series.fillna(0.5) - 0.5) * 2
 
 
-def rolling_zscore(series: pd.Series, window: int, clip: float = 3.0) -> pd.Series:
-    series = pd.to_numeric(series, errors="coerce")
-    mean = series.rolling(window, min_periods=max(20, window // 5)).mean()
-    std = series.rolling(window, min_periods=max(20, window // 5)).std()
-    z = (series - mean) / std.replace(0, np.nan)
-    return z.clip(-clip, clip)
-
-
-def smooth_norm(series: pd.Series, window: int, clip: float = 3.0, ema_span: int = 3) -> pd.Series:
-    z = rolling_zscore(series, window=window, clip=clip)
-    smooth = ema(z.fillna(0.0), ema_span)
-    return np.tanh(smooth)
-
-
-def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str, use_smooth_hourly: bool = True) -> pd.DataFrame:
-    spans = {"hourly": (5, 13, 5), "daily": (8, 21, 7), "weekly": (5, 13, 5)}
+def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
+    spans = {
+        "hourly": (5, 13, 5),
+        "daily": (8, 21, 7),
+        "weekly": (5, 13, 5),
+    }
 
     def pct_col(name: str) -> pd.Series:
-        return centered_pct(out[name]) if name in out.columns else pd.Series(0.0, index=out.index, dtype=float)
-
-    def smooth_col(name: str, window: int, ema_span: int = 3, scale: float = 1.0) -> pd.Series:
-        if name not in out.columns:
-            return pd.Series(0.0, index=out.index, dtype=float)
-        return smooth_norm(out[name], window=window, ema_span=ema_span) * scale
+        if name in out.columns:
+            return centered_pct(out[name])
+        return pd.Series(0.0, index=out.index, dtype=float)
 
     fast, slow, sig = spans[timeframe_name]
-
-    if timeframe_name == "hourly" and use_smooth_hourly:
-        # Use continuous, pre-smoothed inputs so the hourly oscillator behaves more like
-        # a clean PPO/stochastic wave instead of a percentile step-function.
-        smooth_window = 96
-        rsi_sm = ema(out.get("rsi_14", pd.Series(0.0, index=out.index)).fillna(method="ffill").fillna(50.0), 4)
-        cci_sm = ema(out.get("cci_20", pd.Series(0.0, index=out.index)).fillna(method="ffill").fillna(0.0), 4)
-        pctb_sm = ema(out.get("pct_b", pd.Series(0.5, index=out.index)).fillna(method="ffill").fillna(0.5), 4)
-        atr_sm = ema(out.get("atr_stretch", pd.Series(0.0, index=out.index)).fillna(method="ffill").fillna(0.0), 5)
-        dema_sm = ema(out.get("dist_ema20_pct", pd.Series(0.0, index=out.index)).fillna(method="ffill").fillna(0.0), 5)
-        tsi_sm = ema(out.get("tsi", pd.Series(0.0, index=out.index)).fillna(method="ffill").fillna(0.0), 4)
-        adx_sm = ema(out.get("adx_14", pd.Series(20.0, index=out.index)).fillna(method="ffill").fillna(20.0), 5)
-        price_slope_sm = ema(out.get("price_slope_3", pd.Series(0.0, index=out.index)).fillna(0.0), 4)
-        rs_sm = ema(out.get("rs_bench_slope_5", pd.Series(0.0, index=out.index)).fillna(0.0), 4)
-
-        stretch = (
-            0.18 * np.tanh(rolling_zscore(rsi_sm, smooth_window, clip=2.5).fillna(0.0) / 1.6)
-            + 0.18 * np.tanh(rolling_zscore(cci_sm, smooth_window, clip=2.5).fillna(0.0) / 1.7)
-            + 0.14 * np.tanh(rolling_zscore(pctb_sm, smooth_window, clip=2.5).fillna(0.0) / 1.5)
-            + 0.12 * np.tanh(rolling_zscore(atr_sm, smooth_window, clip=2.5).fillna(0.0) / 1.8)
-            + 0.10 * np.tanh(rolling_zscore(dema_sm, smooth_window, clip=2.5).fillna(0.0) / 1.8)
-        )
-        if "dist_vwap_pct" in out.columns:
-            dvwap_sm = ema(out["dist_vwap_pct"].fillna(method="ffill").fillna(0.0), 4)
-            stretch = stretch + 0.10 * np.tanh(rolling_zscore(dvwap_sm, smooth_window, clip=2.5).fillna(0.0) / 1.8)
-
-        momentum = (
-            0.20 * np.tanh(rolling_zscore(tsi_sm, smooth_window, clip=2.5).fillna(0.0) / 1.6)
-            + 0.08 * np.tanh(price_slope_sm * 26)
-        )
-        rs_part = 0.10 * np.tanh(rs_sm * 26)
-        quality = 1 + 0.10 * np.tanh(rolling_zscore(adx_sm, smooth_window, clip=2.0).fillna(0.0) / 1.8)
-
-        # Extra smoothing on the base is what visually restores the wave-like hourly behavior.
-        out["uo_base"] = ema(ema((stretch + momentum + rs_part) * quality, 5), 3)
-        fast, slow, sig = (8, 21, 5)
-    else:
-        stretch = 0.18 * pct_col("rsi_14_pctile") + 0.18 * pct_col("cci_20_pctile") + 0.14 * pct_col("pct_b_pctile") + 0.12 * pct_col("atr_stretch_pctile") + 0.10 * pct_col("dist_ema20_pctile")
-        momentum = 0.20 * pct_col("tsi_pctile") + 0.08 * np.tanh(out.get("price_slope_3", pd.Series(0.0, index=out.index)).fillna(0) * 25)
-        rs_part = 0.10 * np.tanh(out.get("rs_bench_slope_5", pd.Series(0.0, index=out.index)).fillna(0) * 25)
-        quality = 1 + 0.15 * pct_col("adx_14_pctile")
-        if "dist_vwap_pctile" in out.columns:
-            stretch = stretch + 0.10 * centered_pct(out["dist_vwap_pctile"].fillna(0.5))
-        out["uo_base"] = (stretch + momentum + rs_part) * quality
-
+    stretch = (
+        0.18 * pct_col("rsi_14_pctile")
+        + 0.18 * pct_col("cci_20_pctile")
+        + 0.14 * pct_col("pct_b_pctile")
+        + 0.12 * pct_col("atr_stretch_pctile")
+        + 0.10 * pct_col("dist_ema20_pctile")
+    )
+    momentum = 0.20 * pct_col("tsi_pctile") + 0.08 * np.tanh(out["price_slope_3"].fillna(0) * 25)
+    rs_part = 0.10 * np.tanh(out["rs_bench_slope_5"].fillna(0) * 25)
+    quality = 1 + 0.15 * pct_col("adx_14_pctile")
+    if "dist_vwap_pctile" in out.columns:
+        stretch = stretch + 0.10 * centered_pct(out["dist_vwap_pctile"].fillna(0.5))
+    out["uo_base"] = (stretch + momentum + rs_part) * quality
     out["uo"] = ema(out["uo_base"], fast) - ema(out["uo_base"], slow)
     out["uo_signal"] = ema(out["uo"], sig)
     out["uo_hist"] = out["uo"] - out["uo_signal"]
@@ -563,10 +502,10 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str, use_smooth_h
     return out
 
 
-def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None, use_smooth_hourly: bool = True) -> pd.DataFrame:
+def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     if df.empty:
         return df.copy()
-    out = df.copy().sort_index()
+    out = df.copy()
     out["ema_10"] = ema(out["Close"], 10)
     out["ema_20"] = ema(out["Close"], 20)
     out["sma_50"] = sma(out["Close"], 50)
@@ -604,7 +543,8 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     for col in ["rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14", "dist_ema20_pct", "volume_ratio", "dist_vwap_pct"]:
         if col in out.columns:
             out[f"{col}_pctile"] = rolling_percentile(out[col], win)
-    return add_ultimate_oscillator(out, timeframe_name, use_smooth_hourly=use_smooth_hourly)
+    out = add_ultimate_oscillator(out, timeframe_name)
+    return out
 
 
 def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
@@ -626,14 +566,17 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, float,
     pct_b = row.get("pct_b", 0.5)
     adx_val = row.get("adx_14", 15.0)
     dist_ema = row.get("dist_ema20_pct", 0.0)
+
     if uo_pct > 0.80 and (uo_slope < 0 or uo_gap < 0 or tsi_gap < 0) and rsi_val > 70:
-        return "PUT", min(95.0, 55 + (uo_pct - 0.80) * 150), "Rolling from elevated zone"
+        conf = min(95.0, 55 + (uo_pct - 0.80) * 150)
+        return "PUT", conf, "Rolling from elevated zone"
     if timeframe == "hourly" and rsi_val > 75 and cci_val > 90 and pct_b > 0.90 and (uo_gap <= 0 or tsi_gap <= 0):
         return "PUT", 78.0, "Hourly overheated and rolling"
     if timeframe == "hourly" and rsi_val > 75 and cci_val > 90 and pct_b > 0.90 and adx_val > 25 and uo_gap > 0:
         return "AVOID CHASE", 72.0, "Pinned continuation risk"
     if uo_pct < 0.20 and (uo_slope > 0 or uo_gap > 0 or tsi_gap > 0) and rsi_val < 35:
-        return "CALL", min(95.0, 55 + (0.20 - uo_pct) * 150), "Turning up from washed-out zone"
+        conf = min(95.0, 55 + (0.20 - uo_pct) * 150)
+        return "CALL", conf, "Turning up from washed-out zone"
     if uo_gap > 0 and uo_slope > 0 and dist_ema > -0.02:
         return "CALL", 62.0 + max(0.0, min(15.0, (uo_pct - 0.5) * 20)), "Composite rising above signal"
     if uo_gap < 0 and uo_slope < 0 and dist_ema < 0.02:
@@ -676,11 +619,12 @@ def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
     w = analogs["similarity"].fillna(1.0)
     out: Dict[str, float] = {"n": float(len(analogs))}
     for c in ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"]:
-        vals = analogs[c].fillna(0)
-        out[f"{c}_median"] = float(vals.median())
-        out[f"{c}_mean_w"] = float(np.average(vals, weights=w))
-        out[f"{c}_p_down"] = float(np.average((vals < 0).astype(float), weights=w))
-        out[f"{c}_p_up"] = float(np.average((vals > 0).astype(float), weights=w))
+        if c in analogs.columns:
+            vals = analogs[c].fillna(0)
+            out[f"{c}_median"] = float(vals.median())
+            out[f"{c}_mean_w"] = float(np.average(vals, weights=w))
+            out[f"{c}_p_down"] = float(np.average((vals < 0).astype(float), weights=w))
+            out[f"{c}_p_up"] = float(np.average((vals > 0).astype(float), weights=w))
     return out
 
 
@@ -724,6 +668,7 @@ def combine_calls(hourly_call: str, daily_call: str, weekly_call: str, flags: Di
         score += 0.20
     if flags.get("dead_cat_risk"):
         score -= 0.35
+
     if hourly_call in {"PUT", "AVOID CHASE"} and daily_call == "CALL" and weekly_call == "CALL":
         return "WAIT / HOURLY TOO HOT", "Bullish trend, but hourly timing is poor"
     if score >= 0.55:
@@ -735,8 +680,9 @@ def combine_calls(hourly_call: str, daily_call: str, weekly_call: str, flags: Di
     return "NEUTRAL", "Mixed timeframe signals"
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def get_option_candidates(symbol: str, option_type: str, max_expirations: int = 2) -> pd.DataFrame:
-    if option_type not in {"CALL", "PUT"}:
+    if not option_type or option_type not in {"CALL", "PUT"}:
         return pd.DataFrame()
     try:
         ticker = yf.Ticker(symbol)
@@ -756,14 +702,21 @@ def get_option_candidates(symbol: str, option_type: str, max_expirations: int = 
                 continue
             exp_dt = pd.Timestamp(exp_date)
             dte = int((exp_dt - now.normalize()).days)
-            options = options[options["strike"] >= current_price * 0.95] if option_type == "CALL" else options[options["strike"] <= current_price * 1.05]
+            if option_type == "CALL":
+                options = options[options["strike"] >= current_price * 0.95]
+            else:
+                options = options[options["strike"] <= current_price * 1.05]
             if options.empty:
                 continue
             options["spread"] = options["ask"] - options["bid"]
             options["mid"] = (options["ask"] + options["bid"]) / 2
             rel_spread = (options["spread"] / options["mid"].replace(0, np.nan)).clip(upper=1).fillna(1)
             options["days_to_expiry"] = dte
-            options["liq_score"] = options["volume"].fillna(0).clip(upper=5000) / 5000 * 0.35 + options["openInterest"].fillna(0).clip(upper=10000) / 10000 * 0.35 + (1 - rel_spread) * 0.30
+            options["liq_score"] = (
+                options["volume"].fillna(0).clip(upper=5000) / 5000 * 0.35
+                + options["openInterest"].fillna(0).clip(upper=10000) / 10000 * 0.35
+                + (1 - rel_spread) * 0.30
+            )
             all_options.append(options.assign(expiration=exp_date, option_type=option_type))
         if not all_options:
             return pd.DataFrame()
@@ -774,9 +727,12 @@ def get_option_candidates(symbol: str, option_type: str, max_expirations: int = 
         return pd.DataFrame()
 
 
-def plot_timeframe_dashboard(symbol: str, hourly_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_label: Optional[str] = None) -> None:
-    title_suffix = f" (as of {asof_label})" if asof_label else ""
-    fig = make_subplots(rows=4, cols=1, vertical_spacing=0.06, subplot_titles=[f"{symbol} Daily Price{title_suffix}", "Hourly Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"], row_heights=[0.42, 0.19, 0.19, 0.20])
+def plot_timeframe_dashboard(symbol: str, hourly_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, as_of_label: Optional[str] = None) -> None:
+    fig = make_subplots(
+        rows=4, cols=1, vertical_spacing=0.06,
+        subplot_titles=[f"{symbol} Daily Price" + (f" (as of {as_of_label})" if as_of_label else ""), "Hourly Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
+        row_heights=[0.42, 0.19, 0.19, 0.20],
+    )
     if not daily_df.empty:
         d = daily_df.tail(220)
         fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Daily"), row=1, col=1)
@@ -798,7 +754,10 @@ def build_symbol_list(manual_symbols: str, watchlist_file, uploaded_history_map:
         symbols.extend([s.strip().upper() for s in manual_symbols.replace("\n", ",").split(",") if s.strip()])
     if watchlist_file is not None:
         try:
-            df = pd.read_csv(watchlist_file) if watchlist_file.name.lower().endswith(".csv") else pd.read_excel(watchlist_file)
+            if watchlist_file.name.lower().endswith(".csv"):
+                df = pd.read_csv(watchlist_file)
+            else:
+                df = pd.read_excel(watchlist_file)
             preferred = [c for c in df.columns if str(c).strip().lower() in {"ticker", "symbol", "tickers", "symbols"}]
             col = preferred[0] if preferred else df.columns[0]
             symbols.extend(df[col].dropna().astype(str).str.upper().str.strip().tolist())
@@ -806,16 +765,16 @@ def build_symbol_list(manual_symbols: str, watchlist_file, uploaded_history_map:
             pass
     if not symbols and uploaded_history_map:
         symbols.extend(uploaded_history_map.keys())
-    symbols = [s for s in symbols if re.fullmatch(r"[A-Z][A-Z0-9.\-\^=]{0,14}", s)]
+    symbols = [s for s in symbols if re.fullmatch(r"[A-Z][A-Z0-9.\-\^=]{0,9}", s)]
     return list(dict.fromkeys(symbols))
 
 
-st.title("📈 Stable Market Engine")
-st.caption("cache-first | batched Yahoo | upload persistence | explicit fetch diagnostics")
+st.title("📊 Stock Analyzer Ultimate v2.1")
+st.caption("Boot-safe | per-timeframe calls | state-aware analogs | Yahoo-protected")
 
 with st.sidebar:
     st.header("Input")
-    manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="QQQ, SMH, SQQQ, SOXL, SPY", height=110)
+    manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="QQQ, SMH, SQQQ", height=100)
     watchlist_file = st.file_uploader("Upload watchlist CSV/XLSX", type=["csv", "xlsx"])
     uploaded_history_files = st.file_uploader("Upload OHLCV files (CSV/XLSX)", type=["csv", "xlsx"], accept_multiple_files=True)
 
@@ -825,37 +784,27 @@ with st.sidebar:
     analog_count = st.slider("Analogs", 5, 30, 15)
     mc_sims = st.slider("Monte Carlo simulations", 500, 5000, 1000, 500)
     show_options = st.checkbox("Show option chains", value=False)
-    force_refresh = st.checkbox("Force refresh Yahoo cache", value=False)
-    use_smooth_hourly = st.checkbox("Smooth hourly oscillator", value=True)
+    enable_calendar_lookback = st.checkbox("Calendar lookback", value=True)
     run_analysis = st.button("Run Analysis", type="primary", width='stretch')
 
-st.info("This version prefers persisted uploads and local cache first. Yahoo is used mainly to fill gaps or seed cache.")
+st.info("The app should render immediately. Heavy work starts only after you press Run Analysis.")
 
 if not run_analysis:
     st.stop()
 
-if force_refresh:
-    for fp in YAHOO_CACHE_DIR.glob("*.parquet"):
-        try:
-            fp.unlink()
-        except Exception:
-            pass
-
-with st.spinner("Loading uploads and persisted cache..."):
-    uploaded_history_map = load_history_uploads(uploaded_history_files) if uploaded_history_files else load_persisted_uploads()
+with st.spinner("Loading uploaded history..."):
+    uploaded_history_map = load_history_uploads(uploaded_history_files) if uploaded_history_files else {}
 
 symbols = build_symbol_list(manual_symbols, watchlist_file, uploaded_history_map)
 if not symbols:
     st.error("Provide at least one symbol via paste/watchlist or upload OHLCV files named by ticker.")
     st.stop()
 
-preload_symbols = list(dict.fromkeys(symbols + [benchmark]))
-with st.spinner("Preloading daily and hourly market data in batches..."):
-    preloaded_daily, preloaded_daily_status = batch_download_yahoo(preload_symbols, "1d", period=f"{max(history_years, 5)}y", max_age_hours=24)
-    preloaded_hourly, preloaded_hourly_status = batch_download_yahoo(symbols, "1h", period="60d", max_age_hours=8)
+benchmark_daily, _, benchmark_fetch_meta = fetch_daily_history_with_priority(benchmark, uploaded_history_map, history_years)
+if benchmark_daily.empty:
+    benchmark_daily = fetch_yahoo_prices(benchmark, "1d", period=f"{max(history_years, 5)}y")
 
-benchmark_daily, benchmark_source, benchmark_fetch_meta = fetch_daily_history_with_priority(benchmark, uploaded_history_map, history_years, preloaded_daily, preloaded_daily_status)
-st.caption(f"Benchmark fetch: source={benchmark_source} | upload={benchmark_fetch_meta.get('upload_status','n/a')} | daily={benchmark_fetch_meta.get('daily_cache_status','n/a')} | rows={benchmark_fetch_meta.get('daily_rows','0')}")
+st.caption(f"Benchmark fetch: source={benchmark_fetch_meta.get('upload_status','n/a')}/{benchmark_fetch_meta.get('defeat_status','n/a')}/{benchmark_fetch_meta.get('yahoo_status','n/a')} | rows={benchmark_fetch_meta.get('daily_rows','0')}")
 
 results: List[Dict[str, object]] = []
 detail_data: Dict[str, Dict[str, object]] = {}
@@ -863,27 +812,27 @@ progress = st.progress(0.0)
 
 for idx, symbol in enumerate(symbols):
     progress.progress((idx + 1) / len(symbols))
-    data = fetch_multi_timeframe(symbol, uploaded_history_map, history_years, preloaded_daily, preloaded_daily_status, preloaded_hourly, preloaded_hourly_status)
+    data = fetch_multi_timeframe(symbol, uploaded_history_map, history_years)
     daily_df = data["daily"]
     hourly_df = data["hourly"]
     weekly_df = data["weekly"]
-    meta = data.get("fetch_meta", {})
     if daily_df.empty:
+        meta = data.get("fetch_meta", {})
         results.append({
             "Symbol": symbol,
             "Status": "No data",
             "History Source": data["history_source"],
             "Upload": meta.get("upload_status", "n/a"),
-            "Daily Fetch": meta.get("daily_cache_status", "n/a"),
+            "DefeatBeta": meta.get("defeat_status", "n/a"),
+            "Yahoo Daily": meta.get("yahoo_status", "n/a"),
             "Hourly Source": meta.get("hourly_status", "n/a"),
-            "Daily Rows": meta.get("daily_rows", "0"),
-            "Fetch Detail": f"upload={meta.get('upload_status','n/a')} | daily={meta.get('daily_cache_status','n/a')} | note={meta.get('history_note','')}",
+            "Fetch Detail": f"upload={meta.get('upload_status','n/a')} | defeat={meta.get('defeat_status','n/a')} | yahoo={meta.get('yahoo_status','n/a')}",
         })
         continue
 
-    daily_df = add_forward_returns(enrich_price_features(daily_df, "daily", benchmark_daily, use_smooth_hourly=use_smooth_hourly))
-    weekly_df = enrich_price_features(weekly_df, "weekly", benchmark_daily, use_smooth_hourly=use_smooth_hourly)
-    hourly_df = add_forward_returns(enrich_price_features(hourly_df, "hourly", benchmark_daily, use_smooth_hourly=use_smooth_hourly))
+    daily_df = add_forward_returns(enrich_price_features(daily_df, "daily", benchmark_daily))
+    weekly_df = enrich_price_features(weekly_df, "weekly", benchmark_daily)
+    hourly_df = add_forward_returns(enrich_price_features(hourly_df, "hourly", benchmark_daily))
 
     hourly_row = hourly_df.iloc[-1] if not hourly_df.empty else pd.Series(dtype=float)
     daily_row = daily_df.iloc[-1]
@@ -898,17 +847,20 @@ for idx, symbol in enumerate(symbols):
     daily_analog_summary = summarize_analogs(daily_analogs)
     hourly_analogs = nearest_analogs(hourly_df, HOURLY_ANALOG_FEATURES, min(analog_count, 12)) if not data["degraded_hourly"] else pd.DataFrame()
     hourly_analog_summary = summarize_analogs(hourly_analogs)
+
     combined_call, combined_reason = combine_calls(hourly_call, daily_call, weekly_call, flags, daily_analog_summary, hourly_analog_summary)
     sim_paths, mc_summary = monte_carlo_from_analogs(daily_analogs, 5, mc_sims)
 
+    meta = data.get("fetch_meta", {})
     results.append({
         "Symbol": symbol,
         "Status": "OK",
         "History Source": data["history_source"],
         "Upload": meta.get("upload_status", "n/a"),
-        "Daily Fetch": meta.get("daily_cache_status", "n/a"),
-        "Hourly Source": meta.get("hourly_status", "n/a"),
-        "Daily Rows": meta.get("daily_rows", "0"),
+        "DefeatBeta": meta.get("defeat_status", "n/a"),
+        "Yahoo Daily": meta.get("yahoo_status", "n/a"),
+        "Hourly Source": "degraded fallback" if data["degraded_hourly"] else "Yahoo",
+        "Fetch Detail": f"upload={meta.get('upload_status','n/a')} | defeat={meta.get('defeat_status','n/a')} | yahoo={meta.get('yahoo_status','n/a')} | hourly={meta.get('hourly_status','n/a')}",
         "Hourly Call": hourly_call,
         "Daily Call": daily_call,
         "Weekly Call": weekly_call,
@@ -941,8 +893,7 @@ for idx, symbol in enumerate(symbols):
         "mc_summary": mc_summary,
         "history_source": data["history_source"],
         "degraded_hourly": data["degraded_hourly"],
-        "fetch_meta": meta,
-        "use_smooth_hourly": use_smooth_hourly,
+        "fetch_meta": data.get("fetch_meta", {}),
     }
 
 progress.empty()
@@ -951,51 +902,48 @@ st.session_state["results_df"] = results_df
 st.session_state["detail_data"] = detail_data
 
 st.subheader("Ranked Results")
-if results_df.empty:
+if not results_df.empty:
+    sort_col = "2d Med" if "2d Med" in results_df.columns else None
+    if sort_col:
+        results_df = results_df.sort_values(sort_col, ascending=False)
+    st.dataframe(results_df, width='stretch', hide_index=True)
+    st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stock_analysis_v2_1_results.csv", "text/csv")
+else:
     st.warning("No results")
     st.stop()
-if "2d Med" in results_df.columns:
-    results_df = results_df.sort_values(["Status", "2d Med"], ascending=[True, False])
-st.dataframe(results_df, width='stretch', hide_index=True)
-st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_results.csv", "text/csv")
 
 valid_symbols = [r["Symbol"] for r in results if r.get("Status") == "OK"]
 if valid_symbols:
     st.subheader("Detailed Analysis")
+
     selected_symbol = st.selectbox("Select symbol", valid_symbols)
     data = detail_data[selected_symbol]
 
-    available_dates = pd.to_datetime(data["daily"].index).date
-    default_date = available_dates[-1]
-    analysis_date = st.date_input("Calendar lookback", value=default_date, min_value=available_dates[0], max_value=default_date, key=f"analysis_date_{selected_symbol}")
-    analysis_ts = pd.Timestamp(analysis_date)
-    analysis_ts_end = analysis_ts + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    analysis_date = None
+    as_of_label = None
+    hourly_view = data["hourly"]
+    daily_view = data["daily"]
+    weekly_view = data["weekly"]
 
-    def _align_ts_for_index(idx, ts):
-        if not isinstance(idx, pd.DatetimeIndex):
-            return ts
-        if idx.tz is not None:
-            if getattr(ts, "tzinfo", None) is None:
-                return ts.tz_localize(idx.tz)
-            return ts.tz_convert(idx.tz)
-        if getattr(ts, "tzinfo", None) is not None:
-            return ts.tz_localize(None)
-        return ts
+    if enable_calendar_lookback and not data["daily"].empty:
+        min_date = pd.Timestamp(data["daily"].index.min()).date()
+        max_date = pd.Timestamp(data["daily"].index.max()).date()
+        default_date = max_date
+        analysis_date = st.date_input("Analysis date", value=default_date, min_value=min_date, max_value=max_date, key=f"analysis_date_{selected_symbol}")
+        analysis_ts_end = pd.Timestamp(analysis_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
 
-    analysis_ts_daily = _align_ts_for_index(data["daily"].index, analysis_ts)
-    analysis_ts_weekly = _align_ts_for_index(data["weekly"].index, analysis_ts)
-    analysis_ts_hourly_end = _align_ts_for_index(data["hourly"].index, analysis_ts_end)
+        raw_hourly_view = slice_to_analysis_ts(data["hourly"], analysis_ts_end)
+        raw_daily_view = slice_to_analysis_ts(data["daily"], analysis_ts_end)
+        raw_weekly_view = slice_to_analysis_ts(data["weekly"], analysis_ts_end)
 
-    daily_view = data["daily"].loc[data["daily"].index <= analysis_ts_daily].copy()
-    weekly_view = data["weekly"].loc[data["weekly"].index <= analysis_ts_weekly].copy()
-    hourly_view = data["hourly"].loc[data["hourly"].index <= analysis_ts_hourly_end].copy()
-
-    if daily_view.empty:
-        st.warning("No data available for the selected calendar date.")
-        st.stop()
+        hourly_view, daily_view, weekly_view = re_enrich_sliced_views(raw_hourly_view, raw_daily_view, raw_weekly_view, benchmark_daily)
+        as_of_label = pd.Timestamp(analysis_date).strftime("%Y-%m-%d")
+    else:
+        if not data["daily"].empty:
+            as_of_label = pd.Timestamp(data["daily"].index.max()).strftime("%Y-%m-%d")
 
     hourly_row = hourly_view.iloc[-1] if not hourly_view.empty else pd.Series(dtype=float)
-    daily_row = daily_view.iloc[-1]
+    daily_row = daily_view.iloc[-1] if not daily_view.empty else pd.Series(dtype=float)
     weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
 
     hc, hconf, hreason = classify_timeframe_call(hourly_row, "hourly")
@@ -1003,9 +951,9 @@ if valid_symbols:
     wc, wconf, wreason = classify_timeframe_call(weekly_row, "weekly")
     flags = detect_flags(hourly_row, daily_row, weekly_row)
 
-    daily_analogs = nearest_analogs(daily_view, DAILY_ANALOG_FEATURES, analog_count)
+    daily_analogs = nearest_analogs(daily_view, DAILY_ANALOG_FEATURES, analog_count) if not daily_view.empty else pd.DataFrame()
     daily_analog_summary = summarize_analogs(daily_analogs)
-    hourly_analogs = nearest_analogs(hourly_view, HOURLY_ANALOG_FEATURES, min(analog_count, 12)) if (not data["degraded_hourly"] and not hourly_view.empty) else pd.DataFrame()
+    hourly_analogs = nearest_analogs(hourly_view, HOURLY_ANALOG_FEATURES, min(analog_count, 12)) if (not hourly_view.empty and not data["degraded_hourly"]) else pd.DataFrame()
     hourly_analog_summary = summarize_analogs(hourly_analogs)
     cc, creason = combine_calls(hc, dc, wc, flags, daily_analog_summary, hourly_analog_summary)
     sim_paths, mc_summary = monte_carlo_from_analogs(daily_analogs, 5, mc_sims)
@@ -1019,26 +967,31 @@ if valid_symbols:
     st.markdown(f"**Daily reason:** {dreason}")
     st.markdown(f"**Weekly reason:** {wreason}")
     st.markdown(f"**Combined read:** {creason}")
+    if as_of_label:
+        st.caption(f"Analysis date: {as_of_label}")
     if data["degraded_hourly"]:
-        st.warning("Hourly data is degraded fallback from daily bars. Timing calls are lower quality until hourly cache fills.")
-    st.caption(f"Analysis date: {analysis_ts.date()}")
-    st.caption("Fetch meta: " + " | ".join([f"{k}={v}" for k, v in data["fetch_meta"].items()]))
+        st.warning("Hourly data is degraded fallback from daily bars. Do not trust timing signals until Yahoo hourly is available.")
+    st.caption(f"History source: {data['history_source']}")
+    st.caption(f"Fetch detail: {data.get('fetch_meta', {})}")
 
     flags_df = pd.DataFrame([{"Flag": k, "Detected": v} for k, v in flags.items()])
     st.dataframe(flags_df, width='stretch', hide_index=True)
-    plot_timeframe_dashboard(selected_symbol, hourly_view, daily_view, weekly_view, asof_label=str(analysis_ts.date()))
+
+    plot_timeframe_dashboard(selected_symbol, hourly_view, daily_view, weekly_view, as_of_label=as_of_label)
 
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown("### Daily analogs")
-        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in daily_analog_summary.items()})
+        das = daily_analog_summary
+        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in das.items()})
         if not daily_analogs.empty:
             show = daily_analogs[[c for c in ["Close", "similarity", "distance", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"] if c in daily_analogs.columns]].head(10).copy()
             show.index = show.index.strftime("%Y-%m-%d")
             st.dataframe(show, width='stretch')
     with col_b:
         st.markdown("### Hourly analogs")
-        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in hourly_analog_summary.items()})
+        has = hourly_analog_summary
+        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in has.items()})
         if not hourly_analogs.empty:
             show = hourly_analogs[[c for c in ["Close", "similarity", "distance", "fwd_ret_1", "fwd_ret_2"] if c in hourly_analogs.columns]].head(10).copy()
             show.index = show.index.astype(str)
@@ -1054,14 +1007,10 @@ if valid_symbols:
         fig.update_layout(height=350, xaxis_title="Days Forward", yaxis_title="Cumulative Return")
         st.plotly_chart(fig, width='stretch')
         st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in mc_summary.items()})
-
-    if show_options and cc in {"CALL", "PUT", "CALL ON PULLBACK", "WAIT / HOURLY TOO HOT"}:
-        option_type = "CALL" if "CALL" in cc else "PUT"
-        st.markdown(f"### Option candidates ({option_type})")
-        opt = get_option_candidates(selected_symbol, option_type=option_type)
-        if opt.empty:
-            st.info("No option chain candidates returned.")
+    if show_options and cc in {"CALL", "PUT"}:
+        st.markdown("### Option Chain")
+        opts = get_option_candidates(selected_symbol, cc)
+        if opts.empty:
+            st.info(f"No {cc} options available or Yahoo options request failed.")
         else:
-            st.dataframe(opt, width='stretch', hide_index=True)
-else:
-    st.warning("No symbols produced valid data. Upload OHLCV files to bypass Yahoo when needed.")
+            st.dataframe(opts, width='stretch', hide_index=True)
