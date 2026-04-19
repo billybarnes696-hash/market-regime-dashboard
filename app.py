@@ -1,132 +1,224 @@
-# liquidity_profiler_batched.py
+# options_liquidity_scanner.py
 import streamlit as st
 import pandas as pd
 import yfinance as yf
 import time
-from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="Liquidity Profiler - Batched (No Rate Limits)")
+st.set_page_config(layout="wide", page_title="Options Liquidity Scanner")
 
-st.title("💧 Liquidity Profiler - Batched Version")
-st.caption("Processes symbols in small batches to avoid Yahoo Finance rate limits")
+st.title("🎯 Options Liquidity Scanner")
+st.caption("Find symbols with liquid options for trading - focuses on options volume, open interest, and bid-ask spreads")
 
 # ============================================================================
-# LIQUIDITY CONFIGURATION
+# OPTIONS LIQUIDITY CONFIGURATION
 # ============================================================================
 
-LIQUIDITY_CONFIG = {
-    "min_avg_volume": 500000,
-    "min_price": 5.00,
-    "min_market_cap_billions": 1.0,
-    "max_spread_pct": 0.02,
-    "include_etfs": True,
-    "etf_min_volume": 1000000,
-    "etf_min_price": 10.00,
+OPTIONS_CONFIG = {
+    # Minimum options volume (sum of puts + calls)
+    "min_options_volume": 5000,      # 5,000 contracts/day minimum
+    "min_open_interest": 10000,      # 10,000 open interest minimum
+    "max_bid_ask_spread": 0.10,      # Max 10% spread (e.g., $0.10 on $1.00 option)
+    "min_near_strike_options": 5,    # At least 5 strikes near the money
+    
+    # Stock liquidity (secondary - affects options liquidity)
+    "min_stock_volume": 500000,      # 500k shares/day (liquid underlying)
+    "min_stock_price": 5.00,         # $5 minimum stock price
+    
+    # Expiration preference
+    "prefer_weekly": True,           # Prefer weekly options over monthly
+    "min_days_to_expiry": 3,         # Minimum 3 days to expiry
+    "max_days_to_expiry": 60,        # Maximum 60 days to expiry (near-term)
 }
 
 # ============================================================================
-# SIDEBAR CONTROLS
+# OPTIONS LIQUIDITY CHECK
 # ============================================================================
 
-with st.sidebar:
-    st.header("⚙️ Settings")
-    batch_size = st.slider("Batch size", 25, 200, 100, help="Smaller batches = slower but fewer rate limit errors")
-    delay_seconds = st.slider("Delay between batches (seconds)", 1, 10, 3, help="Longer delay = safer but slower")
-    resume_from = st.number_input("Resume from row #", 0, 5000, 0, help="Start from a specific row if previous run stopped")
+def get_options_liquidity(symbol: str) -> dict:
+    """Get comprehensive options liquidity metrics"""
     
-    st.header("Liquidity Filters")
-    st.caption(f"Min Volume: {LIQUIDITY_CONFIG['min_avg_volume']:,}")
-    st.caption(f"Min Price: ${LIQUIDITY_CONFIG['min_price']}")
-    st.caption(f"Min Market Cap: ${LIQUIDITY_CONFIG['min_market_cap_billions']}B")
-    st.caption(f"Include ETFs: {LIQUIDITY_CONFIG['include_etfs']}")
-
-# ============================================================================
-# FUNCTIONS
-# ============================================================================
-
-def get_stock_info_batch(symbols: list, batch_num: int, total_batches: int) -> list:
-    """Fetch info for a batch of symbols with rate limit handling"""
-    results = []
+    clean_sym = symbol.strip().upper().replace('/', '-')
     
-    for i, symbol in enumerate(symbols):
+    try:
+        ticker = yf.Ticker(clean_sym)
+        
+        # Get stock info
+        info = ticker.info
+        stock_price = info.get('regularMarketPrice', 0)
+        stock_volume = info.get('averageVolume', 0)
+        
+        # Get available expirations
         try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            
-            avg_volume = info.get('averageVolume', 0)
-            current_price = info.get('regularMarketPrice', 0)
-            market_cap = info.get('marketCap', 0)
-            quote_type = info.get('quoteType', '')
-            
-            bid = info.get('bid', 0)
-            ask = info.get('ask', 0)
-            if bid > 0 and ask > 0:
-                spread_pct = (ask - bid) / ((ask + bid) / 2)
-            else:
-                spread_pct = 0.05
-            
-            is_etf = quote_type == 'ETF'
-            
-            results.append({
+            expirations = list(ticker.options)
+        except:
+            expirations = []
+        
+        if not expirations:
+            return {
                 'symbol': symbol,
-                'price': current_price,
-                'avg_volume': avg_volume,
-                'market_cap_b': market_cap / 1e9 if market_cap else 0,
-                'spread_pct': spread_pct,
-                'is_etf': is_etf,
-                'quote_type': quote_type,
-                'sector': info.get('sector', 'N/A'),
-                'industry': info.get('industry', 'N/A'),
-            })
+                'has_options': False,
+                'error': 'No options chain available'
+            }
+        
+        today = datetime.now()
+        
+        # Analyze each expiration
+        expiration_data = []
+        total_options_volume = 0
+        total_open_interest = 0
+        best_expiration = None
+        best_liquidity_score = 0
+        
+        for exp_date in expirations[:5]:  # Check first 5 expirations
+            exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
+            days_to_expiry = (exp_dt - today).days
             
-            # Small delay between symbols within batch
-            time.sleep(0.05)
+            # Skip too far out or already expired
+            if days_to_expiry < OPTIONS_CONFIG['min_days_to_expiry']:
+                continue
+            if days_to_expiry > OPTIONS_CONFIG['max_days_to_expiry']:
+                continue
             
-        except Exception as e:
-            results.append({
+            try:
+                chain = ticker.option_chain(exp_date)
+                
+                # Analyze calls
+                calls = chain.calls
+                puts = chain.puts
+                
+                if calls is None or puts is None or calls.empty or puts.empty:
+                    continue
+                
+                # Calculate metrics for this expiration
+                calls_volume = calls['volume'].fillna(0).sum()
+                puts_volume = puts['volume'].fillna(0).sum()
+                calls_oi = calls['openInterest'].fillna(0).sum()
+                puts_oi = puts['openInterest'].fillna(0).sum()
+                
+                exp_volume = calls_volume + puts_volume
+                exp_oi = calls_oi + puts_oi
+                
+                # Find strikes near the money
+                near_strikes = calls[
+                    (calls['strike'] >= stock_price * 0.95) & 
+                    (calls['strike'] <= stock_price * 1.05)
+                ]
+                near_strike_count = len(near_strikes)
+                
+                # Calculate average bid-ask spread for ATM options
+                if not near_strikes.empty:
+                    avg_spread = ((near_strikes['ask'] - near_strikes['bid']) / 
+                                  ((near_strikes['ask'] + near_strikes['bid']) / 2)).mean()
+                else:
+                    avg_spread = 1.0
+                
+                # Calculate liquidity score for this expiration
+                liquidity_score = 0
+                liquidity_score += min(40, exp_volume / 10000)  # Volume up to 40 pts
+                liquidity_score += min(30, exp_oi / 20000)      # OI up to 30 pts
+                liquidity_score += min(20, near_strike_count)   # Strikes up to 20 pts
+                liquidity_score += max(0, 10 - (avg_spread * 100))  # Spread up to 10 pts
+                
+                expiration_data.append({
+                    'expiration': exp_date,
+                    'days_to_expiry': days_to_expiry,
+                    'total_volume': exp_volume,
+                    'total_oi': exp_oi,
+                    'near_strike_count': near_strike_count,
+                    'avg_spread': avg_spread,
+                    'liquidity_score': liquidity_score,
+                })
+                
+                total_options_volume += exp_volume
+                total_open_interest += exp_oi
+                
+                if liquidity_score > best_liquidity_score:
+                    best_liquidity_score = liquidity_score
+                    best_expiration = exp_date
+                    
+            except Exception as e:
+                continue
+        
+        if not expiration_data:
+            return {
                 'symbol': symbol,
-                'price': 0,
-                'avg_volume': 0,
-                'market_cap_b': 0,
-                'spread_pct': 1.0,
-                'is_etf': False,
-                'quote_type': 'ERROR',
-                'sector': 'N/A',
-                'industry': 'N/A',
-                'error': str(e)[:50],
-            })
-    
-    return results
+                'has_options': True,
+                'error': 'No liquid options found'
+            }
+        
+        # Get best expiration details
+        best_data = next((e for e in expiration_data if e['expiration'] == best_expiration), expiration_data[0])
+        
+        # Calculate overall liquidity score
+        overall_score = min(100, (
+            min(30, total_options_volume / 20000) +
+            min(25, total_open_interest / 50000) +
+            min(25, best_data['liquidity_score']) +
+            min(20, stock_volume / 2000000)
+        ))
+        
+        return {
+            'symbol': symbol,
+            'has_options': True,
+            'stock_price': stock_price,
+            'stock_volume': stock_volume,
+            'total_options_volume': total_options_volume,
+            'total_open_interest': total_open_interest,
+            'best_expiration': best_expiration,
+            'best_days_to_expiry': best_data['days_to_expiry'],
+            'best_volume': best_data['total_volume'],
+            'best_oi': best_data['total_oi'],
+            'best_near_strikes': best_data['near_strike_count'],
+            'best_spread': best_data['avg_spread'],
+            'liquidity_score': overall_score,
+            'expiration_summary': expiration_data,
+            'error': None,
+        }
+        
+    except Exception as e:
+        return {
+            'symbol': symbol,
+            'has_options': False,
+            'error': str(e)[:100],
+        }
 
 
-def check_liquidity(info: dict) -> tuple:
-    """Check if symbol passes liquidity filters"""
+def is_tradeable_options(metrics: dict) -> tuple:
+    """Check if options are tradeable based on liquidity"""
     
-    if info.get('price', 0) == 0:
-        return False, "No price data"
+    if not metrics.get('has_options', False):
+        return False, "No options available"
     
-    if info['is_etf']:
-        if not LIQUIDITY_CONFIG['include_etfs']:
-            return False, "ETF excluded"
-        if info['avg_volume'] < LIQUIDITY_CONFIG['etf_min_volume']:
-            return False, f"ETF volume too low ({info['avg_volume']:,})"
-        if info['price'] < LIQUIDITY_CONFIG['etf_min_price']:
-            return False, f"ETF price too low (${info['price']:.2f})"
-    else:
-        if info['avg_volume'] < LIQUIDITY_CONFIG['min_avg_volume']:
-            return False, f"Volume too low ({info['avg_volume']:,})"
-        if info['price'] < LIQUIDITY_CONFIG['min_price']:
-            return False, f"Price too low (${info['price']:.2f})"
-        if info['market_cap_b'] < LIQUIDITY_CONFIG['min_market_cap_billions']:
-            return False, f"Market cap too low (${info['market_cap_b']:.1f}B)"
-        if info['spread_pct'] > LIQUIDITY_CONFIG['max_spread_pct']:
-            return False, f"Spread too wide ({info['spread_pct']:.1%})"
+    # Check options volume
+    if metrics.get('total_options_volume', 0) < OPTIONS_CONFIG['min_options_volume']:
+        return False, f"Options volume too low ({metrics['total_options_volume']:,} < {OPTIONS_CONFIG['min_options_volume']:,})"
     
-    return True, "PASS"
+    # Check open interest
+    if metrics.get('total_open_interest', 0) < OPTIONS_CONFIG['min_open_interest']:
+        return False, f"Open interest too low ({metrics['total_open_interest']:,} < {OPTIONS_CONFIG['min_open_interest']:,})"
+    
+    # Check stock volume (liquid underlying)
+    if metrics.get('stock_volume', 0) < OPTIONS_CONFIG['min_stock_volume']:
+        return False, f"Stock volume too low ({metrics['stock_volume']:,} < {OPTIONS_CONFIG['min_stock_volume']:,})"
+    
+    # Check stock price
+    if metrics.get('stock_price', 0) < OPTIONS_CONFIG['min_stock_price']:
+        return False, f"Stock price too low (${metrics['stock_price']:.2f})"
+    
+    # Check bid-ask spread
+    if metrics.get('best_spread', 1.0) > OPTIONS_CONFIG['max_bid_ask_spread']:
+        return False, f"Bid-ask spread too wide ({metrics['best_spread']:.1%})"
+    
+    # Check near-strike options
+    if metrics.get('best_near_strikes', 0) < OPTIONS_CONFIG['min_near_strike_options']:
+        return False, f"Not enough near-strike options ({metrics['best_near_strikes']} < {OPTIONS_CONFIG['min_near_strike_options']})"
+    
+    return True, "TRADEABLE"
+
 
 # ============================================================================
-# MAIN UI
+# STREAMLIT UI
 # ============================================================================
 
 uploaded_file = st.file_uploader("Upload CSV file with 'Symbol' column", type=["csv"])
@@ -138,126 +230,132 @@ if uploaded_file is not None:
         st.error("CSV must contain a 'Symbol' column")
         st.stop()
     
-    all_symbols = df['Symbol'].tolist()
-    total_symbols = len(all_symbols)
+    symbols = df['Symbol'].tolist()
+    total_symbols = len(symbols)
     
     st.write(f"Loaded **{total_symbols}** symbols")
     
-    # Start from resume point
-    start_idx = resume_from
-    symbols_to_process = all_symbols[start_idx:]
-    
-    st.info(f"Starting from row {start_idx} ({len(symbols_to_process)} symbols remaining)")
-    
-    # Calculate batches
-    batches = [symbols_to_process[i:i+batch_size] for i in range(0, len(symbols_to_process), batch_size)]
-    total_batches = len(batches)
-    
-    st.write(f"Will process **{total_batches} batches** of ~{batch_size} symbols each")
-    
-    # Progress tracking
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    all_results = []
-    
-    # Load existing results if resuming
-    if start_idx > 0 and Path("liquidity_results_partial.csv").exists():
-        existing = pd.read_csv("liquidity_results_partial.csv")
-        all_results = existing.to_dict('records')
-        st.info(f"Loaded {len(all_results)} existing results")
-    
-    for batch_num, batch in enumerate(batches):
-        batch_start = start_idx + batch_num * batch_size
-        status_text.text(f"Batch {batch_num+1}/{total_batches} - Symbols {batch_start+1}-{batch_start+len(batch)}")
+    # Filter options
+    with st.expander("⚙️ Options Liquidity Settings"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            min_opt_vol = st.number_input("Min Options Volume", value=OPTIONS_CONFIG['min_options_volume'], step=1000)
+            min_oi = st.number_input("Min Open Interest", value=OPTIONS_CONFIG['min_open_interest'], step=5000)
+        with col2:
+            max_spread = st.number_input("Max Bid-Ask Spread %", value=OPTIONS_CONFIG['max_bid_ask_spread'] * 100, step=1.0) / 100
+            min_strikes = st.number_input("Min Near-Strike Options", value=OPTIONS_CONFIG['min_near_strike_options'], step=1)
+        with col3:
+            min_stock_vol = st.number_input("Min Stock Volume", value=OPTIONS_CONFIG['min_stock_volume'], step=250000)
+            min_stock_price = st.number_input("Min Stock Price", value=OPTIONS_CONFIG['min_stock_price'], step=1.0)
         
-        # Process batch
-        batch_results = get_stock_info_batch(batch, batch_num+1, total_batches)
+        OPTIONS_CONFIG['min_options_volume'] = int(min_opt_vol)
+        OPTIONS_CONFIG['min_open_interest'] = int(min_oi)
+        OPTIONS_CONFIG['max_bid_ask_spread'] = max_spread
+        OPTIONS_CONFIG['min_near_strike_options'] = int(min_strikes)
+        OPTIONS_CONFIG['min_stock_volume'] = int(min_stock_vol)
+        OPTIONS_CONFIG['min_stock_price'] = float(min_stock_price)
+    
+    batch_size = st.slider("Batch size", 10, 100, 30, help="Smaller batches = slower but fewer errors")
+    
+    if st.button("🚀 Scan Options Liquidity", type="primary"):
         
-        # Check liquidity for each
-        for result in batch_results:
-            passed, reason = check_liquidity(result)
-            result['pass'] = passed
-            result['reason'] = reason if not passed else 'PASS'
+        results = []
+        progress_bar = st.progress(0)
         
-        all_results.extend(batch_results)
+        for i, symbol in enumerate(symbols):
+            progress_bar.progress((i + 1) / total_symbols)
+            
+            metrics = get_options_liquidity(symbol)
+            tradeable, reason = is_tradeable_options(metrics)
+            
+            results.append({
+                'symbol': symbol,
+                'tradeable': tradeable,
+                'reason': reason if not tradeable else 'TRADEABLE',
+                'stock_price': metrics.get('stock_price', 0),
+                'stock_volume': metrics.get('stock_volume', 0),
+                'options_volume': metrics.get('total_options_volume', 0),
+                'open_interest': metrics.get('total_open_interest', 0),
+                'best_expiry': metrics.get('best_expiration', 'N/A'),
+                'days_to_expiry': metrics.get('best_days_to_expiry', 0),
+                'near_strikes': metrics.get('best_near_strikes', 0),
+                'bid_ask_spread': metrics.get('best_spread', 0),
+                'liquidity_score': metrics.get('liquidity_score', 0),
+            })
+            
+            # Small delay to avoid rate limits
+            time.sleep(0.1)
         
-        # Save progress after each batch
-        temp_df = pd.DataFrame(all_results)
-        temp_df.to_csv("liquidity_results_partial.csv", index=False)
+        progress_bar.empty()
         
-        # Update progress
-        progress_bar.progress((batch_num + 1) / total_batches)
+        # Create results DataFrame
+        results_df = pd.DataFrame(results)
         
-        # Delay between batches to avoid rate limits
-        if batch_num < total_batches - 1:
-            time.sleep(delay_seconds)
-    
-    status_text.text("Done!")
-    progress_bar.empty()
-    
-    # Create final results DataFrame
-    results_df = pd.DataFrame(all_results)
-    
-    # Display summary
-    st.subheader("📊 Liquidity Filter Results")
-    
-    passed_count = results_df['pass'].sum()
-    failed_count = len(results_df) - passed_count
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Processed", len(results_df))
-    col2.metric("✅ Liquid (Pass)", passed_count, delta=f"{passed_count/len(results_df)*100:.0f}%")
-    col3.metric("❌ Filtered Out", failed_count)
-    
-    # Get liquid symbols
-    liquid_symbols = results_df[results_df['pass'] == True]['symbol'].tolist()
-    
-    st.success(f"**Liquid Symbols ({len(liquid_symbols)}):**")
-    
-    # Display in columns for easy copying
-    cols = st.columns(4)
-    for i, sym in enumerate(liquid_symbols):
-        cols[i % 4].markdown(f"`{sym}`")
-    
-    # Save final liquid symbols file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save as text file (one per line)
-    txt_content = "\n".join(liquid_symbols)
-    st.download_button(
-        label="📥 Download Liquid Symbols (TXT)",
-        data=txt_content,
-        file_name=f"liquid_symbols_{timestamp}.txt",
-        mime="text/plain"
-    )
-    
-    # Also save as CSV for reference
-    liquid_df = results_df[results_df['pass'] == True].copy()
-    csv_data = liquid_df.to_csv(index=False)
-    st.download_button(
-        label="📥 Download Detailed Results (CSV)",
-        data=csv_data,
-        file_name=f"liquidity_results_{timestamp}.csv",
-        mime="text/csv"
-    )
-    
-    # Show filtered out symbols
-    with st.expander(f"❌ Filtered out symbols ({len(results_df[results_df['pass'] == False])})"):
-        failed_df = results_df[results_df['pass'] == False][['symbol', 'reason', 'price', 'avg_volume']]
-        st.dataframe(failed_df, width='stretch', use_container_width=True)
-    
-    # Clean up partial file
-    Path("liquidity_results_partial.csv").unlink(missing_ok=True)
-    
+        # Filter tradeable options
+        tradeable_df = results_df[results_df['tradeable'] == True].copy()
+        untradeable_df = results_df[results_df['tradeable'] == False].copy()
+        
+        # Display summary
+        st.subheader("📊 Options Liquidity Scan Results")
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Symbols Scanned", len(results_df))
+        col2.metric("✅ Tradeable Options", len(tradeable_df), delta=f"{len(tradeable_df)/len(results_df)*100:.0f}%")
+        col3.metric("❌ Not Tradeable", len(untradeable_df))
+        
+        # Sort by liquidity score
+        tradeable_df = tradeable_df.sort_values('liquidity_score', ascending=False)
+        
+        # Format display
+        display_df = tradeable_df.copy()
+        display_df['stock_price'] = display_df['stock_price'].apply(lambda x: f"${x:.2f}")
+        display_df['stock_volume'] = display_df['stock_volume'].apply(lambda x: f"{x:,.0f}")
+        display_df['options_volume'] = display_df['options_volume'].apply(lambda x: f"{x:,.0f}")
+        display_df['open_interest'] = display_df['open_interest'].apply(lambda x: f"{x:,.0f}")
+        display_df['bid_ask_spread'] = display_df['bid_ask_spread'].apply(lambda x: f"{x:.2%}")
+        display_df['liquidity_score'] = display_df['liquidity_score'].apply(lambda x: f"{x:.0f}")
+        
+        st.subheader(f"🏆 Tradeable Options ({len(tradeable_df)})")
+        st.dataframe(display_df, width='stretch', use_container_width=True)
+        
+        # Download results
+        if not tradeable_df.empty:
+            st.download_button(
+                "📥 Download Tradeable Options List",
+                "\n".join(tradeable_df['symbol'].tolist()),
+                f"tradeable_options_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                "text/plain"
+            )
+        
+        # Show untradeable
+        with st.expander(f"❌ Not Tradeable ({len(untradeable_df)})"):
+            st.dataframe(untradeable_df[['symbol', 'reason', 'options_volume', 'open_interest']].head(30), width='stretch')
+
 else:
     st.info("👈 Upload a CSV file with a 'Symbol' column")
-    st.markdown("""
-    ### How to use:
-    1. Upload your CSV with stock/ETF symbols
-    2. Adjust batch size (100 is safe, 50 is safer)
-    3. Click 'Run' and wait
-    4. Download the liquid symbols list
     
-    **The batched approach avoids Yahoo Finance rate limits**
+    st.markdown("""
+    ### 🎯 Options Liquidity Metrics
+    
+    This scanner focuses on what matters for options trading:
+    
+    | Metric | Why It Matters |
+    |--------|----------------|
+    | **Options Volume** | Can you get in and out? |
+    | **Open Interest** | Is there liquidity at your strike? |
+    | **Bid-Ask Spread** | What's your actual trading cost? |
+    | **Near-Strike Options** | Can you trade ATM/OTM? |
+    | **Stock Volume** | Liquid underlying = better options |
+    | **Days to Expiry** | Time decay considerations |
+    
+    **Good options liquidity means:**
+    - Tight bid-ask spreads (< 10%)
+    - High volume (> 5,000 contracts/day)
+    - High open interest (> 10,000)
+    - Multiple strikes near the money
+    
+    **Examples of highly liquid options:**
+    - SPY, QQQ, IWM (index ETFs)
+    - AAPL, MSFT, NVDA (mega-cap tech)
+    - TSLA, AMD, META (high volatility names)
     """)
