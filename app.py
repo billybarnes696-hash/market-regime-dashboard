@@ -356,38 +356,81 @@ def merge_history_with_recent(base_df: pd.DataFrame, recent_df: pd.DataFrame) ->
     return merged
 
 
-def fetch_daily_history_with_priority(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int) -> Tuple[pd.DataFrame, str]:
+def fetch_daily_history_with_priority(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int) -> Tuple[pd.DataFrame, str, Dict[str, str]]:
     tkr = ticker.upper()
-    if tkr in uploaded_history and not uploaded_history[tkr].empty:
-        base = uploaded_history[tkr].copy()
-        recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
-        merged = merge_history_with_recent(base, recent)
-        source = "upload+yahoo_gap" if len(merged) > len(base) else "upload"
-        return merged, source
+    fetch_meta = {
+        "upload_status": "not_checked",
+        "defeat_status": "not_checked",
+        "yahoo_status": "not_checked",
+    }
+
+    if tkr in uploaded_history:
+        base = uploaded_history.get(tkr, pd.DataFrame())
+        if base is not None and not base.empty:
+            fetch_meta["upload_status"] = f"matched:{len(base)}"
+            recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
+            fetch_meta["yahoo_status"] = "gap_ok" if recent is not None and not recent.empty else "gap_empty"
+            merged = merge_history_with_recent(base, recent)
+            source = "upload+yahoo_gap" if recent is not None and not recent.empty and len(merged) > len(base) else "upload"
+            fetch_meta["daily_rows"] = str(len(merged))
+            return merged, source, fetch_meta
+        fetch_meta["upload_status"] = "matched_empty"
+    else:
+        fetch_meta["upload_status"] = "not_matched"
+
     defeat_df = fetch_defeat_history(tkr, years=max(years, 5))
-    if not defeat_df.empty:
+    if defeat_df is not None and not defeat_df.empty:
+        fetch_meta["defeat_status"] = f"ok:{len(defeat_df)}"
         recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
+        fetch_meta["yahoo_status"] = "gap_ok" if recent is not None and not recent.empty else "gap_empty"
         merged = merge_history_with_recent(defeat_df, recent)
-        source = "defeatbeta+yahoo_gap" if len(merged) > len(defeat_df) else "defeatbeta"
-        return merged, source
+        source = "defeatbeta+yahoo_gap" if recent is not None and not recent.empty and len(merged) > len(defeat_df) else "defeatbeta"
+        fetch_meta["daily_rows"] = str(len(merged))
+        return merged, source, fetch_meta
+    fetch_meta["defeat_status"] = "empty"
+
     yahoo_df = fetch_yahoo_prices(tkr, "1d", period=f"{max(years, 5)}y")
-    if not yahoo_df.empty:
-        return yahoo_df, "yahoo_only"
-    return pd.DataFrame(), "none"
+    if yahoo_df is not None and not yahoo_df.empty:
+        fetch_meta["yahoo_status"] = f"ok:{len(yahoo_df)}"
+        fetch_meta["daily_rows"] = str(len(yahoo_df))
+        return yahoo_df, "yahoo_only", fetch_meta
+
+    fetch_meta["yahoo_status"] = "empty_or_rate_limited"
+    fetch_meta["daily_rows"] = "0"
+    return pd.DataFrame(), "none", fetch_meta
 
 
 def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int) -> Dict[str, pd.DataFrame]:
-    daily, history_source = fetch_daily_history_with_priority(ticker, uploaded_history, years)
+    daily, history_source, fetch_meta = fetch_daily_history_with_priority(ticker, uploaded_history, years)
     hourly = fetch_yahoo_prices(ticker, "1h", period="60d")
     degraded = False
     if daily.empty:
-        return {"hourly": pd.DataFrame(), "daily": pd.DataFrame(), "weekly": pd.DataFrame(), "history_source": history_source, "degraded_hourly": True}
-    if hourly.empty:
+        fetch_meta["hourly_status"] = "skipped_no_daily"
+        return {
+            "hourly": pd.DataFrame(),
+            "daily": pd.DataFrame(),
+            "weekly": pd.DataFrame(),
+            "history_source": history_source,
+            "degraded_hourly": True,
+            "fetch_meta": fetch_meta,
+        }
+    if hourly is None or hourly.empty:
         degraded = True
+        fetch_meta["hourly_status"] = "empty_or_rate_limited_using_daily_fallback"
         # Degraded placeholder, not true hourly timing
         hourly = resample_ohlcv(daily.tail(120), "B")
+    else:
+        fetch_meta["hourly_status"] = f"ok:{len(hourly)}"
     weekly = resample_ohlcv(daily, "W-FRI")
-    return {"hourly": hourly, "daily": daily, "weekly": weekly, "history_source": history_source, "degraded_hourly": degraded}
+    fetch_meta["weekly_rows"] = str(len(weekly))
+    return {
+        "hourly": hourly,
+        "daily": daily,
+        "weekly": weekly,
+        "history_source": history_source,
+        "degraded_hourly": degraded,
+        "fetch_meta": fetch_meta,
+    }
 
 
 def centered_pct(series: pd.Series) -> pd.Series:
@@ -729,9 +772,11 @@ if not symbols:
     st.error("Provide at least one symbol via paste/watchlist or upload OHLCV files named by ticker.")
     st.stop()
 
-benchmark_daily, _ = fetch_daily_history_with_priority(benchmark, uploaded_history_map, history_years)
+benchmark_daily, _, benchmark_fetch_meta = fetch_daily_history_with_priority(benchmark, uploaded_history_map, history_years)
 if benchmark_daily.empty:
     benchmark_daily = fetch_yahoo_prices(benchmark, "1d", period=f"{max(history_years, 5)}y")
+
+st.caption(f"Benchmark fetch: source={benchmark_fetch_meta.get('upload_status','n/a')}/{benchmark_fetch_meta.get('defeat_status','n/a')}/{benchmark_fetch_meta.get('yahoo_status','n/a')} | rows={benchmark_fetch_meta.get('daily_rows','0')}")
 
 results: List[Dict[str, object]] = []
 detail_data: Dict[str, Dict[str, object]] = {}
@@ -744,7 +789,17 @@ for idx, symbol in enumerate(symbols):
     hourly_df = data["hourly"]
     weekly_df = data["weekly"]
     if daily_df.empty:
-        results.append({"Symbol": symbol, "Status": "No data", "History Source": data["history_source"]})
+        meta = data.get("fetch_meta", {})
+        results.append({
+            "Symbol": symbol,
+            "Status": "No data",
+            "History Source": data["history_source"],
+            "Upload": meta.get("upload_status", "n/a"),
+            "DefeatBeta": meta.get("defeat_status", "n/a"),
+            "Yahoo Daily": meta.get("yahoo_status", "n/a"),
+            "Hourly Source": meta.get("hourly_status", "n/a"),
+            "Fetch Detail": f"upload={meta.get('upload_status','n/a')} | defeat={meta.get('defeat_status','n/a')} | yahoo={meta.get('yahoo_status','n/a')}",
+        })
         continue
 
     daily_df = add_forward_returns(enrich_price_features(daily_df, "daily", benchmark_daily))
@@ -768,11 +823,16 @@ for idx, symbol in enumerate(symbols):
     combined_call, combined_reason = combine_calls(hourly_call, daily_call, weekly_call, flags, daily_analog_summary, hourly_analog_summary)
     sim_paths, mc_summary = monte_carlo_from_analogs(daily_analogs, 5, mc_sims)
 
+    meta = data.get("fetch_meta", {})
     results.append({
         "Symbol": symbol,
         "Status": "OK",
         "History Source": data["history_source"],
+        "Upload": meta.get("upload_status", "n/a"),
+        "DefeatBeta": meta.get("defeat_status", "n/a"),
+        "Yahoo Daily": meta.get("yahoo_status", "n/a"),
         "Hourly Source": "degraded fallback" if data["degraded_hourly"] else "Yahoo",
+        "Fetch Detail": f"upload={meta.get('upload_status','n/a')} | defeat={meta.get('defeat_status','n/a')} | yahoo={meta.get('yahoo_status','n/a')} | hourly={meta.get('hourly_status','n/a')}",
         "Hourly Call": hourly_call,
         "Daily Call": daily_call,
         "Weekly Call": weekly_call,
@@ -805,6 +865,7 @@ for idx, symbol in enumerate(symbols):
         "mc_summary": mc_summary,
         "history_source": data["history_source"],
         "degraded_hourly": data["degraded_hourly"],
+        "fetch_meta": data.get("fetch_meta", {}),
     }
 
 progress.empty()
@@ -845,6 +906,7 @@ if valid_symbols:
     if data["degraded_hourly"]:
         st.warning("Hourly data is degraded fallback from daily bars. Do not trust timing signals until Yahoo hourly is available.")
     st.caption(f"History source: {data['history_source']}")
+    st.caption(f"Fetch detail: {data.get('fetch_meta', {})}")
 
     flags_df = pd.DataFrame([{"Flag": k, "Detected": v} for k, v in data["flags"].items()])
     st.dataframe(flags_df, width='stretch', hide_index=True)
