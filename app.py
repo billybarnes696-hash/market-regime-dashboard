@@ -1,6 +1,6 @@
 """
 Stock Analyzer Ultimate v1.0
-Merged from: Diamond Scanner Pro + Predictive Trading Analysis Engine
+Merged from: Baller express
 
 Features:
 - Multi-timeframe (hourly/daily/weekly)
