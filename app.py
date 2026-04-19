@@ -954,9 +954,24 @@ if valid_symbols:
     analysis_ts = pd.Timestamp(analysis_date)
     analysis_ts_end = analysis_ts + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
 
-    daily_view = data["daily"].loc[data["daily"].index <= analysis_ts].copy()
-    weekly_view = data["weekly"].loc[data["weekly"].index <= analysis_ts].copy()
-    hourly_view = data["hourly"].loc[data["hourly"].index <= analysis_ts_end].copy()
+    def _align_ts_for_index(idx, ts):
+        if not isinstance(idx, pd.DatetimeIndex):
+            return ts
+        if idx.tz is not None:
+            if getattr(ts, "tzinfo", None) is None:
+                return ts.tz_localize(idx.tz)
+            return ts.tz_convert(idx.tz)
+        if getattr(ts, "tzinfo", None) is not None:
+            return ts.tz_localize(None)
+        return ts
+
+    analysis_ts_daily = _align_ts_for_index(data["daily"].index, analysis_ts)
+    analysis_ts_weekly = _align_ts_for_index(data["weekly"].index, analysis_ts)
+    analysis_ts_hourly_end = _align_ts_for_index(data["hourly"].index, analysis_ts_end)
+
+    daily_view = data["daily"].loc[data["daily"].index <= analysis_ts_daily].copy()
+    weekly_view = data["weekly"].loc[data["weekly"].index <= analysis_ts_weekly].copy()
+    hourly_view = data["hourly"].loc[data["hourly"].index <= analysis_ts_hourly_end].copy()
 
     if daily_view.empty:
         st.warning("No data available for the selected calendar date.")
