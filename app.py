@@ -400,13 +400,25 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
         "daily": (8, 21, 7),
         "weekly": (5, 13, 5),
     }
+
+    def pct_col(name: str) -> pd.Series:
+        if name in out.columns:
+            return centered_pct(out[name])
+        return pd.Series(0.0, index=out.index, dtype=float)
+
     fast, slow, sig = spans[timeframe_name]
-    stretch = 0.18 * centered_pct(out["rsi_14_pctile"]) + 0.18 * centered_pct(out["cci_20_pctile"]) + 0.14 * centered_pct(out["pct_b_pctile"]) + 0.12 * centered_pct(out["atr_stretch_pctile"]) + 0.10 * centered_pct(out["dist_ema20_pctile"])
-    momentum = 0.20 * centered_pct(out["tsi_pctile"]) + 0.08 * np.tanh(out["price_slope_3"].fillna(0) * 25)
+    stretch = (
+        0.18 * pct_col("rsi_14_pctile")
+        + 0.18 * pct_col("cci_20_pctile")
+        + 0.14 * pct_col("pct_b_pctile")
+        + 0.12 * pct_col("atr_stretch_pctile")
+        + 0.10 * pct_col("dist_ema20_pctile")
+    )
+    momentum = 0.20 * pct_col("tsi_pctile") + 0.08 * np.tanh(out["price_slope_3"].fillna(0) * 25)
     rs_part = 0.10 * np.tanh(out["rs_bench_slope_5"].fillna(0) * 25)
-    quality = 1 + 0.15 * centered_pct(out["adx_14_pctile"])
+    quality = 1 + 0.15 * pct_col("adx_14_pctile")
     if "dist_vwap_pctile" in out.columns:
-        stretch = stretch + 0.10 * centered_pct(out["dist_vwap_pctile"])
+        stretch = stretch + 0.10 * centered_pct(out["dist_vwap_pctile"].fillna(0.5))
     out["uo_base"] = (stretch + momentum + rs_part) * quality
     out["uo"] = ema(out["uo_base"], fast) - ema(out["uo_base"], slow)
     out["uo_signal"] = ema(out["uo"], sig)
