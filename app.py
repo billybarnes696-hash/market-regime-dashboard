@@ -36,6 +36,12 @@ FEATURE_COLS = [
     "is_hot", "is_cold", "is_fading_stack", "is_repairing_stack",
 ]
 
+REGIME_COLS = [
+    "mkt_above_ema20", "mkt_tsi_747", "mkt_tsi_state_code", "mkt_stretch_atr",
+    "mkt_cci15", "mkt_hot", "mkt_fading", "high_vol_regime", "low_vol_regime",
+    "leadership_regime", "risk_on_regime",
+]
+
 STATE_CODE_MAP = {
     "below_zero": 0,
     "bull_repair": 1,
@@ -331,6 +337,46 @@ def build_features(df: pd.DataFrame, bench: Optional[pd.Series]) -> pd.DataFrame
         out["RS_SLOPE_10"] = 0.0
         out["RS_divergence"] = 0
 
+    # Market / regime context from benchmark proxy
+    if bench is not None and not bench.empty:
+        bclose = bench.reindex(out.index).ffill()
+        bdf = pd.DataFrame({"close": bclose})
+        bdf["SMA20"] = bdf["close"].rolling(20).mean()
+        bdf["ATR14"] = (bdf["close"].diff().abs()).rolling(14).mean()
+        bdf["stretch_atr"] = (bdf["close"] - bdf["SMA20"]) / bdf["ATR14"].replace(0, np.nan)
+        bdf["CCI15"] = ((bdf["close"] - bdf["close"].rolling(15).mean()) / (0.015 * (bdf["close"] - bdf["close"].rolling(15).mean()).abs().rolling(15).mean().replace(0, np.nan)))
+        bdf["TSI_747"], bdf["TSI_747_sig"] = tsi(bdf["close"], 7, 4, 7)
+        bdf["TSI_747_slope_1"] = bdf["TSI_747"].diff(1)
+        bdf["pinned_747"] = count_consecutive((bdf["TSI_747"] >= 85) & (bdf["TSI_747"].diff().abs() <= 1.0))
+        mkt_state = []
+        for _, row in bdf.iterrows():
+            mkt_state.append(classify_tsi_state(row.get("TSI_747"), row.get("TSI_747_sig"), row.get("TSI_747_slope_1"), int(row.get("pinned_747", 0)) if pd.notna(row.get("pinned_747", 0)) else 0))
+        out["mkt_tsi_747"] = bdf["TSI_747"]
+        out["mkt_tsi_state_code"] = pd.Series(mkt_state, index=out.index).map(STATE_CODE_MAP).fillna(0)
+        out["mkt_above_ema20"] = (bclose > bclose.ewm(span=20, adjust=False).mean()).astype(int)
+        out["mkt_stretch_atr"] = bdf["stretch_atr"].fillna(0)
+        out["mkt_cci15"] = bdf["CCI15"].fillna(0)
+        out["mkt_hot"] = ((bdf["TSI_747"] > 70) & (bdf["stretch_atr"] > 1.5)).astype(int)
+        out["mkt_fading"] = (((bdf["TSI_747"] > 60) & (bdf["TSI_747_slope_1"] <= 0)) | (bdf["CCI15"].diff() < 0)).astype(int)
+        out["leadership_regime"] = (out["RS_SLOPE_5"].fillna(0) > 0).astype(int)
+        out["risk_on_regime"] = ((out["RS_SLOPE_5"].fillna(0) > 0) & (out["mkt_above_ema20"] == 1)).astype(int)
+    else:
+        for col, default in {
+            "mkt_tsi_747": 0.0,
+            "mkt_tsi_state_code": 0,
+            "mkt_above_ema20": 0,
+            "mkt_stretch_atr": 0.0,
+            "mkt_cci15": 0.0,
+            "mkt_hot": 0,
+            "mkt_fading": 0,
+            "leadership_regime": 0,
+            "risk_on_regime": 0,
+        }.items():
+            out[col] = default
+
+    out["high_vol_regime"] = (out["ATR_pct"] >= 0.75).astype(int)
+    out["low_vol_regime"] = (out["ATR_pct"] <= 0.25).astype(int)
+
     for tcol, pcol, scol, codecol in [
         ("TSI_424", "pinned_424", "state_424", "state_424_code"),
         ("TSI_747", "pinned_747", "state_747", "state_747_code"),
@@ -462,10 +508,21 @@ def find_analogs(hist_df: pd.DataFrame, current_row: pd.Series, n: int = 30, exc
         "RS_SLOPE_10": 0.0,
         "ADX14": 0.0,
         "ADX14_slope_3": 0.0,
+        "mkt_tsi_747": 0.0,
+        "mkt_tsi_state_code": 0,
+        "mkt_above_ema20": 0,
+        "mkt_stretch_atr": 0.0,
+        "mkt_cci15": 0.0,
+        "mkt_hot": 0,
+        "mkt_fading": 0,
+        "high_vol_regime": 0,
+        "low_vol_regime": 0,
+        "leadership_regime": 0,
+        "risk_on_regime": 0,
     }.items():
         if col in working.columns:
             working[col] = working[col].fillna(default)
-    base = working.dropna(subset=FEATURE_COLS + ["ret1", "ret2", "ret5"]).copy()
+    base = working.dropna(subset=FEATURE_COLS + REGIME_COLS + ["ret1", "ret2", "ret5"]).copy()
     if len(base) < 100:
         return pd.DataFrame()
     if current_row.name in base.index:
@@ -477,6 +534,18 @@ def find_analogs(hist_df: pd.DataFrame, current_row: pd.Series, n: int = 30, exc
         pool = base.iloc[:-exclusion_gap].copy()
     if pool.empty:
         return pd.DataFrame()
+
+    # Regime-aware filtering: narrow analog pool to similar tape first.
+    same_state = pool[pool["mkt_tsi_state_code"] == current_row.get("mkt_tsi_state_code", 0)].copy()
+    if len(same_state) >= max(40, n * 3):
+        pool = same_state
+    same_hotfade = pool[(pool["mkt_hot"] == current_row.get("mkt_hot", 0)) & (pool["mkt_fading"] == current_row.get("mkt_fading", 0))].copy()
+    if len(same_hotfade) >= max(30, n * 2):
+        pool = same_hotfade
+    same_vol = pool[(pool["high_vol_regime"] == current_row.get("high_vol_regime", 0)) & (pool["low_vol_regime"] == current_row.get("low_vol_regime", 0))].copy()
+    if len(same_vol) >= max(25, int(n * 1.5)):
+        pool = same_vol
+
     X = pool[FEATURE_COLS]
     cur_df = pd.DataFrame([current_row[FEATURE_COLS]], columns=FEATURE_COLS)
     scaler = StandardScaler()
@@ -484,15 +553,31 @@ def find_analogs(hist_df: pd.DataFrame, current_row: pd.Series, n: int = 30, exc
     cur_scaled = scaler.transform(cur_df)
     dist = cdist(cur_scaled, X_scaled)[0]
     pool["distance"] = dist
+
+    # Regime penalties keep analogs inside a similar tape even when feature distances are close.
+    pool["regime_penalty"] = (
+        (pool["mkt_tsi_state_code"] != current_row.get("mkt_tsi_state_code", 0)).astype(float) * 0.50
+        + (pool["mkt_hot"] != current_row.get("mkt_hot", 0)).astype(float) * 0.30
+        + (pool["mkt_fading"] != current_row.get("mkt_fading", 0)).astype(float) * 0.35
+        + (pool["high_vol_regime"] != current_row.get("high_vol_regime", 0)).astype(float) * 0.25
+        + (pool["leadership_regime"] != current_row.get("leadership_regime", 0)).astype(float) * 0.20
+        + ((pool["mkt_stretch_atr"] - float(current_row.get("mkt_stretch_atr", 0))) .abs() > 1.0).astype(float) * 0.15
+    )
     pool["state_penalty"] = (
         (pool["state_424_code"] != current_row["state_424_code"]).astype(float) * 0.15
         + (pool["state_747_code"] != current_row["state_747_code"]).astype(float) * 0.35
         + (pool["state_1377_code"] != current_row["state_1377_code"]).astype(float) * 0.20
-        + (pool["state_25137_code"] != current_row["state_25137_code"]).astype(float) * 0.10
         + (pool["is_bear_kiss"] != current_row["is_bear_kiss"]).astype(float) * 0.20
         + (pool["is_bull_kiss"] != current_row["is_bull_kiss"]).astype(float) * 0.20
     )
-    pool["total_distance"] = pool["distance"] + pool["state_penalty"]
+    # Slight recency boost: more recent analogs tend to be more useful for short-horizon options timing.
+    if isinstance(pool.index, pd.DatetimeIndex) and hasattr(current_row.name, 'to_pydatetime'):
+        age_days = (pd.Timestamp(current_row.name) - pool.index).days.clip(lower=1)
+        pool["recency_penalty"] = np.clip(age_days / 2520.0, 0, 0.20)
+    else:
+        pool["recency_penalty"] = 0.0
+
+    pool["total_distance"] = pool["distance"] + pool["state_penalty"] + pool["regime_penalty"] + pool["recency_penalty"]
     analogs = pool.nsmallest(n, "total_distance").copy()
     analogs["similarity"] = 1 / (1 + analogs["total_distance"])
     return analogs
@@ -664,7 +749,13 @@ def why_text(row: pd.Series) -> str:
         reasons.append("RS firming")
     if row.get("TSI_25137_slope_3", 0) <= 0.5:
         reasons.append("25,13,7 flattening")
-    return ", ".join(reasons[:6]) if reasons else "No stacked trigger yet"
+    if row.get("mkt_hot", 0):
+        reasons.append("market hot")
+    if row.get("mkt_fading", 0):
+        reasons.append("market fading")
+    if row.get("high_vol_regime", 0):
+        reasons.append("high vol regime")
+    return ", ".join(reasons[:7]) if reasons else "No stacked trigger yet"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -806,11 +897,30 @@ def scan_symbol(symbol: str, current_row: pd.Series, hist_feat: pd.DataFrame, an
         "State": setup_label(current_row),
         "Why": why_text(current_row),
         "Expected Move %": round(expected_move_pct(current_row) * 100, 2) if pd.notna(expected_move_pct(current_row)) else np.nan,
+        "Market Regime": regime_label(current_row),
         "Bull Reasons": bull_reasons,
         "Bear Reasons": bear_reasons,
         "Row Date": str(current_row.name.date()) if hasattr(current_row.name, "date") else str(current_row.name),
     }
     return detail, analogs
+
+
+
+def regime_label(row: pd.Series) -> str:
+    parts = []
+    if row.get("mkt_hot", 0):
+        parts.append("Market hot")
+    elif row.get("mkt_fading", 0):
+        parts.append("Market fading")
+    else:
+        parts.append("Market neutral")
+    if row.get("high_vol_regime", 0):
+        parts.append("high vol")
+    elif row.get("low_vol_regime", 0):
+        parts.append("low vol")
+    if row.get("leadership_regime", 0):
+        parts.append("RS leading")
+    return " | ".join(parts)
 
 
 st.title("🔍 Diamond Scanner Pro")
@@ -915,7 +1025,7 @@ if results is None or results.empty:
     st.stop()
 
 st.subheader("🏆 Ranked Setups")
-display_cols = ["symbol", "Signal", "Option Type", "Confidence", "Position Size %", "Bull Score", "Bear Score", "RipProb_1d", "RipProb_2d", "RipProb_5d", "DipProb_1d", "DipProb_2d", "DipProb_5d", "TSI_424", "TSI_747", "CCI15", "MFI14", "BBP", "StretchATR", "Expected Move %", "Bull Kiss", "Bear Kiss", "State", "Why", "Row Date"]
+display_cols = ["symbol", "Signal", "Option Type", "Confidence", "Position Size %", "Bull Score", "Bear Score", "RipProb_1d", "RipProb_2d", "RipProb_5d", "DipProb_1d", "DipProb_2d", "DipProb_5d", "TSI_424", "TSI_747", "CCI15", "MFI14", "BBP", "StretchATR", "Expected Move %", "Market Regime", "Bull Kiss", "Bear Kiss", "State", "Why", "Row Date"]
 display_cols = [c for c in display_cols if c in results.columns]
 st.dataframe(results[display_cols], width="stretch")
 
@@ -949,6 +1059,7 @@ if selected:
         st.markdown("**🔴 Bearish reasons**")
         for r in detail["Bear Reasons"]:
             st.write(f"⚠️ {r}")
+    st.markdown(f"**Market Regime:** {detail['Market Regime']}")
     st.markdown(f"**Why:** {detail['Why']}")
     st.write(f"Expected move: **{detail.get('Expected Move %', np.nan):.2f}%** | Suggested size: **{detail.get('Position Size %', np.nan):.1f}%** of max risk budget")
     option_type = detail["Option Type"]
