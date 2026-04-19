@@ -1,9 +1,8 @@
-# diamond_scanner_enhanced.py
 import hashlib
-import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -17,31 +16,24 @@ try:
 except Exception:
     from defeatbeta_api.data.ticker import Ticker
 
-st.set_page_config(layout="wide", page_title="Diamond Scanner - Enhanced")
+st.set_page_config(layout="wide", page_title="Diamond Scanner Pro")
 
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# ============================================================================
-# FEATURE COLUMNS
-# ============================================================================
-
 FEATURE_COLS = [
-    "TSI_424", "TSI_424_minus_sig", "TSI_424_slope_1", "TSI_424_slope_3",
-    "TSI_747", "TSI_747_minus_sig", "TSI_747_slope_1", "TSI_747_slope_3",
-    "TSI_1377", "TSI_1377_minus_sig", "TSI_1377_slope_1", "TSI_1377_slope_3",
-    "TSI_25137", "TSI_25137_minus_sig", "TSI_25137_slope_1", "TSI_25137_slope_3",
-    "CCI15", "CCI20", "CCI15_days_fading", "CCI20_days_fading",
+    "TSI_424", "TSI_424_slope_1", "TSI_747", "TSI_747_slope_3", "pinned_424",
+    "CCI15", "CCI15_days_fading", "CCI_divergence",
     "BBP", "BBP_delta_1", "BBP_days_falling",
-    "RSI14", "RSI14_slope_3",
-    "EXT_SMA10", "EXT_SMA20", "EXT_VWAP",
-    "RS_SLOPE_5", "RS_SLOPE_10",
-    "candle_score", "candle_close_loc", "upper_wick_pct", "body_pct",
-    "pinned_424", "pinned_747", "pinned_1377", "pinned_25137",
-    "state_424_code", "state_747_code", "state_1377_code", "state_25137_code",
-    "is_bear_kiss", "is_hot", "is_ripping", "is_fading_stack", "bear_kiss_score",
-    "bull_kiss_score", "is_bull_kiss",
+    "EXT_VWAP", "VWAP_slope", "VWAP_stall",
+    "stretch_ATR", "ATR14", "ATR_pct",
+    "RSI14", "RSI14_slope_3", "RSI_divergence",
+    "MFI14", "MFI14_slope", "MFI_divergence",
+    "RS_SLOPE_5", "RS_SLOPE_10", "RS_divergence",
     "ADX14", "ADX14_slope_3",
+    "state_424_code", "state_747_code", "state_1377_code",
+    "bear_kiss_score", "bull_kiss_score", "is_bear_kiss", "is_bull_kiss",
+    "is_hot", "is_cold", "is_fading_stack", "is_repairing_stack",
 ]
 
 STATE_CODE_MAP = {
@@ -52,22 +44,30 @@ STATE_CODE_MAP = {
     "pinned": 4,
     "bear_kiss": 5,
     "rolling": 6,
+    "oversold": 7,
 }
 
-# ============================================================================
-# INDICATOR FUNCTIONS
-# ============================================================================
+for key, default in {
+    "scan_results": None,
+    "debug_rows": [],
+    "detail_rows": {},
+    "analogs_map": {},
+    "live_rows_map": {},
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
 
 def tsi(series: pd.Series, r: int, s: int, signal: int = 7) -> Tuple[pd.Series, pd.Series]:
-    m = series.diff()
-    ema1 = m.ewm(span=r, adjust=False).mean()
+    mom = series.diff()
+    ema1 = mom.ewm(span=r, adjust=False).mean()
     ema2 = ema1.ewm(span=s, adjust=False).mean()
-    abs_m = m.abs()
-    ema3 = abs_m.ewm(span=r, adjust=False).mean()
+    abs_mom = mom.abs()
+    ema3 = abs_mom.ewm(span=r, adjust=False).mean()
     ema4 = ema3.ewm(span=s, adjust=False).mean()
     tsi_val = 100 * ema2 / ema4.replace(0, np.nan)
-    sig = tsi_val.ewm(span=signal, adjust=False).mean()
-    return tsi_val, sig
+    tsi_sig = tsi_val.ewm(span=signal, adjust=False).mean()
+    return tsi_val, tsi_sig
 
 
 def cci(df: pd.DataFrame, n: int = 20) -> pd.Series:
@@ -104,6 +104,26 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+
+def mfi(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    rmf = tp * df["volume"].fillna(0)
+    pos = rmf.where(tp > tp.shift(1), 0.0)
+    neg = rmf.where(tp < tp.shift(1), 0.0)
+    pos_sum = pos.rolling(n).sum()
+    neg_sum = neg.rolling(n).sum().replace(0, np.nan)
+    mfr = pos_sum / neg_sum
+    return 100 - (100 / (1 + mfr))
+
+
 def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     high = df["high"]
     low = df["low"]
@@ -124,112 +144,26 @@ def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
 def count_consecutive(cond: pd.Series) -> pd.Series:
     out = np.zeros(len(cond), dtype=int)
     count = 0
-    vals = cond.fillna(False).astype(bool).tolist()
-    for i, ok in enumerate(vals):
+    for i, ok in enumerate(cond.fillna(False).astype(bool).tolist()):
         count = count + 1 if ok else 0
         out[i] = count
     return pd.Series(out, index=cond.index)
 
-
-# ============================================================================
-# BULL / BEAR SIGNAL DETECTION
-# ============================================================================
-
-def calculate_bull_score(row: pd.Series) -> Tuple[float, List[str]]:
-    score = 0.0
-    reasons = []
-    
-    if row.get("TSI_747", 0) > 70 and row.get("TSI_747_slope_1", 0) > 0:
-        score += 2.0
-        reasons.append("TSI_747 bullish trending")
-    if row.get("TSI_747_bull_kiss", 0):
-        score += 3.0
-        reasons.append("TSI_747 bull kiss")
-    if row.get("TSI_424", 0) > 95 and row.get("TSI_424_slope_1", 0) > 0:
-        score += 2.0
-        reasons.append("TSI_424 pinned bullish")
-    if row.get("RSI14", 0) < 30:
-        score += 2.0
-        reasons.append("RSI oversold")
-    if 30 < row.get("RSI14", 0) < 40 and row.get("RSI14_slope_3", 0) > 0:
-        score += 2.0
-        reasons.append("RSI recovering")
-    if row.get("CCI15", 0) < -100:
-        score += 2.0
-        reasons.append("CCI extreme oversold")
-    if row.get("BBP", 0) < 0:
-        score += 2.0
-        reasons.append("BB% below lower band")
-    if row.get("candle_score", 0) >= 68:
-        score += 1.0
-        reasons.append("strong rejection candle")
-    if row.get("bear_kiss_score", 0) < 5:
-        score += 1.0
-        reasons.append("no bear kiss pressure")
-    if row.get("bull_kiss_score", 0) >= 2:
-        score += 2.0
-        reasons.append(f"{int(row['bull_kiss_score'])}x bull kiss")
-    
-    return min(score, 10.0), reasons[:5]
-
-
-def calculate_bear_score(row: pd.Series) -> Tuple[float, List[str]]:
-    score = 0.0
-    reasons = []
-    
-    if row.get("TSI_747", 0) > 70 and row.get("TSI_747_slope_1", 0) <= 0:
-        score += 2.0
-        reasons.append("TSI_747 rolling over")
-    if row.get("TSI_747_bear_kiss", 0):
-        score += 3.0
-        reasons.append("TSI_747 bear kiss")
-    if row.get("RSI14", 0) > 70:
-        score += 2.0
-        reasons.append("RSI overbought")
-    if 60 < row.get("RSI14", 0) < 70 and row.get("RSI14_slope_3", 0) < 0:
-        score += 2.0
-        reasons.append("RSI rolling from overbought")
-    if row.get("CCI15", 0) > 100:
-        score += 2.0
-        reasons.append("CCI extreme overbought")
-    if row.get("BBP", 0) > 1:
-        score += 2.0
-        reasons.append("BB% above upper band")
-    
-    bear_kiss = row.get("bear_kiss_score", 0)
-    if bear_kiss >= 8:
-        score += 3.0
-        reasons.append(f"bear kiss score {bear_kiss:.0f}")
-    elif bear_kiss >= 5:
-        score += 1.5
-        reasons.append(f"bear kiss score {bear_kiss:.0f}")
-    
-    return min(score, 10.0), reasons[:5]
-
-
-def get_signal_type(bull_score: float, bear_score: float) -> Tuple[str, str, float]:
-    if bull_score >= 6 and bull_score > bear_score + 2:
-        return "🟢 BULL", "CALL", bull_score / 10
-    elif bear_score >= 6 and bear_score > bull_score + 2:
-        return "🔴 BEAR", "PUT", bear_score / 10
-    elif bull_score >= 4 and bull_score > bear_score:
-        return "🟡 BULLISH BIAS", "CALL", bull_score / 10 * 0.7
-    elif bear_score >= 4 and bear_score > bull_score:
-        return "🟠 BEARISH BIAS", "PUT", bear_score / 10 * 0.7
-    else:
-        return "⚪ NEUTRAL", None, 0.3
-
-
-# ============================================================================
-# DATA LOADING
-# ============================================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_history(symbol: str, years: int = 3) -> Optional[pd.DataFrame]:
     try:
         t = Ticker(symbol)
         df = t.price()
-        df = df.rename(columns={"report_date": "date", "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
+        rename_map = {
+            "report_date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+        }
+        df = df.rename(columns=rename_map)
         needed = ["date", "open", "high", "low", "close", "volume"]
         if all(c in df.columns for c in needed):
             df = df[needed].copy()
@@ -242,7 +176,7 @@ def get_history(symbol: str, years: int = 3) -> Optional[pd.DataFrame]:
                 return df.tail(252 * years)
     except Exception:
         pass
-    
+
     try:
         df = yf.download(symbol, period=f"{years}y", interval="1d", auto_adjust=False, progress=False, threads=False)
         if df is None or df.empty:
@@ -262,7 +196,7 @@ def get_history(symbol: str, years: int = 3) -> Optional[pd.DataFrame]:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_benchmark(symbol: str = "SPY", years: int = 5) -> Optional[pd.Series]:
+def get_benchmark(symbol: str = "SPY", years: int = 3) -> Optional[pd.Series]:
     hist = get_history(symbol, years=years)
     if hist is None or hist.empty:
         return None
@@ -270,7 +204,7 @@ def get_benchmark(symbol: str = "SPY", years: int = 5) -> Optional[pd.Series]:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_live_daily(symbol: str, lookback_days: int = 260) -> Optional[pd.DataFrame]:
+def get_live_daily(symbol: str, lookback_days: int = 300) -> Optional[pd.DataFrame]:
     try:
         df = yf.download(symbol, period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
         if df is None or df.empty:
@@ -289,9 +223,27 @@ def get_live_daily(symbol: str, lookback_days: int = 260) -> Optional[pd.DataFra
         return None
 
 
-# ============================================================================
-# FEATURE ENGINEERING
-# ============================================================================
+def classify_tsi_state(tsi_val: float, sig_val: float, slope1: float, pinned_bars: int) -> str:
+    if pd.isna(tsi_val) or pd.isna(sig_val):
+        return "below_zero"
+    if tsi_val < -60:
+        return "oversold"
+    if tsi_val < 0:
+        return "below_zero"
+    if pinned_bars >= 3 and abs(slope1) <= 0.5 and tsi_val >= 95:
+        return "pinned"
+    if tsi_val >= 90 and abs(slope1) <= 1.0:
+        return "near_pinned"
+    if tsi_val > 70 and slope1 <= 0 and tsi_val <= sig_val + 2:
+        return "bear_kiss"
+    if tsi_val > sig_val and tsi_val > 0 and slope1 > 0:
+        return "bull_continuation"
+    if tsi_val > sig_val and tsi_val <= 40:
+        return "bull_repair"
+    if tsi_val > 0 and slope1 < 0:
+        return "rolling"
+    return "bull_repair"
+
 
 def compute_candle_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -315,7 +267,6 @@ def compute_candle_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_features(df: pd.DataFrame, bench: Optional[pd.Series]) -> pd.DataFrame:
     out = df.copy()
-    
     out["TSI_424"], out["TSI_424_sig"] = tsi(out["close"], 4, 2, 4)
     out["TSI_747"], out["TSI_747_sig"] = tsi(out["close"], 7, 4, 7)
     out["TSI_1377"], out["TSI_1377_sig"] = tsi(out["close"], 13, 7, 7)
@@ -325,35 +276,39 @@ def build_features(df: pd.DataFrame, bench: Optional[pd.Series]) -> pd.DataFrame
         out[f"{col}_minus_sig"] = out[col] - out[f"{col}_sig"]
         out[f"{col}_slope_1"] = out[col].diff(1)
         out[f"{col}_slope_3"] = out[col].diff(3)
-    
-    # TSI Kiss patterns
-    for tsi_col, sig_col in [("TSI_424", "TSI_424_sig"), ("TSI_747", "TSI_747_sig"), 
-                              ("TSI_1377", "TSI_1377_sig"), ("TSI_25137", "TSI_25137_sig")]:
-        distance = abs(out[tsi_col] - out[sig_col])
-        kissing = distance < 1.5
-        was_above = out[tsi_col].shift(1) > out[sig_col].shift(1)
-        was_below = out[tsi_col].shift(1) < out[sig_col].shift(1)
-        out[f"{tsi_col}_bull_kiss"] = (was_above & kissing & (out[tsi_col] < out[tsi_col].shift(1))).astype(int)
-        out[f"{tsi_col}_bear_kiss"] = (was_below & kissing & (out[tsi_col] > out[tsi_col].shift(1))).astype(int)
 
     out["CCI15"] = cci(out, 15)
     out["CCI20"] = cci(out, 20)
     out["CCI15_days_fading"] = count_consecutive(out["CCI15"].diff() < 0)
     out["CCI20_days_fading"] = count_consecutive(out["CCI20"].diff() < 0)
-    
+    out["CCI_divergence"] = ((out["close"] >= out["close"].shift(1)) & (out["CCI15"] < out["CCI15"].shift(1))).astype(int)
+
     out["BBP"] = bbpct(out["close"])
     out["BBP_delta_1"] = out["BBP"].diff(1)
     out["BBP_days_falling"] = count_consecutive(out["BBP"].diff() < 0)
-    
+
     out["RSI14"] = rsi(out["close"], 14)
     out["RSI14_slope_3"] = out["RSI14"].diff(3)
+    out["RSI_divergence"] = ((out["close"] >= out["close"].shift(1)) & (out["RSI14"] <= out["RSI14"].shift(1))).astype(int)
 
     out["VWAP"] = rolling_vwap(out, 20)
     out["EXT_VWAP"] = (out["close"] - out["VWAP"]) / out["VWAP"]
+    out["VWAP_slope"] = out["EXT_VWAP"].diff(1)
+    out["VWAP_stall"] = ((out["EXT_VWAP"] > 0.03) & (out["VWAP_slope"] <= 0)).astype(int)
+
     out["SMA10"] = out["close"].rolling(10).mean()
     out["SMA20"] = out["close"].rolling(20).mean()
     out["EXT_SMA10"] = (out["close"] - out["SMA10"]) / out["SMA10"]
     out["EXT_SMA20"] = (out["close"] - out["SMA20"]) / out["SMA20"]
+
+    out["ATR14"] = atr(out, 14)
+    out["stretch_ATR"] = (out["close"] - out["SMA20"]) / out["ATR14"].replace(0, np.nan)
+    out["ATR_pct"] = out["ATR14"].rolling(60, min_periods=20).rank(pct=True)
+
+    out["MFI14"] = mfi(out, 14)
+    out["MFI14_slope"] = out["MFI14"].diff(1)
+    out["MFI_divergence"] = ((out["close"] >= out["close"].shift(1)) & (out["MFI14"] < out["MFI14"].shift(1))).astype(int)
+
     out["ADX14"] = adx(out, 14)
     out["ADX14_slope_3"] = out["ADX14"].diff(3)
     out = compute_candle_features(out)
@@ -369,10 +324,12 @@ def build_features(df: pd.DataFrame, bench: Optional[pd.Series]) -> pd.DataFrame
         out["RS_LINE"] = out["close"] / out["bench_close"].replace(0, np.nan)
         out["RS_SLOPE_5"] = out["RS_LINE"].diff(5) / out["RS_LINE"].shift(5)
         out["RS_SLOPE_10"] = out["RS_LINE"].diff(10) / out["RS_LINE"].shift(10)
+        out["RS_divergence"] = ((out["close"] >= out["close"].shift(1)) & (out["RS_SLOPE_5"].fillna(0) < 0)).astype(int)
     else:
         out["RS_LINE"] = 1.0
         out["RS_SLOPE_5"] = 0.0
         out["RS_SLOPE_10"] = 0.0
+        out["RS_divergence"] = 0
 
     for tcol, pcol, scol, codecol in [
         ("TSI_424", "pinned_424", "state_424", "state_424_code"),
@@ -380,60 +337,63 @@ def build_features(df: pd.DataFrame, bench: Optional[pd.Series]) -> pd.DataFrame
         ("TSI_1377", "pinned_1377", "state_1377", "state_1377_code"),
         ("TSI_25137", "pinned_25137", "state_25137", "state_25137_code"),
     ]:
-        state_vals = []
+        vals = []
         for _, row in out.iterrows():
-            state_vals.append(classify_tsi_state(row[tcol], row[f"{tcol}_sig"], row[f"{tcol}_slope_1"], int(row[pcol]) if pd.notna(row[pcol]) else 0))
-        out[scol] = state_vals
-        out[codecol] = out[scol].map(STATE_CODE_MAP)
+            vals.append(classify_tsi_state(row[tcol], row[f"{tcol}_sig"], row[f"{tcol}_slope_1"], int(row[pcol]) if pd.notna(row[pcol]) else 0))
+        out[scol] = vals
+        out[codecol] = out[scol].map(STATE_CODE_MAP).fillna(0)
 
-    out["bull_kiss_score"] = (
-        out["TSI_424_bull_kiss"] + out["TSI_747_bull_kiss"] + 
-        out["TSI_1377_bull_kiss"] + out["TSI_25137_bull_kiss"]
-    )
-    out["is_bull_kiss"] = (out["bull_kiss_score"] >= 2).astype(int)
-
-    price_higher = (out["close"] >= out["close"].shift(1) * 0.998)
+    price_higher = out["close"] >= out["close"].rolling(5, min_periods=2).max().shift(1).fillna(out["close"].shift(1)) * 0.98
+    tsi_still_strong = (out["TSI_424"] > 80) & (out["TSI_747"] > 60)
     tsi_747_fail = out["TSI_747"] <= out["TSI_747"].shift(1) + 0.3
-    tsi_1377_supportive = out["TSI_1377"] > 45
-    tsi_25137_flat = out["TSI_25137_slope_3"] <= 1.0
-    cci_roll = (out["CCI15_days_fading"] >= 2) | ((out["CCI15"] > 100) & (out["CCI15"].diff() < 0))
-    bb_stall = (out["BBP"] > 0.95) & (out["BBP_days_falling"] >= 1)
-    candle_ok = out["candle_score"] >= 55
+    cci_early_fade = (out["CCI15"] > 90) & (out["CCI15"].diff() < 0) & (out["CCI15_days_fading"] >= 1)
+    bb_stall = (out["BBP"] > 0.95) & ((out["BBP_days_falling"] >= 1) | (out["BBP_delta_1"] <= 0))
+    vwap_stall = out["VWAP_stall"] == 1
+    mfi_fade = (out["MFI14"] > 70) & (out["MFI14_slope"] < 0)
+    rsi_nonconfirm = (out["RSI14"] > 65) & (out["RSI_divergence"] == 1)
+    rs_fade = out["RS_divergence"] == 1
+    candle_bear = out["candle_score"] >= 55
+    strong_trend_penalty = ((out["ADX14"] > 28) & (out["ADX14_slope_3"] > 0)).astype(int)
+
+    out["early_bear_setup"] = (price_higher & cci_early_fade & tsi_still_strong & (out["BBP"] > 0.95)).astype(int)
     out["bear_kiss_score"] = (
-        price_higher.astype(int) * 2.0 +
-        tsi_747_fail.astype(int) * 3.0 +
-        tsi_1377_supportive.astype(int) * 1.0 +
-        tsi_25137_flat.astype(int) * 1.5 +
-        cci_roll.astype(int) * 2.5 +
-        bb_stall.astype(int) * 2.0 +
-        candle_ok.astype(int) * 2.0
+        price_higher.astype(int) * 2.0
+        + cci_early_fade.astype(int) * 2.5
+        + tsi_still_strong.astype(int) * 2.0
+        + tsi_747_fail.astype(int) * 1.5
+        + bb_stall.astype(int) * 1.5
+        + vwap_stall.astype(int) * 1.5
+        + mfi_fade.astype(int) * 1.0
+        + rsi_nonconfirm.astype(int) * 1.0
+        + rs_fade.astype(int) * 1.5
+        + candle_bear.astype(int) * 1.0
+        - strong_trend_penalty.astype(int) * 1.5
     )
-    out["is_bear_kiss"] = (out["bear_kiss_score"] >= 8.0).astype(int)
+    out["is_bear_kiss"] = (out["bear_kiss_score"] >= 7.5).astype(int)
+
+    price_lower = out["close"] <= out["close"].rolling(5, min_periods=2).min().shift(1).fillna(out["close"].shift(1)) * 1.02
+    tsi_747_turn = out["TSI_747"] >= out["TSI_747"].shift(1) - 0.2
+    cci_repair = ((out["CCI15"] < -100) & (out["CCI15"].diff() > 0)) | (count_consecutive(out["CCI15"].diff() > 0) >= 2)
+    bb_oversold = (out["BBP"] < 0.05) | ((out["BBP"] < 0.15) & (out["BBP_delta_1"] > 0))
+    mfi_repair = (out["MFI14"] < 30) & (out["MFI14_slope"] > 0)
+    rs_repair = (out["RS_SLOPE_5"].fillna(0) > 0)
+    out["bull_kiss_score"] = (
+        price_lower.astype(int) * 1.5
+        + tsi_747_turn.astype(int) * 2.0
+        + cci_repair.astype(int) * 2.5
+        + bb_oversold.astype(int) * 2.0
+        + mfi_repair.astype(int) * 1.0
+        + rs_repair.astype(int) * 1.0
+        + (out["candle_score"] >= 60).astype(int) * 1.5
+    )
+    out["is_bull_kiss"] = (out["bull_kiss_score"] >= 7.0).astype(int)
+
     out["is_hot"] = ((out["TSI_424"] > 95) & (out["TSI_747"] > 70) & (out["BBP"] > 0.95)).astype(int)
+    out["is_cold"] = ((out["TSI_424"] < -95) & (out["BBP"] < 0.05) & (out["CCI15"] < -100)).astype(int)
     out["is_ripping"] = ((out["TSI_424"] > 95) & (out["TSI_747_slope_1"] > 0.8) & (out["RS_SLOPE_5"].fillna(0) > 0)).astype(int)
-    out["is_fading_stack"] = ((out["CCI15_days_fading"] >= 3) & (out["TSI_424_slope_1"] < 0) & (out["TSI_747_slope_1"] <= 0) & (out["BBP_days_falling"] >= 2)).astype(int)
-    
+    out["is_fading_stack"] = ((out["CCI15_days_fading"] >= 2) & (out["TSI_424_slope_1"] <= 0) & (out["TSI_747_slope_1"] <= 0) & ((out["BBP_days_falling"] >= 1) | (out["VWAP_stall"] == 1))).astype(int)
+    out["is_repairing_stack"] = ((count_consecutive(out["CCI15"].diff() > 0) >= 2) & (out["TSI_424_slope_1"] > 0) & (out["BBP_delta_1"] > 0)).astype(int)
     return out
-
-
-def classify_tsi_state(tsi_val: float, sig_val: float, slope1: float, pinned_bars: int) -> str:
-    if pd.isna(tsi_val) or pd.isna(sig_val):
-        return "below_zero"
-    if tsi_val < 0:
-        return "below_zero"
-    if pinned_bars >= 3 and abs(slope1) <= 0.5 and tsi_val >= 95:
-        return "pinned"
-    if tsi_val >= 90 and abs(slope1) <= 1.0:
-        return "near_pinned"
-    if tsi_val > 70 and slope1 <= 0 and tsi_val <= sig_val + 2:
-        return "bear_kiss"
-    if tsi_val > sig_val and tsi_val > 0 and slope1 > 0:
-        return "bull_continuation"
-    if tsi_val > sig_val and tsi_val <= 40:
-        return "bull_repair"
-    if tsi_val > 0 and slope1 < 0:
-        return "rolling"
-    return "bull_repair"
 
 
 def add_returns(df: pd.DataFrame) -> pd.DataFrame:
@@ -444,6 +404,9 @@ def add_returns(df: pd.DataFrame) -> pd.DataFrame:
     out["dip1"] = (out["ret1"] < 0).astype(float)
     out["dip2"] = (out["ret2"] < -0.005).astype(float)
     out["dip5"] = (out["ret5"] < -0.01).astype(float)
+    out["rip1"] = (out["ret1"] > 0).astype(float)
+    out["rip2"] = (out["ret2"] > 0.005).astype(float)
+    out["rip5"] = (out["ret5"] > 0.01).astype(float)
     return out
 
 
@@ -465,12 +428,16 @@ def load_or_build_feature_store(symbol: str, years: int, benchmark_symbol: str) 
     bench = get_benchmark(benchmark_symbol, years=years)
     feat = build_features(df, bench)
     feat = add_returns(feat)
-    for col in ["RS_LINE", "RS_SLOPE_5", "RS_SLOPE_10"]:
+    for col, default in {
+        "RS_LINE": 1.0,
+        "RS_SLOPE_5": 0.0,
+        "RS_SLOPE_10": 0.0,
+        "ADX14": 0.0,
+        "ADX14_slope_3": 0.0,
+    }.items():
         if col not in feat.columns:
-            feat[col] = 0.0 if col != "RS_LINE" else 1.0
-    feat["RS_LINE"] = feat["RS_LINE"].fillna(1.0)
-    feat["RS_SLOPE_5"] = feat["RS_SLOPE_5"].fillna(0.0)
-    feat["RS_SLOPE_10"] = feat["RS_SLOPE_10"].fillna(0.0)
+            feat[col] = default
+        feat[col] = feat[col].fillna(default)
     try:
         feat.to_parquet(path)
     except Exception:
@@ -478,38 +445,52 @@ def load_or_build_feature_store(symbol: str, years: int, benchmark_symbol: str) 
     return feat
 
 
-def find_analogs(df: pd.DataFrame, n: int = 30, exclusion_gap: int = 20) -> pd.DataFrame:
-    working = df.copy()
-    fill_defaults = {
+def get_row_as_of(feat: pd.DataFrame, as_of_date: pd.Timestamp) -> Optional[pd.Series]:
+    if feat is None or feat.empty:
+        return None
+    eligible = feat[feat.index <= as_of_date]
+    if eligible.empty:
+        return None
+    return eligible.iloc[-1].copy()
+
+
+def find_analogs(hist_df: pd.DataFrame, current_row: pd.Series, n: int = 30, exclusion_gap: int = 20) -> pd.DataFrame:
+    working = hist_df.copy()
+    for col, default in {
         "RS_LINE": 1.0,
         "RS_SLOPE_5": 0.0,
         "RS_SLOPE_10": 0.0,
         "ADX14": 0.0,
         "ADX14_slope_3": 0.0,
-    }
-    for col, default in fill_defaults.items():
+    }.items():
         if col in working.columns:
             working[col] = working[col].fillna(default)
     base = working.dropna(subset=FEATURE_COLS + ["ret1", "ret2", "ret5"]).copy()
     if len(base) < 100:
         return pd.DataFrame()
-    current = base.iloc[-1]
-    pool = base.iloc[:-exclusion_gap].copy()
+    if current_row.name in base.index:
+        current_pos = base.index.get_loc(current_row.name)
+        pool = base.iloc[:max(0, current_pos - exclusion_gap)].copy()
+        if pool.empty:
+            pool = base.iloc[:-exclusion_gap].copy()
+    else:
+        pool = base.iloc[:-exclusion_gap].copy()
     if pool.empty:
         return pd.DataFrame()
     X = pool[FEATURE_COLS]
-    cur = current[FEATURE_COLS]
+    cur_df = pd.DataFrame([current_row[FEATURE_COLS]], columns=FEATURE_COLS)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    cur_scaled = scaler.transform(pd.DataFrame([cur], columns=FEATURE_COLS))
+    cur_scaled = scaler.transform(cur_df)
     dist = cdist(cur_scaled, X_scaled)[0]
     pool["distance"] = dist
     pool["state_penalty"] = (
-        (pool["state_424_code"] != current["state_424_code"]).astype(float) * 0.15 +
-        (pool["state_747_code"] != current["state_747_code"]).astype(float) * 0.35 +
-        (pool["state_1377_code"] != current["state_1377_code"]).astype(float) * 0.20 +
-        (pool["state_25137_code"] != current["state_25137_code"]).astype(float) * 0.10 +
-        (pool["is_bear_kiss"] != current["is_bear_kiss"]).astype(float) * 0.20
+        (pool["state_424_code"] != current_row["state_424_code"]).astype(float) * 0.15
+        + (pool["state_747_code"] != current_row["state_747_code"]).astype(float) * 0.35
+        + (pool["state_1377_code"] != current_row["state_1377_code"]).astype(float) * 0.20
+        + (pool["state_25137_code"] != current_row["state_25137_code"]).astype(float) * 0.10
+        + (pool["is_bear_kiss"] != current_row["is_bear_kiss"]).astype(float) * 0.20
+        + (pool["is_bull_kiss"] != current_row["is_bull_kiss"]).astype(float) * 0.20
     )
     pool["total_distance"] = pool["distance"] + pool["state_penalty"]
     analogs = pool.nsmallest(n, "total_distance").copy()
@@ -521,12 +502,14 @@ def weighted_stats(analogs: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     if analogs.empty:
         return {}
     w = analogs["similarity"].clip(lower=1e-9)
-    stats: Dict[str, Dict[str, float]] = {}
-    for ret_col, dip_col in [("ret1", "dip1"), ("ret2", "dip2"), ("ret5", "dip5")]:
+    stats = {}
+    for ret_col, down_col, up_col in [("ret1", "dip1", "rip1"), ("ret2", "dip2", "rip2"), ("ret5", "dip5", "rip5")]:
         r = analogs[ret_col]
-        d = analogs[dip_col]
+        d = analogs[down_col]
+        u = analogs[up_col]
         stats[ret_col] = {
-            "prob": float(np.average(d, weights=w)),
+            "down_prob": float(np.average(d, weights=w)),
+            "up_prob": float(np.average(u, weights=w)),
             "mean": float(np.average(r, weights=w)),
             "median": float(r.median()),
             "p10": float(r.quantile(0.10)),
@@ -535,201 +518,346 @@ def weighted_stats(analogs: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     return stats
 
 
-def confidence_score(analogs: pd.DataFrame, current: pd.Series, stats: Dict[str, Dict[str, float]]) -> float:
+def confidence_score(analogs: pd.DataFrame, current: pd.Series, stats: Dict[str, Dict[str, float]], side: str) -> float:
     if analogs.empty:
         return 0.0
     size_score = min(len(analogs) / 30.0, 1.0)
     closeness = float(np.clip(1 / (1 + analogs["total_distance"].mean()), 0, 1))
     agreement = 0.0
-    if current.get("is_hot", 0):
-        agreement += 0.12
-    if current.get("is_bear_kiss", 0):
-        agreement += 0.28
-    if current.get("bear_kiss_score", 0) >= 10:
-        agreement += 0.12
-    if current.get("candle_score", 0) >= 68:
-        agreement += 0.16
-    if current.get("CCI15_days_fading", 0) >= 2:
-        agreement += 0.10
-    if current.get("BBP_days_falling", 0) >= 1:
-        agreement += 0.08
-    if current.get("state_747") in {"bear_kiss", "pinned", "near_pinned", "rolling"}:
-        agreement += 0.08
-    if current.get("RS_SLOPE_5", 0) < 0:
-        agreement += 0.06
-    outcome_consistency = 0.0
-    if stats:
-        probs = [stats["ret1"]["prob"], stats["ret2"]["prob"], stats["ret5"]["prob"]]
-        outcome_consistency = max(0.0, 1 - float(np.std(probs)) * 2)
+    if side == "PUT":
+        if current.get("is_hot", 0): agreement += 0.10
+        if current.get("is_bear_kiss", 0): agreement += 0.25
+        if current.get("bear_kiss_score", 0) >= 10: agreement += 0.12
+        if current.get("candle_score", 0) >= 68: agreement += 0.15
+        if current.get("CCI15_days_fading", 0) >= 2: agreement += 0.10
+        if current.get("BBP_days_falling", 0) >= 1: agreement += 0.08
+        if current.get("state_747") in {"bear_kiss", "pinned", "near_pinned", "rolling"}: agreement += 0.10
+    else:
+        if current.get("is_cold", 0): agreement += 0.10
+        if current.get("is_bull_kiss", 0): agreement += 0.25
+        if current.get("bull_kiss_score", 0) >= 9: agreement += 0.12
+        if current.get("candle_score", 0) >= 60: agreement += 0.15
+        if current.get("CCI15", 0) < -100: agreement += 0.10
+        if current.get("BBP", 0) < 0.10: agreement += 0.08
+        if current.get("state_747") in {"oversold", "below_zero", "bull_repair"}: agreement += 0.10
+    probs = [stats["ret1"]["down_prob" if side == "PUT" else "up_prob"], stats["ret2"]["down_prob" if side == "PUT" else "up_prob"], stats["ret5"]["down_prob" if side == "PUT" else "up_prob"]]
+    outcome_consistency = max(0.0, 1 - float(np.std(probs)) * 2)
     conf = 100 * (0.20 * size_score + 0.35 * closeness + 0.25 * agreement + 0.20 * outcome_consistency)
     return float(np.clip(conf, 0, 100))
 
 
+def calculate_bull_score(row: pd.Series) -> Tuple[float, List[str]]:
+    score = 0.0
+    reasons = []
+    if row.get("TSI_747", 0) < 0:
+        score += 1.0; reasons.append("TSI_747 below zero")
+    if row.get("is_bull_kiss", 0):
+        score += 3.0; reasons.append("bull kiss")
+    if row.get("bull_kiss_score", 0) >= 9:
+        score += 2.0; reasons.append(f"bull kiss {row['bull_kiss_score']:.0f}")
+    if row.get("RSI14", 0) < 30:
+        score += 2.0; reasons.append("RSI oversold")
+    elif 30 < row.get("RSI14", 0) < 40 and row.get("RSI14_slope_3", 0) > 0:
+        score += 1.5; reasons.append("RSI repairing")
+    if row.get("CCI15", 0) < -100:
+        score += 2.0; reasons.append("CCI extreme oversold")
+    if row.get("BBP", 0) < 0.05:
+        score += 2.0; reasons.append("BB% washed out")
+    if row.get("TSI_424_slope_1", 0) > 0 and row.get("TSI_747_slope_1", 0) >= 0:
+        score += 1.0; reasons.append("TSI turning up")
+    if row.get("candle_score", 0) >= 60:
+        score += 1.0; reasons.append("good reversal candle")
+    if row.get("RS_SLOPE_5", 0) > 0:
+        score += 0.5; reasons.append("RS firming")
+    return min(score, 10.0), reasons[:5]
+
+
+def calculate_bear_score(row: pd.Series) -> Tuple[float, List[str]]:
+    score = 0.0
+    reasons = []
+    if row.get("early_bear_setup", 0):
+        score += 2.0; reasons.append("early CCI fade")
+    if row.get("TSI_747", 0) > 70 and row.get("TSI_747_slope_1", 0) <= 0:
+        score += 1.5; reasons.append("TSI_747 rolling")
+    if row.get("is_bear_kiss", 0):
+        score += 3.0; reasons.append("bear kiss")
+    if row.get("bear_kiss_score", 0) >= 9:
+        score += 2.0; reasons.append(f"bear kiss {row['bear_kiss_score']:.0f}")
+    if row.get("CCI15", 0) > 100:
+        score += 1.5; reasons.append("CCI stretched")
+    if row.get("CCI_divergence", 0):
+        score += 1.0; reasons.append("CCI divergence")
+    if row.get("BBP", 0) > 0.95:
+        score += 1.0; reasons.append("BB% hot")
+    if row.get("VWAP_stall", 0):
+        score += 1.0; reasons.append("VWAP stall")
+    if row.get("MFI_divergence", 0):
+        score += 0.75; reasons.append("MFI divergence")
+    if row.get("RS_divergence", 0):
+        score += 0.75; reasons.append("RS divergence")
+    if row.get("pinned_424", 0) >= 2:
+        score += 0.75; reasons.append("4,2,4 pinned")
+    if row.get("ADX14", 0) > 28 and row.get("ADX14_slope_3", 0) > 0:
+        score -= 1.0; reasons.append("trend too strong")
+    return float(np.clip(score, 0, 10)), reasons[:6]
+
+
+def get_signal_type(bull_score: float, bear_score: float) -> Tuple[str, Optional[str], float]:
+    if bull_score >= 6 and bull_score > bear_score + 1.5:
+        return "🟢 BULL", "CALL", bull_score / 10
+    if bear_score >= 6 and bear_score > bull_score + 1.5:
+        return "🔴 BEAR", "PUT", bear_score / 10
+    if bull_score >= 4 and bull_score > bear_score:
+        return "🟡 BULLISH BIAS", "CALL", bull_score / 10 * 0.7
+    if bear_score >= 4 and bear_score > bull_score:
+        return "🟠 BEARISH BIAS", "PUT", bear_score / 10 * 0.7
+    return "⚪ NEUTRAL", None, 0.3
+
+
 def setup_label(row: pd.Series) -> str:
-    if row.get("is_bear_kiss", 0) and row.get("candle_score", 0) >= 68 and row.get("TSI_747", 0) > 70:
-        return "🔥 Diamond"
-    if row.get("bear_kiss_score", 0) >= 8 and row.get("TSI_747", 0) > 70:
-        return "🟠 Near Diamond"
+    if row.get("is_bear_kiss", 0) and row.get("TSI_747", 0) > 60 and row.get("CCI15_days_fading", 0) >= 1:
+        return "🔥 Diamond Bear"
+    if row.get("early_bear_setup", 0):
+        return "🟠 Early Bear Setup"
+    if row.get("is_bull_kiss", 0) and row.get("candle_score", 0) >= 60 and row.get("CCI15", 0) < -50:
+        return "💎 Diamond Bull"
+    if row.get("bear_kiss_score", 0) >= 8:
+        return "🟠 Near Bear Diamond"
+    if row.get("bull_kiss_score", 0) >= 7.5:
+        return "🟢 Near Bull Diamond"
     if row.get("pinned_424", 0) >= 2 or row.get("state_747") in {"pinned", "near_pinned"}:
         return "🟡 Pinned Extreme"
-    if row.get("is_ripping", 0):
-        return "🚀 Ripping Extreme"
-    if row.get("bull_kiss_score", 0) >= 2:
-        return "💋 Multiple Bull Kisses"
+    if row.get("is_cold", 0):
+        return "🔵 Washed Out"
     return "⚪ Watch"
 
 
 def why_text(row: pd.Series) -> str:
-    reasons: List[str] = []
+    reasons = []
     if row.get("pinned_424", 0) >= 2:
         reasons.append(f"{int(row['pinned_424'])}x 4,2,4 pinned")
+    if row.get("early_bear_setup", 0):
+        reasons.append("early CCI fade")
     if row.get("state_747") == "bear_kiss":
         reasons.append("7,4,7 bear kiss")
     if row.get("bull_kiss_score", 0) >= 2:
         reasons.append(f"{int(row['bull_kiss_score'])}x bull kiss")
     if row.get("CCI15_days_fading", 0) >= 2:
         reasons.append(f"CCI15 fading {int(row['CCI15_days_fading'])}d")
+    if row.get("CCI15", 0) < -100:
+        reasons.append("CCI oversold")
     if row.get("BBP_days_falling", 0) >= 1 and row.get("BBP", 0) > 0.95:
         reasons.append("BB% stalled high")
+    if row.get("VWAP_stall", 0):
+        reasons.append("VWAP stall")
+    if row.get("MFI_divergence", 0):
+        reasons.append("MFI divergence")
+    if row.get("RS_divergence", 0):
+        reasons.append("RS divergence")
+    if row.get("BBP", 0) < 0.05:
+        reasons.append("BB% washed out")
     if row.get("candle_score", 0) >= 68:
-        reasons.append("good rejection candle")
+        reasons.append("good candle")
     if row.get("RS_SLOPE_5", 0) < 0:
         reasons.append("RS fading")
+    if row.get("RS_SLOPE_5", 0) > 0:
+        reasons.append("RS firming")
     if row.get("TSI_25137_slope_3", 0) <= 0.5:
         reasons.append("25,13,7 flattening")
     return ", ".join(reasons[:6]) if reasons else "No stacked trigger yet"
 
 
-# ============================================================================
-# OPTIONS CHAIN
-# ============================================================================
-
 @st.cache_data(ttl=900, show_spinner=False)
-def get_option_candidates(symbol: str, option_type: str) -> Optional[pd.DataFrame]:
+def get_option_candidates(symbol: str, option_type: str, max_expirations: int = 3) -> Optional[pd.DataFrame]:
     try:
         ticker = yf.Ticker(symbol)
         exps = list(ticker.options)
         if not exps:
             return None
-        
-        current_price = ticker.history(period="1d")["Close"].iloc[-1]
-        today = datetime.now()
-        
+        hist = ticker.history(period="5d")
+        if hist is None or hist.empty:
+            return None
+        current_price = float(hist["Close"].iloc[-1])
         all_options = []
-        
-        for exp_date in exps[:3]:
+        now = pd.Timestamp.utcnow().tz_localize(None)
+        for exp_date in exps[:max_expirations]:
             chain = ticker.option_chain(exp_date)
-            
-            if option_type == "CALL":
-                options = chain.calls.copy()
-            else:
-                options = chain.puts.copy()
-            
+            options = chain.calls.copy() if option_type == "CALL" else chain.puts.copy()
             if options is None or options.empty:
                 continue
-            
-            exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
-            days_to_expiry = (exp_dt - today).days
-            
+            exp_dt = pd.Timestamp(exp_date)
+            dte = int((exp_dt - now.normalize()).days)
             if option_type == "CALL":
                 options = options[options["strike"] >= current_price * 0.95]
             else:
                 options = options[options["strike"] <= current_price * 1.05]
-            
             if options.empty:
                 continue
-            
             options["spread"] = options["ask"] - options["bid"]
             options["mid"] = (options["ask"] + options["bid"]) / 2
             options["expiration"] = exp_date
-            options["days_to_expiry"] = days_to_expiry
-            options["expiry_date_str"] = exp_dt.strftime("%b %d, %Y")
+            options["days_to_expiry"] = dte
             options["option_type"] = option_type
-            
+            rel_spread = (options["spread"] / options["mid"].replace(0, np.nan)).clip(upper=1).fillna(1)
             options["liq_score"] = (
-                options["volume"].fillna(0).clip(upper=5000) / 5000 * 0.35 +
-                options["openInterest"].fillna(0).clip(upper=10000) / 10000 * 0.35 +
-                (1 - (options["spread"] / options["mid"].replace(0, np.nan)).clip(upper=1).fillna(1)) * 0.30
+                options["volume"].fillna(0).clip(upper=5000) / 5000 * 0.35
+                + options["openInterest"].fillna(0).clip(upper=10000) / 10000 * 0.35
+                + (1 - rel_spread) * 0.30
             )
-            
             all_options.append(options)
-        
         if not all_options:
             return None
-        
         result = pd.concat(all_options, ignore_index=True)
         result = result.sort_values(["liq_score", "volume", "openInterest"], ascending=False)
-        
-        return result.head(10)[[
-            "contractSymbol", "expiration", "expiry_date_str", "days_to_expiry",
-            "strike", "option_type", "bid", "ask", "mid", "spread",
-            "volume", "openInterest", "liq_score"
-        ]]
-        
-    except Exception as e:
+        cols = ["contractSymbol", "expiration", "days_to_expiry", "strike", "option_type", "bid", "ask", "mid", "spread", "volume", "openInterest", "impliedVolatility", "liq_score"]
+        cols = [c for c in cols if c in result.columns]
+        return result[cols].head(12)
+    except Exception:
         return None
 
 
-# ============================================================================
-# MAIN UI
-# ============================================================================
+def expected_move_pct(current_row: pd.Series) -> float:
+    atr_val = float(current_row.get("ATR14", np.nan))
+    close_val = float(current_row.get("close", np.nan)) if "close" in current_row.index else np.nan
+    if pd.isna(atr_val) or pd.isna(close_val) or close_val == 0:
+        return np.nan
+    return atr_val / close_val
 
-st.title("🔍 Diamond Scanner v4 - Enhanced")
-st.caption("Bull/Bear signal detection with analog pattern matching | Upload your liquid symbols list")
+
+def position_size_pct(confidence: float, atr_pct: float) -> float:
+    try:
+        base = max(0.1, min(confidence / 100.0, 1.0))
+        vol_adj = 1 - float(atr_pct) if not pd.isna(atr_pct) else 0.75
+        return float(max(0.1, min(base * vol_adj, 1.0)))
+    except Exception:
+        return 0.25
+
+
+def build_live_or_historical_row(symbol: str, benchmark_symbol: str, years: int, analysis_mode: str, analysis_date: Optional[pd.Timestamp]) -> Tuple[Optional[pd.Series], Optional[pd.DataFrame], str]:
+    hist_feat = load_or_build_feature_store(symbol, years, benchmark_symbol)
+    if hist_feat is None or hist_feat.empty:
+        return None, None, "no history returned"
+    if analysis_mode == "Historical":
+        if analysis_date is None:
+            return None, hist_feat, "missing historical date"
+        row = get_row_as_of(hist_feat, pd.Timestamp(analysis_date))
+        if row is None:
+            return None, hist_feat, "no row for chosen date"
+        return row, hist_feat, "ok"
+    live_df = get_live_daily(symbol)
+    if live_df is None or live_df.empty:
+        return None, hist_feat, "no live data"
+    live_bench = get_benchmark(benchmark_symbol, years=years)
+    live_feat = build_features(live_df, live_bench)
+    live_feat = add_returns(live_feat)
+    if live_feat.empty:
+        return None, hist_feat, "no live features"
+    return live_feat.iloc[-1].copy(), hist_feat, "ok"
+
+
+def scan_symbol(symbol: str, current_row: pd.Series, hist_feat: pd.DataFrame, analog_count: int) -> Tuple[Optional[Dict], Optional[pd.DataFrame]]:
+    analogs = find_analogs(hist_feat, current_row=current_row, n=analog_count)
+    if analogs.empty:
+        return None, None
+    stats = weighted_stats(analogs)
+    bull_score, bull_reasons = calculate_bull_score(current_row)
+    bear_score, bear_reasons = calculate_bear_score(current_row)
+    signal_type, option_type, _ = get_signal_type(bull_score, bear_score)
+    if option_type == "PUT":
+        conf = confidence_score(analogs, current_row, stats, side="PUT")
+    elif option_type == "CALL":
+        conf = confidence_score(analogs, current_row, stats, side="CALL")
+    else:
+        conf = 40.0
+    pos_size = position_size_pct(conf, float(current_row.get("ATR_pct", np.nan)))
+    detail = {
+        "symbol": symbol,
+        "Signal": signal_type,
+        "Option Type": option_type,
+        "Bull Score": round(bull_score, 2),
+        "Bear Score": round(bear_score, 2),
+        "DipProb_1d": round(stats["ret1"]["down_prob"] * 100, 1),
+        "DipProb_2d": round(stats["ret2"]["down_prob"] * 100, 1),
+        "DipProb_5d": round(stats["ret5"]["down_prob"] * 100, 1),
+        "RipProb_1d": round(stats["ret1"]["up_prob"] * 100, 1),
+        "RipProb_2d": round(stats["ret2"]["up_prob"] * 100, 1),
+        "RipProb_5d": round(stats["ret5"]["up_prob"] * 100, 1),
+        "ExpRet_1d": round(stats["ret1"]["median"] * 100, 2),
+        "ExpRet_2d": round(stats["ret2"]["median"] * 100, 2),
+        "ExpRet_5d": round(stats["ret5"]["median"] * 100, 2),
+        "Confidence": round(conf, 1),
+        "Position Size %": round(pos_size * 100, 1),
+        "TSI_424": round(float(current_row.get("TSI_424", np.nan)), 2),
+        "TSI_747": round(float(current_row.get("TSI_747", np.nan)), 2),
+        "TSI_1377": round(float(current_row.get("TSI_1377", np.nan)), 2),
+        "TSI_25137": round(float(current_row.get("TSI_25137", np.nan)), 2),
+        "RSI14": round(float(current_row.get("RSI14", np.nan)), 2),
+        "CCI15": round(float(current_row.get("CCI15", np.nan)), 2),
+        "CCI20": round(float(current_row.get("CCI20", np.nan)), 2),
+        "BBP": round(float(current_row.get("BBP", np.nan)), 3),
+        "ATR14": round(float(current_row.get("ATR14", np.nan)), 3),
+        "ATR_pct": round(float(current_row.get("ATR_pct", np.nan)) * 100, 1) if pd.notna(current_row.get("ATR_pct", np.nan)) else np.nan,
+        "StretchATR": round(float(current_row.get("stretch_ATR", np.nan)), 2),
+        "MFI14": round(float(current_row.get("MFI14", np.nan)), 2),
+        "VWAP Ext": round(float(current_row.get("EXT_VWAP", np.nan)) * 100, 2) if pd.notna(current_row.get("EXT_VWAP", np.nan)) else np.nan,
+        "Candle": round(float(current_row.get("candle_score", np.nan)), 1),
+        "Bull Kiss": round(float(current_row.get("bull_kiss_score", 0)), 1),
+        "Bear Kiss": round(float(current_row.get("bear_kiss_score", 0)), 1),
+        "State": setup_label(current_row),
+        "Why": why_text(current_row),
+        "Expected Move %": round(expected_move_pct(current_row) * 100, 2) if pd.notna(expected_move_pct(current_row)) else np.nan,
+        "Bull Reasons": bull_reasons,
+        "Bear Reasons": bear_reasons,
+        "Row Date": str(current_row.name.date()) if hasattr(current_row.name, "date") else str(current_row.name),
+    }
+    return detail, analogs
+
+
+st.title("🔍 Diamond Scanner Pro")
+st.caption("Historical analog ranking from DefeatBeta + live current bar + calls, puts, and date lookback")
 
 with st.sidebar:
-    st.header("📁 Symbol Source")
-    
-    symbol_source = st.radio(
-        "Choose symbol source:",
-        ["Upload CSV file", "Paste symbols manually", "Use default symbols"]
-    )
-    
+    st.header("Universe")
+    symbol_source = st.radio("Choose symbol source", ["Upload CSV file", "Paste symbols manually", "Use default symbols"], index=1)
     symbols = []
-    
     if symbol_source == "Upload CSV file":
-        uploaded_file = st.file_uploader("Upload CSV with 'symbol' column", type=["csv"])
-        if uploaded_file:
-            df = pd.read_csv(uploaded_file)
-            if 'symbol' in df.columns:
-                symbols = df['symbol'].tolist()
-                st.success(f"Loaded {len(symbols)} symbols from file")
-            elif 'Symbol' in df.columns:
-                symbols = df['Symbol'].tolist()
-                st.success(f"Loaded {len(symbols)} symbols from file")
+        uploaded_file = st.file_uploader("Upload CSV with symbol or Symbol column", type=["csv"])
+        if uploaded_file is not None:
+            df_up = pd.read_csv(uploaded_file)
+            col = "symbol" if "symbol" in df_up.columns else ("Symbol" if "Symbol" in df_up.columns else None)
+            if col is None:
+                st.error("CSV must contain symbol or Symbol column.")
             else:
-                st.error("CSV must have 'symbol' or 'Symbol' column")
-    
+                symbols = df_up[col].astype(str).str.strip().str.upper().tolist()
+                st.success(f"Loaded {len(symbols)} symbols")
     elif symbol_source == "Paste symbols manually":
-        symbols_text = st.text_area(
-            "Enter symbols (comma or line separated)",
-            placeholder="AAPL, MSFT, NVDA, GOOGL, AMZN\nor\nAAPL\nMSFT\nNVDA"
-        )
-        if symbols_text:
-            # Handle comma-separated or line-separated
-            if ',' in symbols_text:
-                symbols = [s.strip().upper() for s in symbols_text.split(',') if s.strip()]
+        symbols_text = st.text_area("Symbols", value="QQQ,SMH,NVDA,MSFT,AMZN,LYFT", height=120)
+        if symbols_text.strip():
+            if "," in symbols_text:
+                symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
             else:
-                symbols = [s.strip().upper() for s in symbols_text.split('\n') if s.strip()]
-            st.success(f"Loaded {len(symbols)} symbols")
-    
-    else:  # Default symbols
-        default_symbols = ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA"]
-        symbols = default_symbols
-        st.info(f"Using default symbols: {', '.join(default_symbols[:5])}...")
-    
-    st.header("⚙️ Scan Settings")
+                symbols = [s.strip().upper() for s in symbols_text.splitlines() if s.strip()]
+    else:
+        symbols = ["QQQ", "SPY", "IWM", "SMH", "NVDA", "MSFT", "AMZN", "META", "TSLA", "LYFT"]
+        st.info("Using default symbols")
+
+    st.header("Mode")
+    analysis_mode = st.radio("Analysis mode", ["Current", "Historical"], index=0)
+    analysis_date = st.date_input("As-of date", value=pd.Timestamp.today().date(), disabled=(analysis_mode == "Current"))
+
+    st.header("Settings")
     years = st.selectbox("Years of historical data", [2, 3, 5], index=1)
     analog_count = st.slider("Number of analogs", 10, 60, 30, 5)
     benchmark_symbol = st.selectbox("Relative strength benchmark", ["SPY", "QQQ", "IWM"], index=0)
-    
-    st.header("💾 Cache")
+
+    st.header("Cache")
     rebuild_cache = st.checkbox("Rebuild cached feature stores", value=False)
-    
-    run_scan = st.button("🚀 Run Scan", type="primary")
+
+    with st.form("run_scan_form"):
+        run_scan = st.form_submit_button("🚀 Run Scan", type="primary")
 
 if not symbols:
-    st.warning("Please provide symbols via upload, paste, or use defaults.")
+    st.warning("Provide at least one symbol.")
     st.stop()
 
 if run_scan:
@@ -738,183 +866,104 @@ if run_scan:
             path = feature_store_path(symbol, years, benchmark_symbol)
             if path.exists():
                 path.unlink(missing_ok=True)
-    
     rows = []
-    history_map = {}
-    analog_map = {}
-    
-    progress = st.progress(0)
     debug_rows = []
-    
+    detail_rows = {}
+    analogs_map = {}
+    live_rows_map = {}
+    progress = st.progress(0.0)
     for i, symbol in enumerate(symbols):
-        progress.progress((i + 1) / len(symbols))
-        
-        # Load historical feature store
-        feat = load_or_build_feature_store(symbol, years, benchmark_symbol)
-        if feat is None or feat.empty:
-            debug_rows.append({"symbol": symbol, "status": "no history returned"})
+        progress.progress((i + 1) / max(1, len(symbols)))
+        current_row, hist_feat, status = build_live_or_historical_row(symbol, benchmark_symbol, years, analysis_mode, pd.Timestamp(analysis_date))
+        if status != "ok" or current_row is None or hist_feat is None:
+            debug_rows.append({"symbol": symbol, "status": status})
             continue
-        
-        # Get live data for current signal
-        live_df = get_live_daily(symbol)
-        if live_df is None or live_df.empty:
-            debug_rows.append({"symbol": symbol, "status": "no live data"})
+        detail, analogs = scan_symbol(symbol, current_row=current_row, hist_feat=hist_feat, analog_count=analog_count)
+        if detail is None or analogs is None or analogs.empty:
+            debug_rows.append({"symbol": symbol, "status": "no analogs after feature filtering", "hist_rows": len(hist_feat)})
             continue
-        
-        live_bench = get_benchmark(benchmark_symbol, years=years)
-        live_feat = build_features(live_df, live_bench)
-        live_feat = add_returns(live_feat)
-        
-        if live_feat.empty:
-            debug_rows.append({"symbol": symbol, "status": "no live features"})
-            continue
-        
-        current = live_feat.iloc[-1].copy()
-        
-        # Find analogs
-        analogs = find_analogs(feat, n=analog_count)
-        
-        if analogs.empty:
-            debug_rows.append({"symbol": symbol, "status": "no analogs", "hist_rows": len(feat)})
-            continue
-        
-        stats = weighted_stats(analogs)
-        conf = confidence_score(analogs, current, stats)
-        
-        # Calculate bull/bear scores
-        bull_score, bull_reasons = calculate_bull_score(current)
-        bear_score, bear_reasons = calculate_bear_score(current)
-        signal_type, option_type, signal_conf = get_signal_type(bull_score, bear_score)
-        
-        rows.append({
-            "symbol": symbol,
-            "Signal": signal_type,
-            "Bull Score": bull_score,
-            "Bear Score": bear_score,
-            "Confidence": conf,
-            "TSI747": float(current.get("TSI_747", 0)),
-            "RSI14": float(current.get("RSI14", 0)),
-            "CCI15": float(current.get("CCI15", 0)),
-            "BBP": float(current.get("BBP", 0)),
-            "Candle": float(current.get("candle_score", 0)),
-            "Bull Kiss": int(current.get("bull_kiss_score", 0)),
-            "Bear Kiss": int(current.get("bear_kiss_score", 0)),
-            "State": setup_label(current),
-            "Why": why_text(current)[:100],
-        })
-        
-        history_map[symbol] = feat
-        analog_map[symbol] = analogs
-    
+        rows.append(detail)
+        detail_rows[symbol] = detail
+        analogs_map[symbol] = analogs
+        live_rows_map[symbol] = current_row
     progress.empty()
-    
-    if not rows:
-        st.error("No valid symbols were processed.")
-        if debug_rows:
-            st.subheader("Debug Info")
-            st.dataframe(pd.DataFrame(debug_rows), width='stretch')
-        st.stop()
-    
-    results = pd.DataFrame(rows).sort_values(["Confidence", "Bull Score"], ascending=[False, False])
-    
-    st.subheader("🏆 Ranked Setups")
-    st.dataframe(results, width='stretch', use_container_width=True)
-    
-    if debug_rows:
-        with st.expander("Skipped symbols / debug details"):
-            st.dataframe(pd.DataFrame(debug_rows), width='stretch')
-    
-    # Detailed inspection
-    st.subheader("🔬 Detailed Analysis")
-    selected = st.selectbox("Select symbol to inspect", results["symbol"].tolist())
-    
-    if selected:
-        selected_row = results[results["symbol"] == selected].iloc[0]
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Signal", selected_row["Signal"])
-        col2.metric("Bull Score", f"{selected_row['Bull Score']:.1f}")
-        col3.metric("Bear Score", f"{selected_row['Bear Score']:.1f}")
-        col4.metric("Confidence", f"{selected_row['Confidence']:.0f}%")
-        
-        # Show signals
-        current_hist = history_map[selected]
-        live_df = get_live_daily(selected)
-        if live_df is not None and not live_df.empty:
-            live_bench = get_benchmark(benchmark_symbol, years=years)
-            live_feat = build_features(live_df, live_bench)
-            current = live_feat.iloc[-1] if not live_feat.empty else None
-            
-            if current is not None:
-                bull_score, bull_reasons = calculate_bull_score(current)
-                bear_score, bear_reasons = calculate_bear_score(current)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**🟢 Bullish Signals**")
-                    if bull_reasons:
-                        for r in bull_reasons:
-                            st.write(f"  ✅ {r}")
-                    else:
-                        st.write("No bullish signals")
-                
-                with col2:
-                    st.markdown("**🔴 Bearish Signals**")
-                    if bear_reasons:
-                        for r in bear_reasons:
-                            st.write(f"  ⚠️ {r}")
-                    else:
-                        st.write("No bearish signals")
-        
-        # Options
-        signal_type = selected_row["Signal"]
-        if "BULL" in signal_type:
-            option_type = "CALL"
-            st.subheader(f"📈 Call Options for {selected}")
-            opt = get_option_candidates(selected, "CALL")
-            if opt is not None:
-                st.dataframe(opt, width='stretch', use_container_width=True)
-            else:
-                st.info(f"No call options available for {selected}")
-        
-        elif "BEAR" in signal_type:
-            st.subheader(f"📉 Put Options for {selected}")
-            opt = get_option_candidates(selected, "PUT")
-            if opt is not None:
-                st.dataframe(opt, width='stretch', use_container_width=True)
-            else:
-                st.info(f"No put options available for {selected}")
-        
-        # Analog matches
-        st.subheader(f"📊 Historical Analog Matches for {selected}")
-        analogs = analog_map[selected]
-        if analogs is not None and not analogs.empty:
-            analog_show = analogs[["close", "ret1", "ret2", "ret5", "similarity", "state_747", "bear_kiss_score", "candle_score"]].tail(15)
-            st.dataframe(analog_show, width='stretch', use_container_width=True)
-        else:
-            st.info("No analog matches found")
+    if rows:
+        results = pd.DataFrame(rows).sort_values(["Confidence", "Bear Score", "Bull Score"], ascending=[False, False, False]).reset_index(drop=True)
+        st.session_state.scan_results = results
+        st.session_state.debug_rows = debug_rows
+        st.session_state.detail_rows = detail_rows
+        st.session_state.analogs_map = analogs_map
+        st.session_state.live_rows_map = live_rows_map
+    else:
+        st.session_state.scan_results = None
+        st.session_state.debug_rows = debug_rows
+        st.session_state.detail_rows = {}
+        st.session_state.analogs_map = {}
+        st.session_state.live_rows_map = {}
 
-else:
-    st.info("👈 Select symbol source and click 'Run Scan'")
-    
-    with st.expander("📋 How to use"):
-        st.markdown("""
-        **1. Provide symbols via:**
-        - Upload CSV with 'symbol' column (from your liquidity scan)
-        - Paste symbols (comma or line separated)
-        - Use default symbols
-        
-        **2. Click 'Run Scan'**
-        
-        **3. Results show:**
-        - Bull/Bear signal with confidence
-        - Bull/Bear scores with specific reasons
-        - Option recommendations (CALL for BULL, PUT for BEAR)
-        - Historical analog matches
-        
-        **The scanner uses:**
-        - TSI (4,2,4 / 7,4,7 / 13,7,7 / 25,13,7)
-        - CCI, RSI, BB%
-        - Kiss patterns detection
-        - Analog pattern matching from historical data
-        """)
+results = st.session_state.scan_results
+debug_rows = st.session_state.debug_rows
+detail_rows = st.session_state.detail_rows
+analogs_map = st.session_state.analogs_map
+live_rows_map = st.session_state.live_rows_map
+
+if results is None or results.empty:
+    st.info("Run the scan to see ranked setups.")
+    if debug_rows:
+        st.subheader("Debug")
+        st.dataframe(pd.DataFrame(debug_rows), width="stretch")
+    st.stop()
+
+st.subheader("🏆 Ranked Setups")
+display_cols = ["symbol", "Signal", "Option Type", "Confidence", "Position Size %", "Bull Score", "Bear Score", "RipProb_1d", "RipProb_2d", "RipProb_5d", "DipProb_1d", "DipProb_2d", "DipProb_5d", "TSI_424", "TSI_747", "CCI15", "MFI14", "BBP", "StretchATR", "Expected Move %", "Bull Kiss", "Bear Kiss", "State", "Why", "Row Date"]
+display_cols = [c for c in display_cols if c in results.columns]
+st.dataframe(results[display_cols], width="stretch")
+
+if debug_rows:
+    with st.expander("Skipped symbols / debug details"):
+        st.dataframe(pd.DataFrame(debug_rows), width="stretch")
+
+st.subheader("🔬 Detailed Analysis")
+selected = st.selectbox("Select symbol to inspect", results["symbol"].tolist(), key="inspect_symbol")
+if selected:
+    detail = detail_rows[selected]
+    analogs = analogs_map[selected]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Signal", detail["Signal"])
+    c2.metric("Bull Score", f"{detail['Bull Score']:.1f}")
+    c3.metric("Bear Score", f"{detail['Bear Score']:.1f}")
+    c4.metric("Confidence", f"{detail['Confidence']:.0f}%")
+    c5, c6, c7, c8, c9, c10 = st.columns(6)
+    c5.metric("TSI 4,2,4", f"{detail['TSI_424']:.2f}")
+    c6.metric("TSI 7,4,7", f"{detail['TSI_747']:.2f}")
+    c7.metric("CCI15", f"{detail['CCI15']:.1f}")
+    c8.metric("BB%", f"{detail['BBP']:.3f}")
+    c9.metric("MFI14", f"{detail['MFI14']:.1f}")
+    c10.metric("Stretch/ATR", f"{detail['StretchATR']:.2f}")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**🟢 Bullish reasons**")
+        for r in detail["Bull Reasons"]:
+            st.write(f"✅ {r}")
+    with right:
+        st.markdown("**🔴 Bearish reasons**")
+        for r in detail["Bear Reasons"]:
+            st.write(f"⚠️ {r}")
+    st.markdown(f"**Why:** {detail['Why']}")
+    st.write(f"Expected move: **{detail.get('Expected Move %', np.nan):.2f}%** | Suggested size: **{detail.get('Position Size %', np.nan):.1f}%** of max risk budget")
+    option_type = detail["Option Type"]
+    if option_type in {"CALL", "PUT"} and analysis_mode == "Current":
+        st.subheader(f"📦 {option_type} option candidates")
+        opts = get_option_candidates(selected, option_type=option_type)
+        if opts is not None and not opts.empty:
+            st.dataframe(opts, width="stretch")
+        else:
+            st.info(f"No live {option_type.lower()} candidates available right now.")
+    elif analysis_mode == "Historical":
+        st.info("Historical mode shows what the signal would have been on that date. Historical option chains are not included.")
+    st.subheader("📊 Historical analog matches")
+    show_cols = ["close", "ret1", "ret2", "ret5", "similarity", "state_747", "bull_kiss_score", "bear_kiss_score", "candle_score"]
+    show_cols = [c for c in show_cols if c in analogs.columns]
+    st.dataframe(analogs[show_cols].sort_values("similarity", ascending=False).head(15), width="stretch")
+    st.subheader("🗓 Historical lookback snapshot")
+    st.write(f"As-of row date: **{detail['Row Date']}** | Expected 1d: **{detail['ExpRet_1d']:.2f}%** | Expected 2d: **{detail['ExpRet_2d']:.2f}%** | Expected 5d: **{detail['ExpRet_5d']:.2f}%**")
