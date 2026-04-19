@@ -391,38 +391,43 @@ def fetch_daily_history_with_priority(ticker: str, uploaded_history: Dict[str, p
         "yahoo_status": "not_checked",
     }
 
+    def fetch_yahoo_daily_refresh() -> Tuple[pd.DataFrame, str]:
+        recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
+        if recent is not None and not recent.empty:
+            return recent, f"recent_ok:{len(recent)}"
+        full = fetch_yahoo_prices(tkr, "1d", period=f"{max(years, 5)}y")
+        if full is not None and not full.empty:
+            return full, f"full_ok:{len(full)}"
+        return pd.DataFrame(), "empty_or_rate_limited"
+
     if tkr in uploaded_history:
         base = uploaded_history.get(tkr, pd.DataFrame())
         if base is not None and not base.empty:
             fetch_meta["upload_status"] = f"matched:{len(base)}"
-            recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
-            fetch_meta["yahoo_status"] = "gap_ok" if recent is not None and not recent.empty else "gap_empty"
-            merged = merge_history_with_recent(base, recent)
-            source = "upload+yahoo_gap" if recent is not None and not recent.empty and len(merged) > len(base) else "upload"
+            yahoo_refresh, yahoo_status = fetch_yahoo_daily_refresh()
+            fetch_meta["yahoo_status"] = yahoo_status
+            merged = merge_history_with_recent(base, yahoo_refresh)
+            source = "upload+yahoo_refresh" if yahoo_refresh is not None and not yahoo_refresh.empty and len(merged) > len(base) else "upload"
             fetch_meta["daily_rows"] = str(len(merged))
             return merged, source, fetch_meta
         fetch_meta["upload_status"] = "matched_empty"
     else:
         fetch_meta["upload_status"] = "not_matched"
 
+    yahoo_primary, yahoo_status = fetch_yahoo_daily_refresh()
+    fetch_meta["yahoo_status"] = yahoo_status
+    if yahoo_primary is not None and not yahoo_primary.empty:
+        fetch_meta["daily_rows"] = str(len(yahoo_primary))
+        fetch_meta["defeat_status"] = "bypassed_due_to_fresh_yahoo"
+        return yahoo_primary, "yahoo_primary", fetch_meta
+
     defeat_df = fetch_defeat_history(tkr, years=max(years, 5))
     if defeat_df is not None and not defeat_df.empty:
         fetch_meta["defeat_status"] = f"ok:{len(defeat_df)}"
-        recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
-        fetch_meta["yahoo_status"] = "gap_ok" if recent is not None and not recent.empty else "gap_empty"
-        merged = merge_history_with_recent(defeat_df, recent)
-        source = "defeatbeta+yahoo_gap" if recent is not None and not recent.empty and len(merged) > len(defeat_df) else "defeatbeta"
-        fetch_meta["daily_rows"] = str(len(merged))
-        return merged, source, fetch_meta
+        fetch_meta["daily_rows"] = str(len(defeat_df))
+        return defeat_df, "defeatbeta_stale_fallback", fetch_meta
     fetch_meta["defeat_status"] = "empty"
 
-    yahoo_df = fetch_yahoo_prices(tkr, "1d", period=f"{max(years, 5)}y")
-    if yahoo_df is not None and not yahoo_df.empty:
-        fetch_meta["yahoo_status"] = f"ok:{len(yahoo_df)}"
-        fetch_meta["daily_rows"] = str(len(yahoo_df))
-        return yahoo_df, "yahoo_only", fetch_meta
-
-    fetch_meta["yahoo_status"] = "empty_or_rate_limited"
     fetch_meta["daily_rows"] = "0"
     return pd.DataFrame(), "none", fetch_meta
 
