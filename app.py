@@ -870,8 +870,12 @@ with st.sidebar:
     analog_count = st.slider("Analogs", 5, 30, 15)
     mc_sims = st.slider("Monte Carlo simulations", 500, 5000, 1000, 500)
     show_options = st.checkbox("Show option chains", value=False)
+    alpha_vantage_key = st.text_input("Alpha Vantage API key", value="", type="password")
     enable_calendar_lookback = st.checkbox("Calendar lookback", value=True)
     run_analysis = st.button("Run Analysis", type="primary", width='stretch')
+
+
+alpha_vantage_key = (alpha_vantage_key or "").strip()
 
 st.info("The app should render immediately. Heavy work starts only after you press Run Analysis.")
 
