@@ -1,46 +1,38 @@
-"""
-Stable Market Engine v4 - Complete
-- Multiple DefeatBeta import paths
-- Comprehensive error handling
-- Retry logic with exponential backoff
-- Fallback to cached data
-- ETF detection to skip DefeatBeta for known tickers
-"""
-
 import io
+import os
 import re
 import time
-import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import requests
 import yfinance as yf
+from scipy.spatial.distance import cdist
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / "cache_store"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-st.set_page_config(page_title="Stable Market Engine v4", layout="wide", initial_sidebar_state="expanded")
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+st.set_page_config(page_title="Stock Analyzer Ultimate v2.1", layout="wide", initial_sidebar_state="expanded")
 
 SECTOR_ETFS = {
-    "XLK": "Technology", "XLF": "Financials", "XLI": "Industrials", "XLY": "Consumer Discretionary",
-    "XLP": "Consumer Staples", "XLE": "Energy", "XLV": "Health Care", "XLB": "Materials",
-    "XLU": "Utilities", "XLC": "Communication Services", "SMH": "Semiconductors",
+    "XLK": "Technology",
+    "XLF": "Financials",
+    "XLI": "Industrials",
+    "XLY": "Consumer Discretionary",
+    "XLP": "Consumer Staples",
+    "XLE": "Energy",
+    "XLV": "Health Care",
+    "XLB": "Materials",
+    "XLU": "Utilities",
+    "XLC": "Communication Services",
+    "SMH": "Semiconductors",
 }
-
-# ETFs that DefeatBeta likely doesn't have (use Yahoo only)
-ETF_TICKERS = {"SMH", "XLF", "XLK", "XLI", "XLY", "XLP", "XLE", "XLV", "XLB", "XLU", "XLC", 
-               "QQQ", "SPY", "IWM", "RSP", "DIA", "TQQQ", "SQQQ", "SOXL", "SOXS"}
 
 DAILY_ANALOG_FEATURES = [
     "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3", "uo_cross_up", "uo_cross_down",
@@ -59,31 +51,6 @@ for key in ["detail_data", "results_df"]:
     if key not in st.session_state:
         st.session_state[key] = {} if key == "detail_data" else None
 
-
-# ============================================================================
-# DEFEATBETA IMPORT WITH MULTIPLE PATHS
-# ============================================================================
-
-DEFEATBETA_AVAILABLE = False
-DEFEATBETA_ERROR = None
-
-try:
-    from defeatbeta_api import Ticker as DefeatTicker
-    DEFEATBETA_AVAILABLE = True
-    print("DefeatBeta imported from defeatbeta_api")
-except Exception as e1:
-    try:
-        from defeatbeta_api.data.ticker import Ticker as DefeatTicker
-        DEFEATBETA_AVAILABLE = True
-        print("DefeatBeta imported from defeatbeta_api.data.ticker")
-    except Exception as e2:
-        DEFEATBETA_ERROR = f"defeatbeta_api: {e1} | defeatbeta_api.data.ticker: {e2}"
-        print(f"DefeatBeta not available: {DEFEATBETA_ERROR}")
-
-
-# ============================================================================
-# INDICATOR FUNCTIONS
-# ============================================================================
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
@@ -187,7 +154,173 @@ def compute_vwap(df: pd.DataFrame) -> pd.Series:
     return cum_pv / cum_v.replace(0, np.nan)
 
 
-def normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+
+
+def align_timestamp_to_index(index: pd.Index, ts_like) -> pd.Timestamp:
+    ts = pd.Timestamp(ts_like)
+    if isinstance(index, pd.DatetimeIndex):
+        if index.tz is not None:
+            if ts.tzinfo is None:
+                return ts.tz_localize(index.tz)
+            return ts.tz_convert(index.tz)
+        if ts.tzinfo is not None:
+            return ts.tz_localize(None)
+    return ts
+
+
+def slice_to_analysis_ts(df: pd.DataFrame, analysis_ts_end) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    ts = align_timestamp_to_index(df.index, analysis_ts_end)
+    return df.loc[df.index <= ts].copy()
+
+
+def re_enrich_sliced_views(hourly_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, benchmark_daily: pd.DataFrame):
+    daily_view = add_forward_returns(enrich_price_features(daily_df, "daily", benchmark_daily)) if not daily_df.empty else pd.DataFrame()
+    weekly_view = enrich_price_features(weekly_df, "weekly", benchmark_daily) if not weekly_df.empty else pd.DataFrame()
+    hourly_view = add_forward_returns(enrich_price_features(hourly_df, "hourly", benchmark_daily)) if not hourly_df.empty else pd.DataFrame()
+    return hourly_view, daily_view, weekly_view
+
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_alpha_vantage_prices(ticker: str, interval: str, api_key: str = "") -> pd.DataFrame:
+    ticker = str(ticker).strip().upper()
+    api_key = str(api_key or "").strip()
+    if not ticker or not api_key:
+        return pd.DataFrame()
+    try:
+        if interval == "1d":
+            params = {
+                "function": "TIME_SERIES_DAILY_ADJUSTED",
+                "symbol": ticker,
+                "outputsize": "full",
+                "apikey": api_key,
+            }
+            r = requests.get("https://www.alphavantage.co/query", params=params, timeout=20)
+            data = r.json()
+            ts = data.get("Time Series (Daily)", {})
+            if not ts:
+                return pd.DataFrame()
+            rows = []
+            for dt, vals in ts.items():
+                rows.append({
+                    "Date": pd.to_datetime(dt),
+                    "Open": pd.to_numeric(vals.get("1. open"), errors="coerce"),
+                    "High": pd.to_numeric(vals.get("2. high"), errors="coerce"),
+                    "Low": pd.to_numeric(vals.get("3. low"), errors="coerce"),
+                    "Close": pd.to_numeric(vals.get("5. adjusted close") or vals.get("4. close"), errors="coerce"),
+                    "Volume": pd.to_numeric(vals.get("6. volume") or vals.get("5. volume"), errors="coerce"),
+                })
+            df = pd.DataFrame(rows).dropna(subset=["Date", "Open", "High", "Low", "Close"])
+            if df.empty:
+                return pd.DataFrame()
+            return df.set_index("Date").sort_index()[["Open", "High", "Low", "Close", "Volume"]]
+        if interval == "60min":
+            params = {
+                "function": "TIME_SERIES_INTRADAY",
+                "symbol": ticker,
+                "interval": "60min",
+                "outputsize": "full",
+                "extended_hours": "false",
+                "apikey": api_key,
+            }
+            r = requests.get("https://www.alphavantage.co/query", params=params, timeout=20)
+            data = r.json()
+            ts = data.get("Time Series (60min)", {})
+            if not ts:
+                return pd.DataFrame()
+            rows = []
+            for dt, vals in ts.items():
+                rows.append({
+                    "Date": pd.to_datetime(dt),
+                    "Open": pd.to_numeric(vals.get("1. open"), errors="coerce"),
+                    "High": pd.to_numeric(vals.get("2. high"), errors="coerce"),
+                    "Low": pd.to_numeric(vals.get("3. low"), errors="coerce"),
+                    "Close": pd.to_numeric(vals.get("4. close"), errors="coerce"),
+                    "Volume": pd.to_numeric(vals.get("5. volume"), errors="coerce"),
+                })
+            df = pd.DataFrame(rows).dropna(subset=["Date", "Open", "High", "Low", "Close"])
+            if df.empty:
+                return pd.DataFrame()
+            return df.set_index("Date").sort_index()[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_yahoo_prices(ticker: str, interval: str, period: Optional[str] = None) -> pd.DataFrame:
+    ticker = str(ticker).strip().upper()
+    if not ticker or not re.fullmatch(r"[A-Z][A-Z0-9.\-\^=]{0,9}", ticker):
+        return pd.DataFrame()
+    for attempt in range(3):
+        try:
+            df = yf.download(
+                tickers=ticker,
+                interval=interval,
+                period=period or "1y",
+                progress=False,
+                auto_adjust=True,
+                threads=False,
+                group_by="column",
+                prepost=False,
+            )
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df.droplevel(0, axis=1)
+            if df is None or df.empty:
+                return pd.DataFrame()
+            df = df.rename(columns=str.title)
+            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[keep].dropna(how="all")
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index, errors="coerce")
+            df = df[~df.index.isna()].sort_index()
+            return df
+        except Exception as e:
+            msg = str(e).lower()
+            if "rate" in msg or "too many requests" in msg:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_defeat_history(ticker: str, years: int = 5) -> pd.DataFrame:
+    try:
+        try:
+            from defeatbeta_api import Ticker as DefeatTicker
+        except Exception:
+            from defeatbeta_api.data.ticker import Ticker as DefeatTicker
+    except Exception:
+        return pd.DataFrame()
+
+    try:
+        t = DefeatTicker(ticker)
+        df = t.price()
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        rename_map = {
+            "report_date": "Date", "date": "Date", "open": "Open", "high": "High",
+            "low": "Low", "close": "Close", "volume": "Volume",
+        }
+        df = df.rename(columns=rename_map)
+        needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        if not all(c in df.columns for c in needed):
+            return pd.DataFrame()
+        df = df[needed].copy()
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        return df.tail(int(years * 252 * 1.3))
+    except Exception:
+        return pd.DataFrame()
+
+
+def normalize_history_frame(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -211,10 +344,10 @@ def normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.rename(columns=rename_map)
     if "Date" not in out.columns:
         out = out.reset_index()
-        if "index" in out.columns and "Date" not in out.columns:
+        if "Date" not in out.columns and "index" in out.columns:
             out = out.rename(columns={"index": "Date"})
-    need = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    if not all(c in out.columns for c in need):
+    needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    if not all(c in out.columns for c in needed):
         return pd.DataFrame()
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
     out = out.dropna(subset=["Date"]).sort_values("Date")
@@ -228,6 +361,23 @@ def normalize_history_text(text_blob: str, fallback_ticker: str = "") -> Dict[st
     out: Dict[str, pd.DataFrame] = {}
     if not text_blob.strip():
         return out
+    lines = [line.rstrip() for line in text_blob.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return out
+    first_parts = [x.strip() for x in lines[0].split(",")]
+    second_parts = [x.strip() for x in lines[1].split(",")]
+    stockcharts_like = (
+        len(first_parts) == 2 and first_parts[0] and first_parts[1].lower().startswith(("daily", "weekly", "monthly"))
+        and len(second_parts) >= 5 and second_parts[0].lower() == "date"
+    )
+    if stockcharts_like:
+        ticker = first_parts[0].upper() or fallback_ticker.upper()
+        body = "\n".join(lines[1:])
+        df = pd.read_csv(io.StringIO(body), skipinitialspace=True)
+        norm = normalize_history_frame(df)
+        if ticker and not norm.empty:
+            out[ticker] = norm
+        return out
     try:
         df = pd.read_csv(io.StringIO(text_blob), skipinitialspace=True)
     except Exception:
@@ -236,12 +386,12 @@ def normalize_history_text(text_blob: str, fallback_ticker: str = "") -> Dict[st
     ticker_col = cols_lower.get("ticker") or cols_lower.get("symbol")
     if ticker_col is not None:
         for tkr, grp in df.groupby(ticker_col):
-            norm = normalize_ohlcv_columns(grp.drop(columns=[ticker_col]))
+            norm = normalize_history_frame(grp.drop(columns=[ticker_col]))
             tkr = str(tkr).strip().upper()
             if tkr and not norm.empty:
                 out[tkr] = norm
         return out
-    norm = normalize_ohlcv_columns(df)
+    norm = normalize_history_frame(df)
     ticker = fallback_ticker.upper()
     if ticker and not norm.empty:
         out[ticker] = norm
@@ -273,12 +423,12 @@ def load_history_uploads(files) -> Dict[str, pd.DataFrame]:
                 ticker_col = cols_lower.get("ticker") or cols_lower.get("symbol")
                 if ticker_col is not None:
                     for tkr, grp in raw.groupby(ticker_col):
-                        norm = normalize_ohlcv_columns(grp.drop(columns=[ticker_col]))
+                        norm = normalize_history_frame(grp.drop(columns=[ticker_col]))
                         tkr = str(tkr).strip().upper()
                         if tkr and not norm.empty:
                             parsed[tkr] = norm
                 else:
-                    norm = normalize_ohlcv_columns(raw)
+                    norm = normalize_history_frame(raw)
                     if ticker and not norm.empty:
                         parsed[ticker] = norm
             except Exception:
@@ -292,262 +442,100 @@ def load_history_uploads(files) -> Dict[str, pd.DataFrame]:
 
 
 def merge_history_with_recent(base_df: pd.DataFrame, recent_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge base history with recent Yahoo data, keeping latest values"""
     if base_df is None or base_df.empty:
         return recent_df.copy() if recent_df is not None else pd.DataFrame()
     if recent_df is None or recent_df.empty:
         return base_df.copy()
-    cutoff = pd.to_datetime(base_df.index.max()) - pd.Timedelta(days=5)
+    cutoff = pd.to_datetime(base_df.index.max()) - pd.Timedelta(days=3)
     recent_only = recent_df[recent_df.index >= cutoff]
     merged = pd.concat([base_df, recent_only])
     merged = merged[~merged.index.duplicated(keep="last")].sort_index()
     return merged
 
 
-def get_cached_data_path(ticker: str, data_type: str) -> Path:
-    """Get path for cached parquet file"""
-    safe_ticker = re.sub(r"[^A-Z0-9]", "_", ticker.upper())
-    return CACHE_DIR / f"{safe_ticker}_{data_type}.parquet"
-
-
-def save_to_cache(ticker: str, data_type: str, df: pd.DataFrame) -> None:
-    """Save DataFrame to cache"""
-    if df is None or df.empty:
-        return
-    try:
-        path = get_cached_data_path(ticker, data_type)
-        df.to_parquet(path)
-    except Exception as e:
-        st.warning(f"Failed to cache {ticker} {data_type}: {e}")
-
-
-def load_from_cache(ticker: str, data_type: str, max_age_hours: float = 24) -> pd.DataFrame:
-    """Load from cache if not too old"""
-    path = get_cached_data_path(ticker, data_type)
-    if not path.exists():
-        return pd.DataFrame()
-    
-    # Check age
-    age_hours = (time.time() - path.stat().st_mtime) / 3600.0
-    if age_hours > max_age_hours:
-        return pd.DataFrame()
-    
-    try:
-        df = pd.read_parquet(path)
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index, errors="coerce")
-        return df.sort_index()
-    except Exception:
-        return pd.DataFrame()
-
-
-# ============================================================================
-# YAHOO FETCH WITH RETRIES
-# ============================================================================
-
-def fetch_yahoo_with_retry(ticker: str, interval: str, period: str, max_retries: int = 5) -> Tuple[pd.DataFrame, str]:
-    """Fetch Yahoo data with exponential backoff retries"""
-    ticker = str(ticker).strip().upper()
-    
-    for attempt in range(max_retries):
-        try:
-            wait_time = 1.5 * (attempt + 1)  # 1.5, 3, 4.5, 6, 7.5 seconds
-            if attempt > 0:
-                time.sleep(wait_time)
-            
-            df = yf.download(
-                tickers=ticker,
-                interval=interval,
-                period=period,
-                progress=False,
-                auto_adjust=True,
-                threads=False,
-                group_by="column",
-                prepost=False,
-            )
-            
-            if isinstance(df.columns, pd.MultiIndex):
-                df = df.droplevel(0, axis=1)
-            
-            if df is None or df.empty:
-                continue
-                
-            df = df.rename(columns=str.title)
-            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[keep].dropna(how="all")
-            
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df.index = pd.to_datetime(df.index, errors="coerce")
-            df = df[~df.index.isna()].sort_index()
-            
-            if not df.empty:
-                return df, f"yahoo_ok_attempt_{attempt+1}"
-                
-        except Exception as e:
-            msg = str(e).lower()
-            if "rate" in msg or "too many" in msg:
-                if attempt < max_retries - 1:
-                    continue
-            return pd.DataFrame(), f"yahoo_error_{type(e).__name__}"
-    
-    return pd.DataFrame(), "yahoo_max_retries_exceeded"
-
-
-# ============================================================================
-# DEFEATBETA FETCH WITH ERROR HANDLING
-# ============================================================================
-
-def fetch_defeat_history(ticker: str, years: int = 5) -> Tuple[pd.DataFrame, str]:
-    """Fetch DefeatBeta data with comprehensive error handling"""
-    if not DEFEATBETA_AVAILABLE:
-        return pd.DataFrame(), f"defeatbeta_not_available: {DEFEATBETA_ERROR}"
-    
-    # Skip ETFs that DefeatBeta likely doesn't have
-    if ticker.upper() in ETF_TICKERS:
-        return pd.DataFrame(), "defeatbeta_skipped_etf"
-    
-    try:
-        t = DefeatTicker(ticker)
-        df = t.price()
-        
-        if df is None:
-            return pd.DataFrame(), "defeatbeta_returned_none"
-        
-        if len(df) == 0:
-            return pd.DataFrame(), "defeatbeta_empty_dataframe"
-        
-        # Normalize columns
-        rename_map = {
-            "report_date": "Date", "date": "Date", "open": "Open", "high": "High",
-            "low": "Low", "close": "Close", "volume": "Volume",
-        }
-        df = df.rename(columns=rename_map)
-        
-        needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
-        if not all(c in df.columns for c in needed):
-            return pd.DataFrame(), f"defeatbeta_missing_columns: {df.columns.tolist()}"
-        
-        df = df[needed].copy()
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-        
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        
-        if df.empty:
-            return pd.DataFrame(), "defeatbeta_no_valid_rows"
-        
-        # Limit to requested years
-        df = df.tail(int(years * 252 * 1.3))
-        
-        return df, f"defeatbeta_ok_{len(df)}_rows"
-        
-    except Exception as e:
-        return pd.DataFrame(), f"defeatbeta_exception_{type(e).__name__}: {str(e)[:100]}"
-
-
-# ============================================================================
-# OPTIMIZED DAILY FETCH WITH CACHE FALLBACK
-# ============================================================================
-
-def fetch_daily_history_optimized(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int = 5) -> Tuple[pd.DataFrame, str, Dict[str, str]]:
-    """
-    Priority: Cache → Upload → DefeatBeta → Yahoo → Stale Cache Fallback
-    """
+def fetch_daily_history_with_priority(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int, alpha_vantage_key: str = "") -> Tuple[pd.DataFrame, str, Dict[str, str]]:
     tkr = ticker.upper()
-    meta = {
-        "upload_status": "not_matched",
+    fetch_meta = {
+        "upload_status": "not_checked",
         "defeat_status": "not_checked",
         "yahoo_status": "not_checked",
-        "cache_status": "not_checked",
-        "daily_rows": "0",
-        "error_details": "",
+        "alpha_status": "not_checked",
     }
-    
-    # PRIORITY 1: Check cache first (fastest)
-    cached = load_from_cache(tkr, "daily", max_age_hours=48)
-    if not cached.empty:
-        meta["cache_status"] = f"ok_{len(cached)}_rows"
-        meta["daily_rows"] = str(len(cached))
-        # Still try to refresh in background? For now, use cache
-        return cached, "cache", meta
-    
-    # PRIORITY 2: Uploaded history (user provides)
+
+    def fetch_live_daily_refresh() -> Tuple[pd.DataFrame, str, str]:
+        recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
+        if recent is not None and not recent.empty:
+            return recent, f"recent_ok:{len(recent)}", "not_needed"
+        full = fetch_yahoo_prices(tkr, "1d", period=f"{max(years, 5)}y")
+        if full is not None and not full.empty:
+            return full, f"full_ok:{len(full)}", "not_needed"
+        av = fetch_alpha_vantage_prices(tkr, "1d", alpha_vantage_key)
+        if av is not None and not av.empty:
+            return av, "empty_or_rate_limited", f"ok:{len(av)}"
+        return pd.DataFrame(), "empty_or_rate_limited", "empty_or_missing_key"
+
     if tkr in uploaded_history:
         base = uploaded_history.get(tkr, pd.DataFrame())
         if base is not None and not base.empty:
-            meta["upload_status"] = f"matched:{len(base)}"
-            # Only fetch recent days from Yahoo (last 10 days)
-            recent, yahoo_status = fetch_yahoo_with_retry(tkr, "1d", "10d")
-            meta["yahoo_status"] = yahoo_status
-            merged = merge_history_with_recent(base, recent)
-            meta["daily_rows"] = str(len(merged))
-            save_to_cache(tkr, "daily", merged)
-            return merged, "upload+yahoo_recent", meta
-    
-    # PRIORITY 3: DefeatBeta (full history, ends ~1 week ago)
-    defeat_df, defeat_status = fetch_defeat_history(tkr, years=years)
-    meta["defeat_status"] = defeat_status
-    
-    if not defeat_df.empty:
-        # ONLY fetch last 10 days from Yahoo to fill the gap
-        recent, yahoo_status = fetch_yahoo_with_retry(tkr, "1d", "10d")
-        meta["yahoo_status"] = yahoo_status
-        merged = merge_history_with_recent(defeat_df, recent)
-        meta["daily_rows"] = str(len(merged))
-        save_to_cache(tkr, "daily", merged)
-        source = "defeatbeta+yahoo_recent" if not recent.empty else "defeatbeta_only"
-        return merged, source, meta
-    
-    # PRIORITY 4: Yahoo full fallback
-    yahoo_df, yahoo_status = fetch_yahoo_with_retry(tkr, "1d", f"{max(years, 2)}y")
-    meta["yahoo_status"] = yahoo_status
-    if not yahoo_df.empty:
-        meta["daily_rows"] = str(len(yahoo_df))
-        save_to_cache(tkr, "daily", yahoo_df)
-        return yahoo_df, "yahoo_fallback", meta
-    
-    # PRIORITY 5: Stale cache fallback (ignore age)
-    stale_cache = load_from_cache(tkr, "daily", max_age_hours=720)  # 30 days
-    if not stale_cache.empty:
-        meta["cache_status"] = f"stale_{len(stale_cache)}_rows"
-        meta["daily_rows"] = str(len(stale_cache))
-        meta["error_details"] = "Using stale cache - Yahoo and DefeatBeta both failed"
-        return stale_cache, "stale_cache_fallback", meta
-    
-    meta["error_details"] = f"No data from any source. DefeatBeta: {defeat_status}, Yahoo: {yahoo_status}"
-    return pd.DataFrame(), "none", meta
+            fetch_meta["upload_status"] = f"matched:{len(base)}"
+            yahoo_refresh, yahoo_status, alpha_status = fetch_live_daily_refresh()
+            fetch_meta["yahoo_status"] = yahoo_status
+            fetch_meta["alpha_status"] = alpha_status
+            merged = merge_history_with_recent(base, yahoo_refresh)
+            source = "upload+yahoo_refresh" if yahoo_refresh is not None and not yahoo_refresh.empty and len(merged) > len(base) else "upload"
+            fetch_meta["daily_rows"] = str(len(merged))
+            return merged, source, fetch_meta
+        fetch_meta["upload_status"] = "matched_empty"
+    else:
+        fetch_meta["upload_status"] = "not_matched"
+
+    yahoo_primary, yahoo_status, alpha_status = fetch_live_daily_refresh()
+    fetch_meta["yahoo_status"] = yahoo_status
+    fetch_meta["alpha_status"] = alpha_status
+    if yahoo_primary is not None and not yahoo_primary.empty:
+        fetch_meta["daily_rows"] = str(len(yahoo_primary))
+        fetch_meta["defeat_status"] = "bypassed_due_to_fresh_yahoo"
+        return yahoo_primary, "yahoo_primary" if yahoo_status != "empty_or_rate_limited" else "alpha_vantage_primary", fetch_meta
+
+    defeat_df = fetch_defeat_history(tkr, years=max(years, 5))
+    if defeat_df is not None and not defeat_df.empty:
+        fetch_meta["defeat_status"] = f"ok:{len(defeat_df)}"
+        fetch_meta["daily_rows"] = str(len(defeat_df))
+        return defeat_df, "defeatbeta_stale_fallback", fetch_meta
+    fetch_meta["defeat_status"] = "empty"
+
+    fetch_meta["daily_rows"] = "0"
+    return pd.DataFrame(), "none", fetch_meta
 
 
-def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int) -> Dict[str, object]:
-    """Fetch hourly, daily, and weekly data with optimized fetching"""
-    daily, history_source, fetch_meta = fetch_daily_history_optimized(ticker, uploaded_history, years)
-    
-    # Hourly data (only from Yahoo, with cache)
-    hourly = pd.DataFrame()
-    hourly_status = "not_fetched"
-    
-    if not daily.empty:
-        # Check hourly cache first
-        hourly = load_from_cache(ticker, "hourly", max_age_hours=12)
-        if hourly.empty:
-            hourly, hourly_status = fetch_yahoo_with_retry(ticker, "1h", "5d")
-            if not hourly.empty:
-                save_to_cache(ticker, "hourly", hourly)
-        else:
-            hourly_status = f"cache_{len(hourly)}_rows"
-    
+def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int, alpha_vantage_key: str = "") -> Dict[str, pd.DataFrame]:
+    daily, history_source, fetch_meta = fetch_daily_history_with_priority(ticker, uploaded_history, years, alpha_vantage_key)
+    hourly = fetch_yahoo_prices(ticker, "1h", period="60d")
+    if hourly is None or hourly.empty:
+        av_hourly = fetch_alpha_vantage_prices(ticker, "60min", alpha_vantage_key)
+        if av_hourly is not None and not av_hourly.empty:
+            hourly = av_hourly
+            fetch_meta["hourly_status"] = f"alpha_vantage_ok:{len(av_hourly)}"
     degraded = False
+    if daily.empty:
+        fetch_meta["hourly_status"] = "skipped_no_daily"
+        return {
+            "hourly": pd.DataFrame(),
+            "daily": pd.DataFrame(),
+            "weekly": pd.DataFrame(),
+            "history_source": history_source,
+            "degraded_hourly": True,
+            "fetch_meta": fetch_meta,
+        }
     if hourly is None or hourly.empty:
         degraded = True
+        fetch_meta["hourly_status"] = fetch_meta.get("hourly_status") or "empty_or_rate_limited_using_daily_fallback"
+        # Degraded placeholder, not true hourly timing
         hourly = resample_ohlcv(daily.tail(120), "B")
-        hourly_status = f"degraded_from_daily_{len(hourly)}_rows"
-    
-    weekly = resample_ohlcv(daily, "W-FRI") if not daily.empty else pd.DataFrame()
-    fetch_meta["hourly_status"] = hourly_status
+    else:
+        fetch_meta["hourly_status"] = fetch_meta.get("hourly_status") or f"ok:{len(hourly)}"
+    weekly = resample_ohlcv(daily, "W-FRI")
     fetch_meta["weekly_rows"] = str(len(weekly))
-    
     return {
         "hourly": hourly,
         "daily": daily,
@@ -558,16 +546,16 @@ def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame]
     }
 
 
-# ============================================================================
-# FEATURE ENGINEERING
-# ============================================================================
-
 def centered_pct(series: pd.Series) -> pd.Series:
     return (series.fillna(0.5) - 0.5) * 2
 
 
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
-    spans = {"hourly": (5, 13, 5), "daily": (8, 21, 7), "weekly": (5, 13, 5)}
+    spans = {
+        "hourly": (5, 13, 5),
+        "daily": (8, 21, 7),
+        "weekly": (5, 13, 5),
+    }
 
     def pct_col(name: str) -> pd.Series:
         if name in out.columns:
@@ -652,10 +640,6 @@ def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ============================================================================
-# SIGNAL CLASSIFICATION
-# ============================================================================
-
 def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, float, str]:
     if row is None or row.empty:
         return "NO DATA", 0.0, "No data"
@@ -698,10 +682,6 @@ def detect_flags(hourly_row: pd.Series, daily_row: pd.Series, weekly_row: pd.Ser
         "dead_cat_risk": bool(weekly_row.get("Close", np.nan) < weekly_row.get("ema_20", np.nan) and daily_row.get("price_slope_3", 0) > 0 and daily_row.get("Close", np.nan) < daily_row.get("ema_20", np.nan)),
     }
 
-
-# ============================================================================
-# ANALOGS & MONTE CARLO
-# ============================================================================
 
 def nearest_analogs(df: pd.DataFrame, feature_cols: List[str], top_n: int = 15) -> pd.DataFrame:
     use = [c for c in feature_cols if c in df.columns]
@@ -833,15 +813,10 @@ def get_option_candidates(symbol: str, option_type: str, max_expirations: int = 
         return pd.DataFrame()
 
 
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
-
 def plot_timeframe_dashboard(symbol: str, hourly_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, as_of_label: Optional[str] = None) -> None:
     fig = make_subplots(
         rows=4, cols=1, vertical_spacing=0.06,
-        subplot_titles=[f"{symbol} Daily Price" + (f" (as of {as_of_label})" if as_of_label else ""), 
-                       "Hourly Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
+        subplot_titles=[f"{symbol} Daily Price" + (f" (as of {as_of_label})" if as_of_label else ""), "Hourly Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
         row_heights=[0.42, 0.19, 0.19, 0.20],
     )
     if not daily_df.empty:
@@ -856,7 +831,7 @@ def plot_timeframe_dashboard(symbol: str, hourly_df: pd.DataFrame, daily_df: pd.
         fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"Signal {row_num}", line=dict(color="black", width=1)), row=row_num, col=1)
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row_num, col=1)
     fig.update_layout(height=950, xaxis_rangeslider_visible=False, legend_orientation="h")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def build_symbol_list(manual_symbols: str, watchlist_file, uploaded_history_map: Dict[str, pd.DataFrame]) -> List[str]:
@@ -880,17 +855,12 @@ def build_symbol_list(manual_symbols: str, watchlist_file, uploaded_history_map:
     return list(dict.fromkeys(symbols))
 
 
-# ============================================================================
-# MAIN APP
-# ============================================================================
+st.title("📊 Stock Analyzer Ultimate v2.1")
+st.caption("Boot-safe | per-timeframe calls | state-aware analogs | Yahoo-protected")
 
-st.title("📊 Stable Market Engine v4")
-st.caption("Complete error handling | Multi-source fallback | Cache-first | Yahoo retries")
-
-# Show DefeatBeta status in sidebar
 with st.sidebar:
     st.header("Input")
-    manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="QQQ, SMH, XLF", height=100)
+    manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="QQQ, SMH, SQQQ", height=100)
     watchlist_file = st.file_uploader("Upload watchlist CSV/XLSX", type=["csv", "xlsx"])
     uploaded_history_files = st.file_uploader("Upload OHLCV files (CSV/XLSX)", type=["csv", "xlsx"], accept_multiple_files=True)
 
@@ -900,24 +870,10 @@ with st.sidebar:
     analog_count = st.slider("Analogs", 5, 30, 15)
     mc_sims = st.slider("Monte Carlo simulations", 500, 5000, 1000, 500)
     show_options = st.checkbox("Show option chains", value=False)
-    
-    st.header("Status")
-    if DEFEATBETA_AVAILABLE:
-        st.success("✅ DefeatBeta available")
-    else:
-        st.error(f"❌ DefeatBeta not available")
-        st.caption(f"Error: {DEFEATBETA_ERROR[:100] if DEFEATBETA_ERROR else 'Unknown'}")
-    
-    run_analysis = st.button("Run Analysis", type="primary", use_container_width=True)
+    enable_calendar_lookback = st.checkbox("Calendar lookback", value=True)
+    run_analysis = st.button("Run Analysis", type="primary", width='stretch')
 
-st.info("""
-**Data Source Strategy:**
-1. **Cache** (fastest, 48-hour TTL)
-2. **Uploaded files** (user provides)
-3. **DefeatBeta** (full history, ETFs skipped)
-4. **Yahoo** (with retries, only last 10 days)
-5. **Stale cache fallback** (if all else fails)
-""")
+st.info("The app should render immediately. Heavy work starts only after you press Run Analysis.")
 
 if not run_analysis:
     st.stop()
@@ -930,10 +886,11 @@ if not symbols:
     st.error("Provide at least one symbol via paste/watchlist or upload OHLCV files named by ticker.")
     st.stop()
 
-# Fetch benchmark
-benchmark_daily, benchmark_source, benchmark_meta = fetch_daily_history_optimized(benchmark, uploaded_history_map, history_years)
+benchmark_daily, _, benchmark_fetch_meta = fetch_daily_history_with_priority(benchmark, uploaded_history_map, history_years, alpha_vantage_key)
+if benchmark_daily.empty:
+    benchmark_daily = fetch_yahoo_prices(benchmark, "1d", period=f"{max(history_years, 5)}y")
 
-st.caption(f"Benchmark: {benchmark} | Source: {benchmark_source} | Rows: {benchmark_meta.get('daily_rows', '0')}")
+st.caption(f"Benchmark fetch: source={benchmark_fetch_meta.get('upload_status','n/a')}/{benchmark_fetch_meta.get('defeat_status','n/a')}/{benchmark_fetch_meta.get('yahoo_status','n/a')}/{benchmark_fetch_meta.get('alpha_status','n/a')} | rows={benchmark_fetch_meta.get('daily_rows','0')}")
 
 results: List[Dict[str, object]] = []
 detail_data: Dict[str, Dict[str, object]] = {}
@@ -941,59 +898,70 @@ progress = st.progress(0.0)
 
 for idx, symbol in enumerate(symbols):
     progress.progress((idx + 1) / len(symbols))
-    
-    data = fetch_multi_timeframe(symbol, uploaded_history_map, history_years)
+    data = fetch_multi_timeframe(symbol, uploaded_history_map, history_years, alpha_vantage_key)
     daily_df = data["daily"]
     hourly_df = data["hourly"]
     weekly_df = data["weekly"]
-    meta = data.get("fetch_meta", {})
-    
     if daily_df.empty:
+        meta = data.get("fetch_meta", {})
         results.append({
             "Symbol": symbol,
             "Status": "No data",
-            "Daily Source": meta.get("defeat_status", "n/a"),
-            "Yahoo Status": meta.get("yahoo_status", "n/a"),
-            "Cache Status": meta.get("cache_status", "n/a"),
-            "Error": meta.get("error_details", "Unknown"),
+            "History Source": data["history_source"],
+            "Upload": meta.get("upload_status", "n/a"),
+            "DefeatBeta": meta.get("defeat_status", "n/a"),
+            "Yahoo Daily": meta.get("yahoo_status", "n/a"),
+            "Hourly Source": meta.get("hourly_status", "n/a"),
+            "Fetch Detail": f"upload={meta.get('upload_status','n/a')} | defeat={meta.get('defeat_status','n/a')} | yahoo={meta.get('yahoo_status','n/a')} | alpha={meta.get('alpha_status','n/a')}",
         })
         continue
-    
-    # Enrich features
+
     daily_df = add_forward_returns(enrich_price_features(daily_df, "daily", benchmark_daily))
     weekly_df = enrich_price_features(weekly_df, "weekly", benchmark_daily)
     hourly_df = add_forward_returns(enrich_price_features(hourly_df, "hourly", benchmark_daily))
-    
+
     hourly_row = hourly_df.iloc[-1] if not hourly_df.empty else pd.Series(dtype=float)
     daily_row = daily_df.iloc[-1]
     weekly_row = weekly_df.iloc[-1] if not weekly_df.empty else pd.Series(dtype=float)
-    
+
     hourly_call, hourly_conf, hourly_reason = classify_timeframe_call(hourly_row, "hourly")
     daily_call, daily_conf, daily_reason = classify_timeframe_call(daily_row, "daily")
     weekly_call, weekly_conf, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
     flags = detect_flags(hourly_row, daily_row, weekly_row)
-    
+
     daily_analogs = nearest_analogs(daily_df, DAILY_ANALOG_FEATURES, analog_count)
     daily_analog_summary = summarize_analogs(daily_analogs)
     hourly_analogs = nearest_analogs(hourly_df, HOURLY_ANALOG_FEATURES, min(analog_count, 12)) if not data["degraded_hourly"] else pd.DataFrame()
     hourly_analog_summary = summarize_analogs(hourly_analogs)
-    
+
     combined_call, combined_reason = combine_calls(hourly_call, daily_call, weekly_call, flags, daily_analog_summary, hourly_analog_summary)
     sim_paths, mc_summary = monte_carlo_from_analogs(daily_analogs, 5, mc_sims)
-    
+
+    meta = data.get("fetch_meta", {})
     results.append({
         "Symbol": symbol,
         "Status": "OK",
-        "Daily Source": meta.get("defeat_status", "n/a"),
-        "Hourly": "Yahoo" if not data["degraded_hourly"] else "Degraded",
+        "History Source": data["history_source"],
+        "Upload": meta.get("upload_status", "n/a"),
+        "DefeatBeta": meta.get("defeat_status", "n/a"),
+        "Yahoo Daily": meta.get("yahoo_status", "n/a"),
+        "Hourly Source": "degraded fallback" if data["degraded_hourly"] else "Yahoo",
+        "Fetch Detail": f"upload={meta.get('upload_status','n/a')} | defeat={meta.get('defeat_status','n/a')} | yahoo={meta.get('yahoo_status','n/a')} | alpha={meta.get('alpha_status','n/a')} | hourly={meta.get('hourly_status','n/a')}",
         "Hourly Call": hourly_call,
         "Daily Call": daily_call,
         "Weekly Call": weekly_call,
         "Combined": combined_call,
+        "Hourly Conf": round(hourly_conf, 1),
+        "Daily Conf": round(daily_conf, 1),
+        "Weekly Conf": round(weekly_conf, 1),
+        "Daily UO %ile": round(daily_row.get("uo_pctile", 0.5) * 100, 1),
+        "Hourly Roll": flags["hourly_roll"],
+        "Bear Kiss": flags["bear_kiss"],
+        "1d Med": round(daily_analog_summary.get("fwd_ret_1_median", 0) * 100, 2),
         "2d Med": round(daily_analog_summary.get("fwd_ret_2_median", 0) * 100, 2),
         "MC 5d Mean": round(mc_summary.get("mean", 0) * 100, 2),
     })
-    
+
     detail_data[symbol] = {
         "hourly": hourly_df,
         "daily": daily_df,
@@ -1009,12 +977,10 @@ for idx, symbol in enumerate(symbols):
         "hourly_analog_summary": hourly_analog_summary,
         "sim_paths": sim_paths,
         "mc_summary": mc_summary,
+        "history_source": data["history_source"],
         "degraded_hourly": data["degraded_hourly"],
-        "fetch_meta": meta,
+        "fetch_meta": data.get("fetch_meta", {}),
     }
-    
-    # Delay between symbols to avoid rate limits
-    time.sleep(1.5)
 
 progress.empty()
 results_df = pd.DataFrame(results)
@@ -1023,8 +989,11 @@ st.session_state["detail_data"] = detail_data
 
 st.subheader("Ranked Results")
 if not results_df.empty:
-    st.dataframe(results_df, use_container_width=True, hide_index=True)
-    st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_v4_results.csv", "text/csv")
+    sort_col = "2d Med" if "2d Med" in results_df.columns else None
+    if sort_col:
+        results_df = results_df.sort_values(sort_col, ascending=False)
+    st.dataframe(results_df, width='stretch', hide_index=True)
+    st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stock_analysis_v2_1_results.csv", "text/csv")
 else:
     st.warning("No results")
     st.stop()
@@ -1032,14 +1001,49 @@ else:
 valid_symbols = [r["Symbol"] for r in results if r.get("Status") == "OK"]
 if valid_symbols:
     st.subheader("Detailed Analysis")
+
     selected_symbol = st.selectbox("Select symbol", valid_symbols)
     data = detail_data[selected_symbol]
-    
-    hc, hconf, hreason = data["hourly_call"]
-    dc, dconf, dreason = data["daily_call"]
-    wc, wconf, wreason = data["weekly_call"]
-    cc, creason = data["combined"]
-    
+
+    analysis_date = None
+    as_of_label = None
+    hourly_view = data["hourly"]
+    daily_view = data["daily"]
+    weekly_view = data["weekly"]
+
+    if enable_calendar_lookback and not data["daily"].empty:
+        min_date = pd.Timestamp(data["daily"].index.min()).date()
+        max_date = pd.Timestamp(data["daily"].index.max()).date()
+        default_date = max_date
+        analysis_date = st.date_input("Analysis date", value=default_date, min_value=min_date, max_value=max_date, key=f"analysis_date_{selected_symbol}")
+        analysis_ts_end = pd.Timestamp(analysis_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+        raw_hourly_view = slice_to_analysis_ts(data["hourly"], analysis_ts_end)
+        raw_daily_view = slice_to_analysis_ts(data["daily"], analysis_ts_end)
+        raw_weekly_view = slice_to_analysis_ts(data["weekly"], analysis_ts_end)
+
+        hourly_view, daily_view, weekly_view = re_enrich_sliced_views(raw_hourly_view, raw_daily_view, raw_weekly_view, benchmark_daily)
+        as_of_label = pd.Timestamp(analysis_date).strftime("%Y-%m-%d")
+    else:
+        if not data["daily"].empty:
+            as_of_label = pd.Timestamp(data["daily"].index.max()).strftime("%Y-%m-%d")
+
+    hourly_row = hourly_view.iloc[-1] if not hourly_view.empty else pd.Series(dtype=float)
+    daily_row = daily_view.iloc[-1] if not daily_view.empty else pd.Series(dtype=float)
+    weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
+
+    hc, hconf, hreason = classify_timeframe_call(hourly_row, "hourly")
+    dc, dconf, dreason = classify_timeframe_call(daily_row, "daily")
+    wc, wconf, wreason = classify_timeframe_call(weekly_row, "weekly")
+    flags = detect_flags(hourly_row, daily_row, weekly_row)
+
+    daily_analogs = nearest_analogs(daily_view, DAILY_ANALOG_FEATURES, analog_count) if not daily_view.empty else pd.DataFrame()
+    daily_analog_summary = summarize_analogs(daily_analogs)
+    hourly_analogs = nearest_analogs(hourly_view, HOURLY_ANALOG_FEATURES, min(analog_count, 12)) if (not hourly_view.empty and not data["degraded_hourly"]) else pd.DataFrame()
+    hourly_analog_summary = summarize_analogs(hourly_analogs)
+    cc, creason = combine_calls(hc, dc, wc, flags, daily_analog_summary, hourly_analog_summary)
+    sim_paths, mc_summary = monte_carlo_from_analogs(daily_analogs, 5, mc_sims)
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Hourly", hc)
     c2.metric("Daily", dc)
@@ -1049,35 +1053,37 @@ if valid_symbols:
     st.markdown(f"**Daily reason:** {dreason}")
     st.markdown(f"**Weekly reason:** {wreason}")
     st.markdown(f"**Combined read:** {creason}")
-    
+    if as_of_label:
+        st.caption(f"Analysis date: {as_of_label}")
     if data["degraded_hourly"]:
-        st.warning("⚠️ Hourly data is degraded (using daily bars). Timing signals are lower quality.")
-    
-    st.caption(f"Fetch details: {data.get('fetch_meta', {})}")
-    
-    flags_df = pd.DataFrame([{"Flag": k, "Detected": v} for k, v in data["flags"].items()])
-    st.dataframe(flags_df, use_container_width=True, hide_index=True)
-    
-    plot_timeframe_dashboard(selected_symbol, data["hourly"], data["daily"], data["weekly"])
-    
+        st.warning("Hourly data is degraded fallback from daily bars. Do not trust timing signals until Yahoo hourly is available.")
+    st.caption(f"History source: {data['history_source']}")
+    st.caption(f"Fetch detail: {data.get('fetch_meta', {})}")
+
+    flags_df = pd.DataFrame([{"Flag": k, "Detected": v} for k, v in flags.items()])
+    st.dataframe(flags_df, width='stretch', hide_index=True)
+
+    plot_timeframe_dashboard(selected_symbol, hourly_view, daily_view, weekly_view, as_of_label=as_of_label)
+
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown("### Daily analogs")
-        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in data["daily_analog_summary"].items()})
-        if not data["daily_analogs"].empty:
-            show = data["daily_analogs"].head(10).copy()
+        das = daily_analog_summary
+        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in das.items()})
+        if not daily_analogs.empty:
+            show = daily_analogs[[c for c in ["Close", "similarity", "distance", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"] if c in daily_analogs.columns]].head(10).copy()
             show.index = show.index.strftime("%Y-%m-%d")
-            st.dataframe(show[["Close", "similarity", "fwd_ret_1", "fwd_ret_2"]], use_container_width=True)
+            st.dataframe(show, width='stretch')
     with col_b:
         st.markdown("### Hourly analogs")
-        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in data["hourly_analog_summary"].items()})
-        if not data["hourly_analogs"].empty:
-            show = data["hourly_analogs"].head(10).copy()
+        has = hourly_analog_summary
+        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in has.items()})
+        if not hourly_analogs.empty:
+            show = hourly_analogs[[c for c in ["Close", "similarity", "distance", "fwd_ret_1", "fwd_ret_2"] if c in hourly_analogs.columns]].head(10).copy()
             show.index = show.index.astype(str)
-            st.dataframe(show[["Close", "similarity", "fwd_ret_1", "fwd_ret_2"]], use_container_width=True)
-    
+            st.dataframe(show, width='stretch')
+
     st.markdown("### Monte Carlo (daily analog-conditioned)")
-    sim_paths = data["sim_paths"]
     if not sim_paths.empty:
         fig = go.Figure()
         x = sim_paths.index
@@ -1085,13 +1091,12 @@ if valid_symbols:
         fig.add_trace(go.Scatter(x=x, y=sim_paths.quantile(0.10, axis=1), name="10th", line=dict(color="lightcoral", width=1), fill='tonexty'))
         fig.add_trace(go.Scatter(x=x, y=sim_paths.quantile(0.50, axis=1), name="Median", line=dict(color="blue", width=2)))
         fig.update_layout(height=350, xaxis_title="Days Forward", yaxis_title="Cumulative Return")
-        st.plotly_chart(fig, use_container_width=True)
-        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in data["mc_summary"].items()})
-    
+        st.plotly_chart(fig, width='stretch')
+        st.write({k: round(v, 4) if isinstance(v, float) else v for k, v in mc_summary.items()})
     if show_options and cc in {"CALL", "PUT"}:
         st.markdown("### Option Chain")
         opts = get_option_candidates(selected_symbol, cc)
         if opts.empty:
-            st.info(f"No {cc} options available.")
+            st.info(f"No {cc} options available or Yahoo options request failed.")
         else:
-            st.dataframe(opts, use_container_width=True, hide_index=True)
+            st.dataframe(opts, width='stretch', hide_index=True)
