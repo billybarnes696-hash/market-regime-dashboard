@@ -26,7 +26,7 @@ except Exception:
 # -----------------------------
 # CONFIG & SETUP
 # -----------------------------
-st.set_page_config(page_title="Stable Market Engine Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stable Market Engine Final", layout="wide", initial_sidebar_state="expanded")
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / "cache_store"
@@ -34,68 +34,15 @@ DATA_DIR = CACHE_DIR / "market_data"  # Persistent Parquet Storage
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
-# VECTORIZED UTILS
+# VECTORIZED UTILS (CORRECTED)
 # -----------------------------
-def rolling_rank_pct(series: pd.Series, window: int = 252, min_periods: Optional[int] = None) -> pd.Series:
-    """True rolling percentile rank of the latest observation in each window.
-
-    This is slower than pure vectorized min-max scaling, but it preserves the user's
-    original cross-asset intent: compare each indicator to its own recent history,
-    not merely its recent min/max range.
-    """
-    s = pd.to_numeric(series, errors="coerce")
-    values = s.to_numpy(dtype=float)
-    out = np.full(len(values), np.nan, dtype=float)
-    min_periods = min_periods or max(20, window // 5)
-    for i, v in enumerate(values):
-        if i + 1 < min_periods or not np.isfinite(v):
-            continue
-        w = values[max(0, i - window + 1): i + 1]
-        w = w[np.isfinite(w)]
-        if len(w) < min_periods:
-            continue
-        out[i] = float((w <= v).mean())
-    return pd.Series(out, index=series.index)
-
-
-def rolling_minmax_scale(series: pd.Series, window: int = 252) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    if len(s) < 2:
-        return pd.Series([np.nan] * len(s), index=s.index)
-    roll_min = s.rolling(window, min_periods=max(10, window // 10)).min()
-    roll_max = s.rolling(window, min_periods=max(10, window // 10)).max()
-    diff = (roll_max - roll_min).replace(0, np.nan)
-    return (s - roll_min) / diff
-
-
-def rolling_zscore_score(series: pd.Series, window: int = 252) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    mean = s.rolling(window, min_periods=max(20, window // 5)).mean()
-    std = s.rolling(window, min_periods=max(20, window // 5)).std().replace(0, np.nan)
-    z = (s - mean) / std
-    # Compress extremes but preserve severity better than rank alone.
-    return 0.5 * (1 + np.tanh(z / 2.0))
-
-
 def rolling_percentile(series: pd.Series, window: int = 252) -> pd.Series:
-    """Best-of-both-worlds normalization.
-
-    Blend true rolling percentile rank (cross-asset comparability) with z-score-based
-    severity and a small min-max component (range awareness). The output stays in
-    the familiar 0..1 band expected by the oscillator, analog engine, and UI.
     """
-    rank_pct = rolling_rank_pct(series, window)
-    z_score = rolling_zscore_score(series, window)
-    minmax = rolling_minmax_scale(series, window)
-
-    pieces = pd.concat([rank_pct, z_score, minmax], axis=1)
-    pieces.columns = ["rank", "z", "mm"]
-
-    # Weighted blend: prioritize true percentile, but keep absolute-stretch severity.
-    blended = 0.55 * pieces["rank"] + 0.30 * pieces["z"] + 0.15 * pieces["mm"]
-
-    # If one component is missing, use the average of what remains.
-    return blended.where(blended.notna(), pieces.mean(axis=1, skipna=True))
+    TRUE Rolling Percentile Rank using Pandas .rank(pct=True).
+    This replaces the Min-Max scaler to restore statistical accuracy.
+    """
+    min_periods = max(10, window // 5)
+    return series.rolling(window, min_periods=min_periods).rank(pct=True)
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
@@ -150,7 +97,7 @@ def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     atr_val = tr.rolling(window).mean()
     plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(window).sum() / atr_val.replace(0, np.nan)
     minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(window).sum() / atr_val.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_dm).abs() / (plus_di + minus_dm).replace(0, np.nan)
     return dx.rolling(window).mean()
 
 def slope(series: pd.Series, bars: int = 3) -> pd.Series:
@@ -231,13 +178,14 @@ def fetch_yahoo_batch(symbols: List[str], years: int = 10) -> Dict[str, pd.DataF
         return data_map
 
     # 2. Bulk Download (Anti-Rate Limit)
+    # auto_adjust=False ensures we get Nominal Price (e.g. 516) matches chart view
     try:
         bulk_df = yf.download(
             symbols_to_fetch, 
             period=f"{max(years, 5)}y", 
             interval="1d", 
             group_by='ticker', 
-            auto_adjust=False,
+            auto_adjust=False,  
             progress=False,
             threads=True
         )
@@ -353,6 +301,10 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     if df.empty:
         return df.copy()
     out = df.copy()
+    
+    # Uses standard Close (Nominal) for all math and display
+    # This ensures displayed price (e.g., 516) matches chart price
+    
     out["ema_10"] = ema(out["Close"], 10)
     out["ema_20"] = ema(out["Close"], 20)
     out["sma_50"] = sma(out["Close"], 50)
@@ -602,8 +554,7 @@ def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 25, exc
     zw = z.fillna(0.0).to_numpy() * weights
     pool["distance"] = np.sqrt((zw ** 2).sum(axis=1))
     pool["similarity"] = 1 / (1 + pool["distance"])
-    # Tighter filtering for robustness
-    pool = pool[pool["distance"] < 5.0] 
+    pool = pool[pool["distance"] < 4.5] 
     return pool.nsmallest(n, "distance").copy()
 
 def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
@@ -675,26 +626,47 @@ def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, 
     st.plotly_chart(fig, width='stretch')
 
 # -----------------------------
-# PARALLEL WORKER
+# PARALLEL WORKER (CORRECTED FOR HISTORICAL INTEGRITY)
 # -----------------------------
-def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: pd.DataFrame, proxy_mode: str, analysis_mode: str, analysis_date_val) -> Tuple[Optional[Dict], Optional[Dict]]:
+def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: pd.DataFrame, proxy_mode: str, analysis_mode: str, analysis_date_val, alpha_key: str) -> Tuple[Optional[Dict], Optional[Dict]]:
     try:
         if sym not in data_map or data_map[sym].empty:
-            return None, None
+            # Fallback try for single fetch if bulk missed it
+            df_fb = fetch_alpha_vantage_daily(sym, alpha_key)
+            if df_fb.empty:
+                return None, None
+            data_map[sym] = df_fb
         
         daily_raw = data_map[sym]
-        proxy_raw, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_raw, proxy_mode)
-        weekly_raw = resample_weekly(daily_raw)
-
-        proxy_df = enrich_price_features(proxy_raw, proxy_timeframe, bench_df)
-        daily_df = enrich_price_features(daily_raw, "daily", bench_df)
-        weekly_df = enrich_price_features(weekly_raw, "weekly", bench_df)
-
+        
+        # 1. DETERMINE AS-OF TIMESTAMP
         asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date_val)
-        proxy_view = slice_asof(proxy_df, asof)
-        daily_view = slice_asof(daily_df, asof)
-        weekly_view = slice_asof(weekly_df, asof)
+        
+        # 2. SLICE DATA FIRST (Critical Fix: Prevents Look-ahead Bias)
+        # We must slice raw data BEFORE enriching it.
+        daily_sliced = slice_asof(daily_raw, asof)
+        bench_sliced = slice_asof(bench_df, asof)
+        
+        if daily_sliced.empty:
+            return None, None
 
+        # 3. BUILD PROXY & WEEKLY FROM SLICED DATA
+        # If we are in 2020, proxy and weekly must not see 2024 data
+        proxy_raw_sliced, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_sliced, proxy_mode)
+        weekly_raw_sliced = resample_weekly(daily_sliced)
+
+        # 4. ENRICH FEATURES (Now calculations are strictly historical)
+        # We pass bench_sliced so Relative Strength is calculated correctly vs historical benchmark
+        proxy_df = enrich_price_features(proxy_raw_sliced, proxy_timeframe, bench_sliced)
+        daily_df = enrich_price_features(daily_sliced, "daily", bench_sliced)
+        weekly_df = enrich_price_features(weekly_raw_sliced, "weekly", bench_sliced)
+
+        # 5. GET CURRENT ROWS (No second slice needed, data is already sliced)
+        proxy_view = proxy_df
+        daily_view = daily_df
+        weekly_view = weekly_df
+        
+        # Safety check
         if daily_view.empty:
             return None, None
 
@@ -702,6 +674,7 @@ def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: p
         daily_row = daily_view.iloc[-1]
         weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
 
+        # 6. CALCULATE SIGNALS (Same logic as before)
         proxy_call, proxy_conf, proxy_reason = classify_timeframe_call(proxy_row, proxy_timeframe)
         proxy_cross = compute_distance_to_cross(proxy_row, proxy_view)
         daily_call, daily_conf, daily_reason = classify_timeframe_call(daily_row, "daily")
@@ -716,6 +689,8 @@ def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: p
         daily_reco = recommendation_from_state(daily_call, daily_severity, "daily")
         weekly_reco = recommendation_from_state(weekly_call, weekly_severity, "weekly")
         
+        # 7. FIND ANALOGS (Strictly Historical)
+        # Since daily_view is already sliced, find_analogs will only look at history PREDATING asof date
         analogs = find_analogs(daily_df, daily_row.name, n=25)
         analog_summary = summarize_analogs(analogs)
         combined_reco = final_recommendation(combined_call, proxy_reco, daily_reco, analog_summary)
@@ -767,18 +742,18 @@ def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: p
         return row_data, detail_data
 
     except Exception as e:
-        # st.error(f"Error processing {sym}: {e}") # Don't st.error in thread
         return {"Symbol": sym, "Status": f"Error: {str(e)[:20]}", "Combined Recommendation": "ERROR"}, None
 
 # -----------------------------
 # APP MAIN
 # -----------------------------
-st.title("📈 Stable Market Engine Pro")
-st.caption("Batch Fetching | Disk Cache | Parallel Processing | Hybrid rank+severity normalization")
+st.title("📈 Stable Market Engine Final")
+st.caption("True Percentile Rank | Batch Fetching | Disk Cache | Parallel Processing | Historical Integrity")
 
 with st.sidebar:
     st.header("Inputs")
     manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="SMH, QQQ, INTC, NVDA, AMD, TSLA, META", height=110)
+    alpha_vantage_key = st.text_input("Alpha Vantage API key (optional fallback)", type="password")
 
     st.header("Settings")
     benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "RSP", "IWM"], index=0)
@@ -788,6 +763,21 @@ with st.sidebar:
     analysis_date = st.date_input("Calendar lookback", value=default_date, disabled=(analysis_mode == "Current"))
     proxy_mode = st.radio("Tactical proxy", ["hourly", "2hour"], index=0)
     run_analysis = st.button("Run Analysis", type="primary", width='stretch')
+    
+    # --- DOWNLOAD SOURCE CODE FEATURE ---
+    st.sidebar.markdown("---")
+    try:
+        script_path = Path(__file__).resolve()
+        with open(script_path, "r") as f:
+            source_code = f.read()
+        st.sidebar.download_button(
+            "⬇️ Download Source Code",
+            source_code,
+            file_name="stable_market_engine_final.py",
+            mime="text/x-python",
+        )
+    except Exception:
+        pass
 
 if not run_analysis:
     st.stop()
@@ -819,7 +809,7 @@ status_text = st.empty()
 # max_workers=4 is safe; indicator calculation is CPU bound but Pandas releases GIL
 with ThreadPoolExecutor(max_workers=4) as executor:
     futures = {
-        executor.submit(process_symbol_task, s, all_data_map, benchmark_df, proxy_mode, analysis_mode, analysis_date): s 
+        executor.submit(process_symbol_task, s, all_data_map, benchmark_df, proxy_mode, analysis_mode, analysis_date, alpha_vantage_key): s 
         for s in symbols
     }
     
@@ -852,7 +842,7 @@ if "Daily %ile" in results_df.columns:
     results_df = results_df.sort_values("Daily %ile", ascending=False)
 
 st.dataframe(results_df, width='stretch', hide_index=True)
-st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_pro.csv", "text/csv")
+st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_final.csv", "text/csv")
 
 valid_symbols = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
 if not valid_symbols:
