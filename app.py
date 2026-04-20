@@ -391,51 +391,44 @@ def fetch_daily_history_with_priority(ticker: str, uploaded_history: Dict[str, p
         "yahoo_status": "not_checked",
     }
 
-    def fetch_yahoo_daily_refresh() -> Tuple[pd.DataFrame, str]:
-        recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
-        if recent is not None and not recent.empty:
-            return recent, f"recent_ok:{len(recent)}"
-        full = fetch_yahoo_prices(tkr, "1d", period=f"{max(years, 5)}y")
-        if full is not None and not full.empty:
-            return full, f"full_ok:{len(full)}"
-        return pd.DataFrame(), "empty_or_rate_limited"
-
     if tkr in uploaded_history:
         base = uploaded_history.get(tkr, pd.DataFrame())
         if base is not None and not base.empty:
             fetch_meta["upload_status"] = f"matched:{len(base)}"
-            yahoo_refresh, yahoo_status = fetch_yahoo_daily_refresh()
-            fetch_meta["yahoo_status"] = yahoo_status
-            merged = merge_history_with_recent(base, yahoo_refresh)
-            source = "upload+yahoo_refresh" if yahoo_refresh is not None and not yahoo_refresh.empty and len(merged) > len(base) else "upload"
+            recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
+            fetch_meta["yahoo_status"] = "gap_ok" if recent is not None and not recent.empty else "gap_empty"
+            merged = merge_history_with_recent(base, recent)
+            source = "upload+yahoo_gap" if recent is not None and not recent.empty and len(merged) > len(base) else "upload"
             fetch_meta["daily_rows"] = str(len(merged))
             return merged, source, fetch_meta
         fetch_meta["upload_status"] = "matched_empty"
     else:
         fetch_meta["upload_status"] = "not_matched"
 
-    yahoo_primary, yahoo_status = fetch_yahoo_daily_refresh()
-    fetch_meta["yahoo_status"] = yahoo_status
-    if yahoo_primary is not None and not yahoo_primary.empty:
-        fetch_meta["daily_rows"] = str(len(yahoo_primary))
-        fetch_meta["defeat_status"] = "bypassed_due_to_fresh_yahoo"
-        return yahoo_primary, "yahoo_primary", fetch_meta
-
     defeat_df = fetch_defeat_history(tkr, years=max(years, 5))
     if defeat_df is not None and not defeat_df.empty:
         fetch_meta["defeat_status"] = f"ok:{len(defeat_df)}"
-        fetch_meta["daily_rows"] = str(len(defeat_df))
-        return defeat_df, "defeatbeta_stale_fallback", fetch_meta
+        recent = fetch_yahoo_prices(tkr, "1d", period="3mo")
+        fetch_meta["yahoo_status"] = "gap_ok" if recent is not None and not recent.empty else "gap_empty"
+        merged = merge_history_with_recent(defeat_df, recent)
+        source = "defeatbeta+yahoo_gap" if recent is not None and not recent.empty and len(merged) > len(defeat_df) else "defeatbeta"
+        fetch_meta["daily_rows"] = str(len(merged))
+        return merged, source, fetch_meta
     fetch_meta["defeat_status"] = "empty"
 
+    yahoo_df = fetch_yahoo_prices(tkr, "1d", period=f"{max(years, 5)}y")
+    if yahoo_df is not None and not yahoo_df.empty:
+        fetch_meta["yahoo_status"] = f"ok:{len(yahoo_df)}"
+        fetch_meta["daily_rows"] = str(len(yahoo_df))
+        return yahoo_df, "yahoo_only", fetch_meta
+
+    fetch_meta["yahoo_status"] = "empty_or_rate_limited"
     fetch_meta["daily_rows"] = "0"
     return pd.DataFrame(), "none", fetch_meta
 
 
 def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame], years: int) -> Dict[str, pd.DataFrame]:
     daily, history_source, fetch_meta = fetch_daily_history_with_priority(ticker, uploaded_history, years)
-    hourly = fetch_yahoo_prices(ticker, "1h", period="60d")
-    degraded = False
     if daily.empty:
         fetch_meta["hourly_status"] = "skipped_no_daily"
         return {
@@ -443,16 +436,14 @@ def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame]
             "daily": pd.DataFrame(),
             "weekly": pd.DataFrame(),
             "history_source": history_source,
-            "degraded_hourly": True,
+            "degraded_hourly": False,
+            "hourly_proxy": True,
             "fetch_meta": fetch_meta,
         }
-    if hourly is None or hourly.empty:
-        degraded = True
-        fetch_meta["hourly_status"] = "empty_or_rate_limited_using_daily_fallback"
-        # Degraded placeholder, not true hourly timing
-        hourly = resample_ohlcv(daily.tail(120), "B")
-    else:
-        fetch_meta["hourly_status"] = f"ok:{len(hourly)}"
+
+    # Intentionally do not fetch true hourly bars. Build a stable tactical proxy from daily bars.
+    hourly = daily.copy()
+    fetch_meta["hourly_status"] = f"proxy_from_daily:{len(hourly)}"
     weekly = resample_ohlcv(daily, "W-FRI")
     fetch_meta["weekly_rows"] = str(len(weekly))
     return {
@@ -460,7 +451,8 @@ def fetch_multi_timeframe(ticker: str, uploaded_history: Dict[str, pd.DataFrame]
         "daily": daily,
         "weekly": weekly,
         "history_source": history_source,
-        "degraded_hourly": degraded,
+        "degraded_hourly": False,
+        "hourly_proxy": True,
         "fetch_meta": fetch_meta,
     }
 
@@ -775,7 +767,7 @@ def build_symbol_list(manual_symbols: str, watchlist_file, uploaded_history_map:
 
 
 st.title("📊 Stock Analyzer Ultimate v2.1")
-st.caption("Boot-safe | per-timeframe calls | state-aware analogs | Yahoo-protected")
+st.caption("Boot-safe | daily-backed tactical hourly proxy | state-aware analogs | Yahoo-protected")
 
 with st.sidebar:
     st.header("Input")
@@ -864,7 +856,7 @@ for idx, symbol in enumerate(symbols):
         "Upload": meta.get("upload_status", "n/a"),
         "DefeatBeta": meta.get("defeat_status", "n/a"),
         "Yahoo Daily": meta.get("yahoo_status", "n/a"),
-        "Hourly Source": "degraded fallback" if data["degraded_hourly"] else "Yahoo",
+        "Hourly Source": "daily proxy" if data.get("hourly_proxy", False) else ("degraded fallback" if data["degraded_hourly"] else "Yahoo"),
         "Fetch Detail": f"upload={meta.get('upload_status','n/a')} | defeat={meta.get('defeat_status','n/a')} | yahoo={meta.get('yahoo_status','n/a')} | hourly={meta.get('hourly_status','n/a')}",
         "Hourly Call": hourly_call,
         "Daily Call": daily_call,
@@ -974,7 +966,9 @@ if valid_symbols:
     st.markdown(f"**Combined read:** {creason}")
     if as_of_label:
         st.caption(f"Analysis date: {as_of_label}")
-    if data["degraded_hourly"]:
+    if data.get("hourly_proxy", False):
+        st.info("Hourly is a tactical proxy built from daily bars. It is intentionally not using true intraday hourly candles.")
+    elif data["degraded_hourly"]:
         st.warning("Hourly data is degraded fallback from daily bars. Do not trust timing signals until Yahoo hourly is available.")
     st.caption(f"History source: {data['history_source']}")
     st.caption(f"Fetch detail: {data.get('fetch_meta', {})}")
