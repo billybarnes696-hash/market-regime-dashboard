@@ -26,7 +26,7 @@ except Exception:
 # -----------------------------
 # CONFIG & SETUP
 # -----------------------------
-st.set_page_config(page_title="Stable Market Engine Final", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stable Market Engine Pro", layout="wide", initial_sidebar_state="expanded")
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / "cache_store"
@@ -34,15 +34,68 @@ DATA_DIR = CACHE_DIR / "market_data"  # Persistent Parquet Storage
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
-# VECTORIZED UTILS (CORRECTED)
+# VECTORIZED UTILS
 # -----------------------------
+def rolling_rank_pct(series: pd.Series, window: int = 252, min_periods: Optional[int] = None) -> pd.Series:
+    """True rolling percentile rank of the latest observation in each window.
+
+    This is slower than pure vectorized min-max scaling, but it preserves the user's
+    original cross-asset intent: compare each indicator to its own recent history,
+    not merely its recent min/max range.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    values = s.to_numpy(dtype=float)
+    out = np.full(len(values), np.nan, dtype=float)
+    min_periods = min_periods or max(20, window // 5)
+    for i, v in enumerate(values):
+        if i + 1 < min_periods or not np.isfinite(v):
+            continue
+        w = values[max(0, i - window + 1): i + 1]
+        w = w[np.isfinite(w)]
+        if len(w) < min_periods:
+            continue
+        out[i] = float((w <= v).mean())
+    return pd.Series(out, index=series.index)
+
+
+def rolling_minmax_scale(series: pd.Series, window: int = 252) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    if len(s) < 2:
+        return pd.Series([np.nan] * len(s), index=s.index)
+    roll_min = s.rolling(window, min_periods=max(10, window // 10)).min()
+    roll_max = s.rolling(window, min_periods=max(10, window // 10)).max()
+    diff = (roll_max - roll_min).replace(0, np.nan)
+    return (s - roll_min) / diff
+
+
+def rolling_zscore_score(series: pd.Series, window: int = 252) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    mean = s.rolling(window, min_periods=max(20, window // 5)).mean()
+    std = s.rolling(window, min_periods=max(20, window // 5)).std().replace(0, np.nan)
+    z = (s - mean) / std
+    # Compress extremes but preserve severity better than rank alone.
+    return 0.5 * (1 + np.tanh(z / 2.0))
+
+
 def rolling_percentile(series: pd.Series, window: int = 252) -> pd.Series:
+    """Best-of-both-worlds normalization.
+
+    Blend true rolling percentile rank (cross-asset comparability) with z-score-based
+    severity and a small min-max component (range awareness). The output stays in
+    the familiar 0..1 band expected by the oscillator, analog engine, and UI.
     """
-    TRUE Rolling Percentile Rank using Pandas .rank(pct=True).
-    This replaces the Min-Max scaler to restore statistical accuracy.
-    """
-    min_periods = max(10, window // 5)
-    return series.rolling(window, min_periods=min_periods).rank(pct=True)
+    rank_pct = rolling_rank_pct(series, window)
+    z_score = rolling_zscore_score(series, window)
+    minmax = rolling_minmax_scale(series, window)
+
+    pieces = pd.concat([rank_pct, z_score, minmax], axis=1)
+    pieces.columns = ["rank", "z", "mm"]
+
+    # Weighted blend: prioritize true percentile, but keep absolute-stretch severity.
+    blended = 0.55 * pieces["rank"] + 0.30 * pieces["z"] + 0.15 * pieces["mm"]
+
+    # If one component is missing, use the average of what remains.
+    return blended.where(blended.notna(), pieces.mean(axis=1, skipna=True))
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
@@ -97,7 +150,7 @@ def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     atr_val = tr.rolling(window).mean()
     plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(window).sum() / atr_val.replace(0, np.nan)
     minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(window).sum() / atr_val.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_dm).abs() / (plus_di + minus_dm).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     return dx.rolling(window).mean()
 
 def slope(series: pd.Series, bars: int = 3) -> pd.Series:
@@ -147,6 +200,125 @@ def is_cache_fresh(filepath: Path, max_hours: int = 24) -> bool:
     mod_time = datetime.datetime.fromtimestamp(filepath.stat().st_mtime)
     return (datetime.datetime.now() - mod_time) < datetime.timedelta(hours=max_hours)
 
+
+def clear_symbol_cache(symbols: List[str]) -> None:
+    for s in symbols:
+        path = get_cache_path(s)
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+
+def compression_span(length: int, bars_per_day: float, minimum: int = 2) -> int:
+    return max(minimum, int(round(length / bars_per_day)))
+
+
+
+def _alpaca_headers(key: str, secret: str) -> dict:
+    return {"APCA-API-KEY-ID": (key or "").strip(), "APCA-API-SECRET-KEY": (secret or "").strip()}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_alpaca_daily_batch(symbols: List[str], years: int, api_key: str, api_secret: str, feed: str = "iex") -> Dict[str, pd.DataFrame]:
+    api_key = (api_key or "").strip()
+    api_secret = (api_secret or "").strip()
+    if not api_key or not api_secret or not symbols:
+        return {}
+    end = pd.Timestamp.utcnow().floor("min")
+    start = end - pd.Timedelta(days=int(max(years, 5) * 370))
+    url = "https://data.alpaca.markets/v2/stocks/bars"
+    params = {
+        "symbols": ",".join(symbols),
+        "timeframe": "1Day",
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
+        "adjustment": "raw",
+        "feed": feed,
+        "limit": 10000,
+    }
+    out: Dict[str, pd.DataFrame] = {}
+    page_token = None
+    while True:
+        if page_token:
+            params["page_token"] = page_token
+        r = requests.get(url, headers=_alpaca_headers(api_key, api_secret), params=params, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        bars = payload.get("bars", {})
+        for sym, rows in bars.items():
+            if not rows:
+                continue
+            df = pd.DataFrame(rows)
+            df = df.rename(columns={"t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+            df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce").dt.tz_convert(None)
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[keep].apply(pd.to_numeric, errors="coerce").dropna(subset=["Open", "High", "Low", "Close"])
+            if sym in out and not out[sym].empty:
+                out[sym] = pd.concat([out[sym], df]).sort_index()
+                out[sym] = out[sym][~out[sym].index.duplicated(keep="last")]
+            else:
+                out[sym] = df
+        page_token = payload.get("next_page_token")
+        if not page_token:
+            break
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_alpaca_intraday(symbol: str, api_key: str, api_secret: str, feed: str = "iex") -> pd.DataFrame:
+    api_key = (api_key or "").strip()
+    api_secret = (api_secret or "").strip()
+    symbol = (symbol or "").strip().upper()
+    if not api_key or not api_secret or not symbol:
+        return pd.DataFrame()
+    end = pd.Timestamp.utcnow().floor("min")
+    start = end - pd.Timedelta(days=730)
+    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": "1Hour",
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
+        "adjustment": "raw",
+        "feed": feed,
+        "limit": 10000,
+    }
+    parts = []
+    page_token = None
+    while True:
+        if page_token:
+            params["page_token"] = page_token
+        r = requests.get(url, headers=_alpaca_headers(api_key, api_secret), params=params, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        rows = payload.get("bars", [])
+        if rows:
+            df = pd.DataFrame(rows)
+            df = df.rename(columns={"t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+            df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce").dt.tz_convert(None)
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[keep].apply(pd.to_numeric, errors="coerce").dropna(subset=["Open", "High", "Low", "Close"])
+            parts.append(df)
+        page_token = payload.get("next_page_token")
+        if not page_token:
+            break
+    if not parts:
+        return pd.DataFrame()
+    df = pd.concat(parts).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    return df
+
+
+def resample_intraday_to_2h(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    out = df.resample("2H").agg(agg).dropna(how="any")
+    return out
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yahoo_batch(symbols: List[str], years: int = 10) -> Dict[str, pd.DataFrame]:
     """Bulk fetch to avoid rate limits, with persistent disk caching."""
@@ -178,14 +350,13 @@ def fetch_yahoo_batch(symbols: List[str], years: int = 10) -> Dict[str, pd.DataF
         return data_map
 
     # 2. Bulk Download (Anti-Rate Limit)
-    # auto_adjust=False ensures we get Nominal Price (e.g. 516) matches chart view
     try:
         bulk_df = yf.download(
             symbols_to_fetch, 
             period=f"{max(years, 5)}y", 
             interval="1d", 
             group_by='ticker', 
-            auto_adjust=False,  
+            auto_adjust=False,
             progress=False,
             threads=True
         )
@@ -263,8 +434,19 @@ def fetch_alpha_vantage_daily(symbol: str, api_key: str) -> pd.DataFrame:
 # -----------------------------
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
     spans = {
-        "proxy_hourly": (5, 13, 5),
-        "proxy_2hour": (6, 18, 5),
+        # Time-compressed from intraday-style oscillators onto daily bars.
+        # Approx 6.5 one-hour bars/day and 3.25 two-hour bars/day.
+        # These are intentionally smoother than literal conversions while keeping relative speed.
+        "proxy_hourly": (
+            compression_span(18, 6.5, minimum=3),
+            compression_span(40, 6.5, minimum=6),
+            compression_span(12, 6.5, minimum=2),
+        ),
+        "proxy_2hour": (
+            compression_span(18, 3.25, minimum=4),
+            compression_span(40, 3.25, minimum=8),
+            compression_span(12, 3.25, minimum=3),
+        ),
         "daily": (8, 21, 7),
         "weekly": (5, 13, 5),
     }
@@ -301,10 +483,6 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     if df.empty:
         return df.copy()
     out = df.copy()
-    
-    # Uses standard Close (Nominal) for all math and display
-    # This ensures displayed price (e.g., 516) matches chart price
-    
     out["ema_10"] = ema(out["Close"], 10)
     out["ema_20"] = ema(out["Close"], 20)
     out["sma_50"] = sma(out["Close"], 50)
@@ -346,6 +524,9 @@ def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
     return df.resample("W-FRI").agg(agg).dropna(how="any")
 
 def build_proxy_from_daily(df: pd.DataFrame, proxy_mode: str) -> Tuple[pd.DataFrame, str, str]:
+    # Time-compression math:
+    # 1 daily bar ~= 6.5 one-hour bars or ~= 3.25 two-hour bars.
+    # We keep the same daily OHLCV series but use compressed oscillator spans downstream.
     label = "Hourly Proxy" if proxy_mode == "hourly" else "2-Hour Proxy"
     timeframe_name = "proxy_hourly" if proxy_mode == "hourly" else "proxy_2hour"
     return df.copy(), timeframe_name, label
@@ -554,7 +735,8 @@ def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 25, exc
     zw = z.fillna(0.0).to_numpy() * weights
     pool["distance"] = np.sqrt((zw ** 2).sum(axis=1))
     pool["similarity"] = 1 / (1 + pool["distance"])
-    pool = pool[pool["distance"] < 4.5] 
+    # Tighter filtering for robustness
+    pool = pool[pool["distance"] < 5.0] 
     return pool.nsmallest(n, "distance").copy()
 
 def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
@@ -607,9 +789,9 @@ def final_recommendation(combined_call: str, proxy_reco: str, daily_reco: str, a
 
 def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, proxy_label: str) -> None:
     fig = make_subplots(
-        rows=4, cols=1, vertical_spacing=0.06,
+        rows=4, cols=1, vertical_spacing=0.05,
         subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", f"{proxy_label} Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
-        row_heights=[0.42, 0.19, 0.19, 0.20],
+        row_heights=[0.34, 0.22, 0.22, 0.22],
     )
     if not daily_df.empty:
         d = daily_df.tail(220)
@@ -619,54 +801,42 @@ def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, 
     for row_num, frame in zip([2, 3, 4], [proxy_df.tail(220), daily_df.tail(220), weekly_df.tail(150)]):
         if frame.empty:
             continue
-        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo"], name=f"UO {row_num}", line=dict(color="red", width=2)), row=row_num, col=1)
-        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"Signal {row_num}", line=dict(color="black", width=1)), row=row_num, col=1)
+        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo"], name=f"UO {row_num}", line=dict(color="red", width=3)), row=row_num, col=1)
+        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"Signal {row_num}", line=dict(color="black", width=2)), row=row_num, col=1)
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row_num, col=1)
-    fig.update_layout(height=950, xaxis_rangeslider_visible=False, legend_orientation="h")
+    fig.update_layout(height=1250, xaxis_rangeslider_visible=False, legend_orientation="h", margin=dict(t=90, b=20))
     st.plotly_chart(fig, width='stretch')
 
 # -----------------------------
-# PARALLEL WORKER (CORRECTED FOR HISTORICAL INTEGRITY)
+# PARALLEL WORKER
 # -----------------------------
-def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: pd.DataFrame, proxy_mode: str, analysis_mode: str, analysis_date_val, alpha_key: str) -> Tuple[Optional[Dict], Optional[Dict]]:
+def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: pd.DataFrame, proxy_mode: str, analysis_mode: str, analysis_date_val, data_provider: str = "yahoo", alpaca_key: str = "", alpaca_secret: str = "", alpaca_feed: str = "iex", true_intraday: bool = False) -> Tuple[Optional[Dict], Optional[Dict]]:
     try:
         if sym not in data_map or data_map[sym].empty:
-            # Fallback try for single fetch if bulk missed it
-            df_fb = fetch_alpha_vantage_daily(sym, alpha_key)
-            if df_fb.empty:
-                return None, None
-            data_map[sym] = df_fb
-        
-        daily_raw = data_map[sym]
-        
-        # 1. DETERMINE AS-OF TIMESTAMP
-        asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date_val)
-        
-        # 2. SLICE DATA FIRST (Critical Fix: Prevents Look-ahead Bias)
-        # We must slice raw data BEFORE enriching it.
-        daily_sliced = slice_asof(daily_raw, asof)
-        bench_sliced = slice_asof(bench_df, asof)
-        
-        if daily_sliced.empty:
             return None, None
 
-        # 3. BUILD PROXY & WEEKLY FROM SLICED DATA
-        # If we are in 2020, proxy and weekly must not see 2024 data
-        proxy_raw_sliced, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_sliced, proxy_mode)
-        weekly_raw_sliced = resample_weekly(daily_sliced)
+        daily_raw = data_map[sym]
+        weekly_raw = resample_weekly(daily_raw)
 
-        # 4. ENRICH FEATURES (Now calculations are strictly historical)
-        # We pass bench_sliced so Relative Strength is calculated correctly vs historical benchmark
-        proxy_df = enrich_price_features(proxy_raw_sliced, proxy_timeframe, bench_sliced)
-        daily_df = enrich_price_features(daily_sliced, "daily", bench_sliced)
-        weekly_df = enrich_price_features(weekly_raw_sliced, "weekly", bench_sliced)
+        if data_provider == "alpaca" and true_intraday and proxy_mode == "2hour":
+            intraday = fetch_alpaca_intraday(sym, alpaca_key, alpaca_secret, alpaca_feed)
+            proxy_raw = resample_intraday_to_2h(intraday)
+            if proxy_raw.empty:
+                proxy_raw, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_raw, proxy_mode)
+            else:
+                proxy_timeframe, proxy_label = "proxy_2hour", "2-Hour (Alpaca)"
+        else:
+            proxy_raw, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_raw, proxy_mode)
 
-        # 5. GET CURRENT ROWS (No second slice needed, data is already sliced)
-        proxy_view = proxy_df
-        daily_view = daily_df
-        weekly_view = weekly_df
-        
-        # Safety check
+        proxy_df = enrich_price_features(proxy_raw, proxy_timeframe, bench_df)
+        daily_df = enrich_price_features(daily_raw, "daily", bench_df)
+        weekly_df = enrich_price_features(weekly_raw, "weekly", bench_df)
+
+        asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date_val)
+        proxy_view = slice_asof(proxy_df, asof)
+        daily_view = slice_asof(daily_df, asof)
+        weekly_view = slice_asof(weekly_df, asof)
+
         if daily_view.empty:
             return None, None
 
@@ -674,7 +844,6 @@ def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: p
         daily_row = daily_view.iloc[-1]
         weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
 
-        # 6. CALCULATE SIGNALS (Same logic as before)
         proxy_call, proxy_conf, proxy_reason = classify_timeframe_call(proxy_row, proxy_timeframe)
         proxy_cross = compute_distance_to_cross(proxy_row, proxy_view)
         daily_call, daily_conf, daily_reason = classify_timeframe_call(daily_row, "daily")
@@ -689,8 +858,6 @@ def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: p
         daily_reco = recommendation_from_state(daily_call, daily_severity, "daily")
         weekly_reco = recommendation_from_state(weekly_call, weekly_severity, "weekly")
         
-        # 7. FIND ANALOGS (Strictly Historical)
-        # Since daily_view is already sliced, find_analogs will only look at history PREDATING asof date
         analogs = find_analogs(daily_df, daily_row.name, n=25)
         analog_summary = summarize_analogs(analogs)
         combined_reco = final_recommendation(combined_call, proxy_reco, daily_reco, analog_summary)
@@ -720,6 +887,7 @@ def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: p
             "Analog N": int(analog_summary.get("n", 0)) if analog_summary else 0,
             "Analog 2d Med": round(float(analog_summary.get("ret_2_median", np.nan)) * 100, 2) if analog_summary else np.nan,
             "Analog 2d Up %": round(float(analog_summary.get("ret_2_p_up", np.nan)) * 100, 1) if analog_summary else np.nan,
+            "Overheat Score": round(float(0.55 * proxy_row.get("uo_pctile", 0.5) * 100 + 0.45 * daily_row.get("uo_pctile", 0.5) * 100 + max(0.0, (daily_row.get("rsi_14", 50.0) - 60)) * 0.4 + max(0.0, (daily_row.get("cci_20", 0.0) - 100)) * 0.03), 1),
         }
 
         # Detail Dict
@@ -742,18 +910,24 @@ def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: p
         return row_data, detail_data
 
     except Exception as e:
+        # st.error(f"Error processing {sym}: {e}") # Don't st.error in thread
         return {"Symbol": sym, "Status": f"Error: {str(e)[:20]}", "Combined Recommendation": "ERROR"}, None
 
 # -----------------------------
 # APP MAIN
 # -----------------------------
-st.title("📈 Stable Market Engine Final")
-st.caption("True Percentile Rank | Batch Fetching | Disk Cache | Parallel Processing | Historical Integrity")
+st.title("📈 Stable Market Engine Pro")
+st.caption("Batch Fetching | Disk Cache | Parallel Processing | Hybrid rank+severity normalization")
 
 with st.sidebar:
     st.header("Inputs")
     manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="SMH, QQQ, INTC, NVDA, AMD, TSLA, META", height=110)
-    alpha_vantage_key = st.text_input("Alpha Vantage API key (optional fallback)", type="password")
+    st.markdown("---")
+    data_provider = st.radio("Market data source", ["yahoo", "alpaca"], index=0)
+    alpaca_key = st.text_input("Alpaca API key", type="password", disabled=(data_provider != "alpaca"))
+    alpaca_secret = st.text_input("Alpaca API secret", type="password", disabled=(data_provider != "alpaca"))
+    alpaca_feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0, disabled=(data_provider != "alpaca"))
+    true_intraday = st.checkbox("Use true Alpaca 2-hour bars", value=True, disabled=(data_provider != "alpaca"))
 
     st.header("Settings")
     benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "RSP", "IWM"], index=0)
@@ -763,21 +937,6 @@ with st.sidebar:
     analysis_date = st.date_input("Calendar lookback", value=default_date, disabled=(analysis_mode == "Current"))
     proxy_mode = st.radio("Tactical proxy", ["hourly", "2hour"], index=0)
     run_analysis = st.button("Run Analysis", type="primary", width='stretch')
-    
-    # --- DOWNLOAD SOURCE CODE FEATURE ---
-    st.sidebar.markdown("---")
-    try:
-        script_path = Path(__file__).resolve()
-        with open(script_path, "r") as f:
-            source_code = f.read()
-        st.sidebar.download_button(
-            "⬇️ Download Source Code",
-            source_code,
-            file_name="stable_market_engine_final.py",
-            mime="text/x-python",
-        )
-    except Exception:
-        pass
 
 if not run_analysis:
     st.stop()
@@ -791,10 +950,21 @@ if not symbols:
 # 1. Bulk Fetch Data
 # Combine symbols + benchmark to ensure we have everything in one go
 all_fetch_symbols = list(set(symbols + [benchmark]))
-all_data_map = fetch_yahoo_batch(all_fetch_symbols, history_years)
+if run_analysis and force_refresh:
+    clear_symbol_cache(all_fetch_symbols)
+    fetch_yahoo_batch.clear()
+    fetch_alpaca_daily_batch.clear()
+    fetch_alpaca_intraday.clear()
+
+if data_provider == "alpaca":
+    all_data_map = fetch_alpaca_daily_batch(all_fetch_symbols, history_years, alpaca_key, alpaca_secret, alpaca_feed)
+    if (not all_data_map) and alpaca_feed == "sip":
+        st.warning("Alpaca SIP feed may require a paid plan. Falling back to IEX may help.")
+else:
+    all_data_map = fetch_yahoo_batch(all_fetch_symbols, history_years)
 
 if benchmark not in all_data_map or all_data_map[benchmark].empty:
-    st.error(f"Could not fetch benchmark {benchmark}. Check cache or network.")
+    st.error(f"Could not fetch benchmark {benchmark}. Check credentials, cache, or network.")
     st.stop()
 
 benchmark_df = all_data_map[benchmark]
@@ -809,7 +979,7 @@ status_text = st.empty()
 # max_workers=4 is safe; indicator calculation is CPU bound but Pandas releases GIL
 with ThreadPoolExecutor(max_workers=4) as executor:
     futures = {
-        executor.submit(process_symbol_task, s, all_data_map, benchmark_df, proxy_mode, analysis_mode, analysis_date, alpha_vantage_key): s 
+        executor.submit(process_symbol_task, s, all_data_map, benchmark_df, proxy_mode, analysis_mode, analysis_date, data_provider, alpaca_key, alpaca_secret, alpaca_feed, true_intraday): s 
         for s in symbols
     }
     
@@ -832,24 +1002,40 @@ status_text.empty()
 
 # 3. Display Results
 results_df = pd.DataFrame(rows)
+if not results_df.empty:
+    # Rank uploaded scan/watchlist results by current overheat state using proxy + daily.
+    if "Overheat Score" in results_df.columns:
+        results_df = results_df.sort_values(["Overheat Score", "Daily %ile"], ascending=False)
+    elif "Daily %ile" in results_df.columns:
+        results_df = results_df.sort_values("Daily %ile", ascending=False)
+    st.session_state["analysis_results"] = results_df
+    st.session_state["analysis_detail"] = detail
+    st.session_state["analysis_valid_symbols"] = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
+else:
+    st.session_state["analysis_results"] = pd.DataFrame()
+    st.session_state["analysis_detail"] = {}
+    st.session_state["analysis_valid_symbols"] = []
+
+results_df = st.session_state.get("analysis_results", pd.DataFrame())
+detail = st.session_state.get("analysis_detail", {})
+valid_symbols = st.session_state.get("analysis_valid_symbols", [])
+
 st.subheader("Ranked Results")
-if results_df.empty:
+if results_df is None or results_df.empty:
     st.warning("No results generated.")
     st.stop()
 
-# Sort by Daily Percentile (highest momentum/extension first)
-if "Daily %ile" in results_df.columns:
-    results_df = results_df.sort_values("Daily %ile", ascending=False)
-
 st.dataframe(results_df, width='stretch', hide_index=True)
-st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_final.csv", "text/csv")
+st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_pro.csv", "text/csv")
 
-valid_symbols = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
 if not valid_symbols:
     st.stop()
 
+if st.session_state.get("selected_symbol") not in valid_symbols:
+    st.session_state["selected_symbol"] = valid_symbols[0]
+
 st.subheader("Detailed Analysis")
-selected = st.selectbox("Select symbol", valid_symbols)
+selected = st.selectbox("Select symbol", valid_symbols, key="selected_symbol")
 item = detail[selected]
 
 # Metric Columns
