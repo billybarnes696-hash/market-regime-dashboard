@@ -268,7 +268,8 @@ def fetch_daily_priority(symbol: str, years: int, alpha_key: str) -> Tuple[pd.Da
 # -----------------------------
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
     spans = {
-        "proxy": (5, 13, 5),
+        "proxy_hourly": (5, 13, 5),
+        "proxy_2hour": (6, 18, 5),
         "daily": (8, 21, 7),
         "weekly": (5, 13, 5),
     }
@@ -298,7 +299,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     out["uo_gap"] = out["uo_hist"]
     out["uo_slope_1"] = out["uo"].diff(1)
     out["uo_slope_3"] = out["uo"].diff(3)
-    out["uo_pctile"] = rolling_percentile(out["uo"], 120 if timeframe_name == "proxy" else 252)
+    out["uo_pctile"] = rolling_percentile(out["uo"], 120 if timeframe_name in {"proxy_hourly", "proxy_2hour"} else 252)
     return out
 
 
@@ -335,7 +336,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     else:
         out["rs_vs_benchmark"] = 1.0
         out["rs_bench_slope_5"] = 0.0
-    win = 120 if timeframe_name == "proxy" else 252
+    win = 120 if timeframe_name in {"proxy_hourly", "proxy_2hour"} else 252
     for col in ["rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14", "dist_ema20_pct", "volume_ratio", "dist_vwap_pct"]:
         if col in out.columns:
             out[f"{col}_pctile"] = rolling_percentile(out[col], win)
@@ -348,9 +349,25 @@ def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
     return df.resample("W-FRI").agg(agg).dropna(how="any")
 
 
-def build_proxy_from_daily(df: pd.DataFrame) -> pd.DataFrame:
-    # Daily-based fast proxy to replace unstable true hourly fetches.
-    return df.copy()
+def build_proxy_from_daily(df: pd.DataFrame, proxy_mode: str) -> Tuple[pd.DataFrame, str, str]:
+    # Daily-based tactical proxy to replace unstable true hourly fetches.
+    label = "Hourly Proxy" if proxy_mode == "hourly" else "2-Hour Proxy"
+    timeframe_name = "proxy_hourly" if proxy_mode == "hourly" else "proxy_2hour"
+    return df.copy(), timeframe_name, label
+
+
+def compute_distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, float]:
+    if row is None or row.empty or frame is None or frame.empty:
+        return {"gap": np.nan, "abs_gap": np.nan, "range_pct": np.nan}
+    gap = float(row.get("uo", np.nan) - row.get("uo_signal", np.nan))
+    abs_gap = abs(gap) if pd.notna(gap) else np.nan
+    recent = (frame["uo"] - frame["uo_signal"]).dropna().tail(40)
+    if recent.empty:
+        range_pct = np.nan
+    else:
+        denom = max(float(recent.abs().max()), 1e-9)
+        range_pct = float(np.clip(abs_gap / denom, 0, 1) * 100) if pd.notna(abs_gap) else np.nan
+    return {"gap": gap, "abs_gap": abs_gap, "range_pct": range_pct}
 
 
 def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, float, str]:
@@ -369,9 +386,9 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, float,
     if uo_pct > 0.80 and (uo_slope < 0 or uo_gap < 0 or tsi_gap < 0) and rsi_val > 70:
         conf = min(95.0, 55 + (uo_pct - 0.80) * 150)
         return "PUT", conf, "Rolling from elevated zone"
-    if timeframe == "proxy" and rsi_val > 75 and cci_val > 90 and pct_b > 0.90 and (uo_gap <= 0 or tsi_gap <= 0):
+    if timeframe in {"proxy_hourly", "proxy_2hour"} and rsi_val > 75 and cci_val > 90 and pct_b > 0.90 and (uo_gap <= 0 or tsi_gap <= 0):
         return "PUT", 78.0, "Proxy overheated and rolling"
-    if timeframe == "proxy" and rsi_val > 75 and cci_val > 90 and pct_b > 0.90 and adx_val > 25 and uo_gap > 0:
+    if timeframe in {"proxy_hourly", "proxy_2hour"} and rsi_val > 75 and cci_val > 90 and pct_b > 0.90 and adx_val > 25 and uo_gap > 0:
         return "AVOID CHASE", 72.0, "Pinned continuation risk"
     if uo_pct < 0.20 and (uo_slope > 0 or uo_gap > 0 or tsi_gap > 0) and rsi_val < 35:
         conf = min(95.0, 55 + (0.20 - uo_pct) * 150)
@@ -418,10 +435,10 @@ def slice_asof(df: pd.DataFrame, analysis_date: pd.Timestamp) -> pd.DataFrame:
     return df.loc[df.index <= end_ts].copy()
 
 
-def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp) -> None:
+def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, proxy_label: str) -> None:
     fig = make_subplots(
         rows=4, cols=1, vertical_spacing=0.06,
-        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", "Fast Daily Proxy Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
+        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", f"{proxy_label} Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
         row_heights=[0.42, 0.19, 0.19, 0.20],
     )
     if not daily_df.empty:
@@ -456,9 +473,10 @@ with st.sidebar:
     analysis_mode = st.radio("Analysis mode", ["Current", "Historical"], index=0)
     default_date = pd.Timestamp.today().date()
     analysis_date = st.date_input("Calendar lookback", value=default_date, disabled=(analysis_mode == "Current"))
+    proxy_mode = st.radio("Tactical proxy", ["hourly", "2hour"], index=0, format_func=lambda x: "Hourly Proxy" if x == "hourly" else "2-Hour Proxy")
     run_analysis = st.button("Run Analysis", type="primary", width='stretch')
 
-st.info("This build uses daily data only. The short-term panel is a fast daily proxy, not true hourly bars.")
+st.info("This build uses daily data only. The tactical panel is a switchable daily-built proxy, not true intraday bars.")
 
 if not run_analysis:
     st.stop()
@@ -497,10 +515,10 @@ for idx, symbol in enumerate(symbols):
         })
         continue
 
-    proxy_raw = build_proxy_from_daily(daily_raw)
+    proxy_raw, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_raw, proxy_mode)
     weekly_raw = resample_weekly(daily_raw)
 
-    proxy_df = enrich_price_features(proxy_raw, "proxy", benchmark_daily)
+    proxy_df = enrich_price_features(proxy_raw, proxy_timeframe, benchmark_daily)
     daily_df = enrich_price_features(daily_raw, "daily", benchmark_daily)
     weekly_df = enrich_price_features(weekly_raw, "weekly", benchmark_daily)
 
@@ -525,7 +543,8 @@ for idx, symbol in enumerate(symbols):
     daily_row = daily_view.iloc[-1]
     weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
 
-    proxy_call, proxy_conf, proxy_reason = classify_timeframe_call(proxy_row, "proxy")
+    proxy_call, proxy_conf, proxy_reason = classify_timeframe_call(proxy_row, proxy_timeframe)
+    proxy_cross = compute_distance_to_cross(proxy_row, proxy_view)
     daily_call, daily_conf, daily_reason = classify_timeframe_call(daily_row, "daily")
     weekly_call, weekly_conf, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
     combined_call, combined_reason = combine_calls(proxy_call, daily_call, weekly_call)
@@ -539,6 +558,7 @@ for idx, symbol in enumerate(symbols):
         "DefeatBeta": meta.get("defeat_status", "n/a"),
         "As Of": str(daily_row.name.date()),
         "Close": round(float(daily_row.get("Close", np.nan)), 2),
+        "Proxy Mode": proxy_label,
         "Proxy Call": proxy_call,
         "Daily Call": daily_call,
         "Weekly Call": weekly_call,
@@ -546,6 +566,8 @@ for idx, symbol in enumerate(symbols):
         "Proxy UO": round(float(proxy_row.get("uo", np.nan)), 4) if not proxy_row.empty else np.nan,
         "Proxy Sig": round(float(proxy_row.get("uo_signal", np.nan)), 4) if not proxy_row.empty else np.nan,
         "Proxy %ile": round(float(proxy_row.get("uo_pctile", np.nan)) * 100, 1) if not proxy_row.empty else np.nan,
+        "Cross Gap": round(float(proxy_cross.get("gap", np.nan)), 4) if proxy_cross else np.nan,
+        "Cross Dist %": round(float(proxy_cross.get("range_pct", np.nan)), 1) if proxy_cross else np.nan,
         "Daily UO": round(float(daily_row.get("uo", np.nan)), 4),
         "Daily Sig": round(float(daily_row.get("uo_signal", np.nan)), 4),
         "Daily %ile": round(float(daily_row.get("uo_pctile", np.nan)) * 100, 1),
@@ -563,6 +585,8 @@ for idx, symbol in enumerate(symbols):
         "daily": daily_view,
         "weekly": weekly_view,
         "proxy_call": (proxy_call, proxy_conf, proxy_reason),
+        "proxy_label": proxy_label,
+        "proxy_cross": proxy_cross,
         "daily_call": (daily_call, daily_conf, daily_reason),
         "weekly_call": (weekly_call, weekly_conf, weekly_reason),
         "combined": (combined_call, combined_reason),
@@ -593,20 +617,27 @@ st.subheader("Detailed Analysis")
 selected = st.selectbox("Select symbol", valid_symbols)
 item = detail[selected]
 proxy_call, proxy_conf, proxy_reason = item["proxy_call"]
+proxy_label = item.get("proxy_label", "Proxy")
+proxy_cross = item.get("proxy_cross", {})
 daily_call, daily_conf, daily_reason = item["daily_call"]
 weekly_call, weekly_conf, weekly_reason = item["weekly_call"]
 combined_call, combined_reason = item["combined"]
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Fast Daily Proxy", proxy_call)
+c1.metric(proxy_label, proxy_call)
 c2.metric("Daily", daily_call)
 c3.metric("Weekly", weekly_call)
 c4.metric("Combined", combined_call)
-st.markdown(f"**Proxy reason:** {proxy_reason}")
+st.markdown(f"**{proxy_label} reason:** {proxy_reason}")
 st.markdown(f"**Daily reason:** {daily_reason}")
 st.markdown(f"**Weekly reason:** {weekly_reason}")
 st.markdown(f"**Combined read:** {combined_reason}")
 st.caption(f"History source: {item['history_source']} | Fetch detail: {item['fetch_meta']}")
+
+cd1, cd2, cd3 = st.columns(3)
+cd1.metric("Distance to cross", f"{proxy_cross.get('abs_gap', np.nan):.4f}" if pd.notna(proxy_cross.get('abs_gap', np.nan)) else "n/a")
+cd2.metric("Cross gap sign", "Above signal" if proxy_cross.get("gap", np.nan) >= 0 else "Below signal") if pd.notna(proxy_cross.get("gap", np.nan)) else cd2.metric("Cross gap sign", "n/a")
+cd3.metric("Cross distance %", f"{proxy_cross.get('range_pct', np.nan):.1f}%" if pd.notna(proxy_cross.get('range_pct', np.nan)) else "n/a")
 
 proxy_last = item["proxy"].iloc[-1] if not item["proxy"].empty else pd.Series(dtype=float)
 daily_last = item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)
@@ -616,13 +647,15 @@ st.markdown("### As-of values")
 asof_table = pd.DataFrame(
     [
         {
-            "Frame": "Fast Daily Proxy",
+            "Frame": proxy_label,
             "Date": str(proxy_last.name.date()) if not proxy_last.empty else "n/a",
             "Price": round(float(proxy_last.get("Close", np.nan)), 2) if not proxy_last.empty else np.nan,
             "UO": round(float(proxy_last.get("uo", np.nan)), 4) if not proxy_last.empty else np.nan,
             "Signal": round(float(proxy_last.get("uo_signal", np.nan)), 4) if not proxy_last.empty else np.nan,
             "Percentile": round(float(proxy_last.get("uo_pctile", np.nan)) * 100, 1) if not proxy_last.empty else np.nan,
             "Candle Score": round(float(proxy_last.get("candle_score", np.nan)), 1) if not proxy_last.empty else np.nan,
+            "Cross Gap": round(float(proxy_cross.get("gap", np.nan)), 4) if pd.notna(proxy_cross.get("gap", np.nan)) else np.nan,
+            "Cross Dist %": round(float(proxy_cross.get("range_pct", np.nan)), 1) if pd.notna(proxy_cross.get("range_pct", np.nan)) else np.nan,
         },
         {
             "Frame": "Daily",
@@ -646,4 +679,4 @@ asof_table = pd.DataFrame(
 )
 st.dataframe(asof_table, width='stretch', hide_index=True)
 
-plot_dashboard(selected, item["proxy"], item["daily"], item["weekly"], item["asof"])
+plot_dashboard(selected, item["proxy"], item["daily"], item["weekly"], item["asof"], proxy_label)
