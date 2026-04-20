@@ -1,7 +1,11 @@
 import io
 import time
+import shutil
+import datetime
+import glob
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -19,29 +23,91 @@ except Exception:
     except Exception:
         DefeatTicker = None
 
-st.set_page_config(page_title="Stable Market Engine", layout="wide", initial_sidebar_state="expanded")
+# -----------------------------
+# CONFIG & SETUP
+# -----------------------------
+st.set_page_config(page_title="Stable Market Engine Pro", layout="wide", initial_sidebar_state="expanded")
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / "cache_store"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = CACHE_DIR / "market_data"  # Persistent Parquet Storage
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
-# Basic indicators
+# VECTORIZED UTILS
 # -----------------------------
+def rolling_rank_pct(series: pd.Series, window: int = 252, min_periods: Optional[int] = None) -> pd.Series:
+    """True rolling percentile rank of the latest observation in each window.
+
+    This is slower than pure vectorized min-max scaling, but it preserves the user's
+    original cross-asset intent: compare each indicator to its own recent history,
+    not merely its recent min/max range.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    values = s.to_numpy(dtype=float)
+    out = np.full(len(values), np.nan, dtype=float)
+    min_periods = min_periods or max(20, window // 5)
+    for i, v in enumerate(values):
+        if i + 1 < min_periods or not np.isfinite(v):
+            continue
+        w = values[max(0, i - window + 1): i + 1]
+        w = w[np.isfinite(w)]
+        if len(w) < min_periods:
+            continue
+        out[i] = float((w <= v).mean())
+    return pd.Series(out, index=series.index)
+
+
+def rolling_minmax_scale(series: pd.Series, window: int = 252) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    if len(s) < 2:
+        return pd.Series([np.nan] * len(s), index=s.index)
+    roll_min = s.rolling(window, min_periods=max(10, window // 10)).min()
+    roll_max = s.rolling(window, min_periods=max(10, window // 10)).max()
+    diff = (roll_max - roll_min).replace(0, np.nan)
+    return (s - roll_min) / diff
+
+
+def rolling_zscore_score(series: pd.Series, window: int = 252) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    mean = s.rolling(window, min_periods=max(20, window // 5)).mean()
+    std = s.rolling(window, min_periods=max(20, window // 5)).std().replace(0, np.nan)
+    z = (s - mean) / std
+    # Compress extremes but preserve severity better than rank alone.
+    return 0.5 * (1 + np.tanh(z / 2.0))
+
+
+def rolling_percentile(series: pd.Series, window: int = 252) -> pd.Series:
+    """Best-of-both-worlds normalization.
+
+    Blend true rolling percentile rank (cross-asset comparability) with z-score-based
+    severity and a small min-max component (range awareness). The output stays in
+    the familiar 0..1 band expected by the oscillator, analog engine, and UI.
+    """
+    rank_pct = rolling_rank_pct(series, window)
+    z_score = rolling_zscore_score(series, window)
+    minmax = rolling_minmax_scale(series, window)
+
+    pieces = pd.concat([rank_pct, z_score, minmax], axis=1)
+    pieces.columns = ["rank", "z", "mm"]
+
+    # Weighted blend: prioritize true percentile, but keep absolute-stretch severity.
+    blended = 0.55 * pieces["rank"] + 0.30 * pieces["z"] + 0.15 * pieces["mm"]
+
+    # If one component is missing, use the average of what remains.
+    return blended.where(blended.notna(), pieces.mean(axis=1, skipna=True))
+
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-
 def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
-
 
 def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(window).mean()
-
 
 def rsi(series: pd.Series, window: int = 14) -> pd.Series:
     delta = series.diff()
@@ -52,13 +118,11 @@ def rsi(series: pd.Series, window: int = 14) -> pd.Series:
     rs = avg_up / avg_down.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-
 def cci(df: pd.DataFrame, window: int = 20) -> pd.Series:
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
     ma = tp.rolling(window).mean()
     md = (tp - ma).abs().rolling(window).mean()
     return (tp - ma) / (0.015 * md.replace(0, np.nan))
-
 
 def tsi(series: pd.Series, long_period: int = 25, short_period: int = 13, signal_period: int = 7) -> Tuple[pd.Series, pd.Series]:
     delta = series.diff()
@@ -69,14 +133,12 @@ def tsi(series: pd.Series, long_period: int = 25, short_period: int = 13, signal
     signal_line = ema(tsi_line, signal_period)
     return tsi_line, signal_line
 
-
 def bollinger_pct_b(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.Series:
     mid = series.rolling(window).mean()
     std = series.rolling(window).std()
     upper = mid + num_std * std
     lower = mid - num_std * std
     return (series - lower) / (upper - lower).replace(0, np.nan)
-
 
 def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
@@ -91,32 +153,14 @@ def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     return dx.rolling(window).mean()
 
-
-def rolling_percentile(series: pd.Series, window: int = 252) -> pd.Series:
-    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
-    out = np.full(len(values), np.nan, dtype=float)
-    min_valid = max(20, window // 5)
-    for i, v in enumerate(values):
-        if i + 1 < min_valid or not np.isfinite(v):
-            continue
-        window_vals = values[max(0, i - window + 1): i + 1]
-        window_vals = window_vals[np.isfinite(window_vals)]
-        if len(window_vals) < max(10, window // 10):
-            continue
-        out[i] = float((window_vals <= v).mean())
-    return pd.Series(out, index=series.index)
-
-
 def slope(series: pd.Series, bars: int = 3) -> pd.Series:
     return series.diff(bars) / bars
-
 
 def centered_pct(series: pd.Series) -> pd.Series:
     return (series.fillna(0.5) - 0.5) * 2
 
-
 # -----------------------------
-# Data fetch
+# DATA FETCHING (ROBUST LAYER)
 # -----------------------------
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -146,22 +190,87 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         out["Volume"] = np.nan
     return out
 
+def get_cache_path(symbol: str) -> Path:
+    safe_name = "".join(c for c in symbol if c.isalnum() or c in ('_', '-', '.'))
+    return DATA_DIR / f"{safe_name}.parquet"
+
+def is_cache_fresh(filepath: Path, max_hours: int = 24) -> bool:
+    if not filepath.exists():
+        return False
+    mod_time = datetime.datetime.fromtimestamp(filepath.stat().st_mtime)
+    return (datetime.datetime.now() - mod_time) < datetime.timedelta(hours=max_hours)
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yahoo_daily(symbol: str, years: int = 10) -> pd.DataFrame:
-    periods = [f"{max(years, 5)}y", "10y", "5y"]
-    for period in periods:
-        for attempt in range(4):
+def fetch_yahoo_batch(symbols: List[str], years: int = 10) -> Dict[str, pd.DataFrame]:
+    """Bulk fetch to avoid rate limits, with persistent disk caching."""
+    if not symbols:
+        return {}
+    
+    # 1. Identify fresh cached data
+    symbols_to_fetch = []
+    for s in symbols:
+        if not is_cache_fresh(get_cache_path(s)):
+            symbols_to_fetch.append(s)
+            
+    cache_status = f"{len(symbols) - len(symbols_to_fetch)} Loaded from Disk, {len(symbols_to_fetch)} Fetching..."
+    if len(symbols_to_fetch) > 0:
+        st.info(f"🔄 Updating Market Data ({cache_status})")
+    else:
+        st.success(f"✅ Data Fresh ({cache_status})")
+
+    if not symbols_to_fetch:
+        # Load all from disk
+        data_map = {}
+        for s in symbols:
+            path = get_cache_path(s)
+            if path.exists():
+                try:
+                    data_map[s] = pd.read_parquet(path)
+                except Exception:
+                    pass
+        return data_map
+
+    # 2. Bulk Download (Anti-Rate Limit)
+    try:
+        bulk_df = yf.download(
+            symbols_to_fetch, 
+            period=f"{max(years, 5)}y", 
+            interval="1d", 
+            group_by='ticker', 
+            auto_adjust=True,  # CRITICAL: Use adjusted prices for accuracy
+            progress=False,
+            threads=True
+        )
+    except Exception as e:
+        st.warning(f"Bulk download warning: {e}")
+        bulk_df = {}
+
+    # 3. Save to Disk
+    saved_map = {}
+    if len(symbols_to_fetch) == 1:
+        bulk_df = {symbols_to_fetch[0]: bulk_df}
+    else:
+        # Handle multi-index response safely
+        if isinstance(bulk_df, pd.DataFrame):
+            available_cols = [c for c in bulk_df.columns.levels[0] if c in symbols_to_fetch]
+            bulk_df = {ticker: bulk_df[ticker].copy() for ticker in available_cols}
+
+    for ticker, df in bulk_df.items():
+        df_clean = normalize_ohlcv(df)
+        if not df_clean.empty:
+            df_clean.to_parquet(get_cache_path(ticker))
+            saved_map[ticker] = df_clean
+
+    # 4. Final Assembly (Fresh + Cache)
+    final_map = {}
+    for s in symbols:
+        path = get_cache_path(s)
+        if path.exists():
             try:
-                df = yf.download(symbol, period=period, interval="1d", auto_adjust=False, progress=False, threads=False, prepost=False)
-                df = normalize_ohlcv(df)
-                if not df.empty:
-                    return df
+                final_map[s] = pd.read_parquet(path)
             except Exception:
                 pass
-            time.sleep(0.8 * (attempt + 1))
-    return pd.DataFrame()
-
+    return final_map
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_alpha_vantage_daily(symbol: str, api_key: str) -> pd.DataFrame:
@@ -194,77 +303,15 @@ def fetch_alpha_vantage_daily(symbol: str, api_key: str) -> pd.DataFrame:
                 }
             )
         df = pd.DataFrame(rows).dropna(subset=["Date"]).set_index("Date").sort_index()
+        # Save to cache manually for AV
+        if not df.empty:
+            df.to_parquet(get_cache_path(symbol))
         return normalize_ohlcv(df)
     except Exception:
         return pd.DataFrame()
 
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_defeatbeta_history(symbol: str, years: int = 5) -> pd.DataFrame:
-    if DefeatTicker is None:
-        return pd.DataFrame()
-    try:
-        t = DefeatTicker(symbol)
-        df = t.price()
-        if df is None or len(df) == 0:
-            return pd.DataFrame()
-        rename_map = {
-            "report_date": "Date", "date": "Date", "open": "Open", "high": "High",
-            "low": "Low", "close": "Close", "volume": "Volume",
-        }
-        df = df.rename(columns=rename_map)
-        needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
-        if not all(c in df.columns for c in needed):
-            return pd.DataFrame()
-        df = df[needed].copy()
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-        return normalize_ohlcv(df).tail(int(max(years, 5) * 252 * 1.3))
-    except Exception:
-        return pd.DataFrame()
-
-
-def merge_with_recent(base_df: pd.DataFrame, recent_df: pd.DataFrame) -> pd.DataFrame:
-    if base_df.empty:
-        return recent_df.copy()
-    if recent_df.empty:
-        return base_df.copy()
-    cutoff = pd.to_datetime(base_df.index.max()) - pd.Timedelta(days=10)
-    recent_only = recent_df[recent_df.index >= cutoff]
-    merged = pd.concat([base_df, recent_only])
-    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-    return merged
-
-
-def fetch_daily_priority(symbol: str, years: int, alpha_key: str) -> Tuple[pd.DataFrame, str, Dict[str, str]]:
-    meta = {"yahoo_status": "not_checked", "alpha_status": "not_checked", "defeat_status": "not_checked"}
-
-    yahoo_df = fetch_yahoo_daily(symbol, years=max(years, 5))
-    if not yahoo_df.empty:
-        meta["yahoo_status"] = f"ok:{len(yahoo_df)}"
-        meta["daily_rows"] = str(len(yahoo_df))
-        return yahoo_df, "yahoo_daily", meta
-    meta["yahoo_status"] = "empty_or_rate_limited"
-
-    alpha_df = fetch_alpha_vantage_daily(symbol, alpha_key)
-    if not alpha_df.empty:
-        meta["alpha_status"] = f"ok:{len(alpha_df)}"
-        meta["daily_rows"] = str(len(alpha_df))
-        return alpha_df, "alpha_vantage_daily", meta
-    meta["alpha_status"] = "empty_or_limited"
-
-    defeat_df = fetch_defeatbeta_history(symbol, years=max(years, 5))
-    if not defeat_df.empty:
-        meta["defeat_status"] = f"ok:{len(defeat_df)}"
-        meta["daily_rows"] = str(len(defeat_df))
-        return defeat_df, "defeatbeta_fallback", meta
-    meta["defeat_status"] = "empty"
-    meta["daily_rows"] = "0"
-    return pd.DataFrame(), "none", meta
-
-
 # -----------------------------
-# Feature engineering
+# FEATURE ENGINEERING
 # -----------------------------
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
     spans = {
@@ -301,7 +348,6 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     out["uo_slope_3"] = out["uo"].diff(3)
     out["uo_pctile"] = rolling_percentile(out["uo"], 120 if timeframe_name in {"proxy_hourly", "proxy_2hour"} else 252)
     return out
-
 
 def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     if df.empty:
@@ -343,19 +389,18 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     out = add_ultimate_oscillator(out, timeframe_name)
     return out
 
-
 def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
     return df.resample("W-FRI").agg(agg).dropna(how="any")
 
-
 def build_proxy_from_daily(df: pd.DataFrame, proxy_mode: str) -> Tuple[pd.DataFrame, str, str]:
-    # Daily-based tactical proxy to replace unstable true hourly fetches.
     label = "Hourly Proxy" if proxy_mode == "hourly" else "2-Hour Proxy"
     timeframe_name = "proxy_hourly" if proxy_mode == "hourly" else "proxy_2hour"
     return df.copy(), timeframe_name, label
 
-
+# -----------------------------
+# ANALYSIS LOGIC
+# -----------------------------
 def compute_distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, float]:
     if row is None or row.empty or frame is None or frame.empty:
         return {"gap": np.nan, "abs_gap": np.nan, "range_pct": np.nan}
@@ -369,7 +414,6 @@ def compute_distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, 
         range_pct = float(np.clip(abs_gap / denom, 0, 1) * 100) if pd.notna(abs_gap) else np.nan
     return {"gap": gap, "abs_gap": abs_gap, "range_pct": range_pct}
 
-
 def compute_state_severity(frame: pd.DataFrame, row: pd.Series) -> Dict[str, float]:
     if row is None or row.empty or frame is None or frame.empty:
         return {
@@ -377,7 +421,6 @@ def compute_state_severity(frame: pd.DataFrame, row: pd.Series) -> Dict[str, flo
             "bars_below_20": 0, "bars_below_10": 0, "signal_catchup": np.nan, "lower_high_div": 0,
             "higher_low_repair": 0, "late_cycle_flag": 0, "early_repair_flag": 0,
         }
-
     gap = (frame["uo"] - frame["uo_signal"]).dropna()
     uo = frame["uo"].dropna()
     pct = frame["uo_pctile"].dropna()
@@ -387,10 +430,8 @@ def compute_state_severity(frame: pd.DataFrame, row: pd.Series) -> Dict[str, flo
         vals = cond.fillna(False).astype(bool).tolist()
         c = 0
         for ok in reversed(vals):
-            if ok:
-                c += 1
-            else:
-                break
+            if ok: c += 1
+            else: break
         return c
 
     bars_above_80 = count_recent(pct > 0.80)
@@ -437,7 +478,6 @@ def compute_state_severity(frame: pd.DataFrame, row: pd.Series) -> Dict[str, flo
         "early_repair_flag": early_repair_flag,
     }
 
-
 def recommendation_from_state(call: str, severity: Dict[str, float], timeframe: str) -> str:
     if call == "CALL":
         if severity.get("late_cycle_flag", 0) or severity.get("lower_high_div", 0):
@@ -458,7 +498,6 @@ def recommendation_from_state(call: str, severity: Dict[str, float], timeframe: 
     if call == "AVOID CHASE":
         return "WAIT, too extended"
     return call
-
 
 def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, float, str]:
     if row is None or row.empty:
@@ -491,7 +530,6 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, float,
         return "NEUTRAL", 45.0, "Near signal-line equilibrium"
     return "NEUTRAL", 50.0, "Mixed state"
 
-
 def combine_calls(proxy_call: str, daily_call: str, weekly_call: str) -> Tuple[str, str]:
     score_map = {"CALL": 1.0, "PUT": -1.0, "NEUTRAL": 0.0, "AVOID CHASE": -0.35, "NO DATA": 0.0}
     score = 0.30 * score_map.get(proxy_call, 0.0) + 0.45 * score_map.get(daily_call, 0.0) + 0.25 * score_map.get(weekly_call, 0.0)
@@ -505,7 +543,6 @@ def combine_calls(proxy_call: str, daily_call: str, weekly_call: str) -> Tuple[s
         return "CALL ON PULLBACK", "Higher timeframe trend constructive, but entry needs reset"
     return "NEUTRAL", "Mixed timeframe signals"
 
-
 def align_asof(index: pd.DatetimeIndex, dt: pd.Timestamp) -> pd.Timestamp:
     ts = pd.Timestamp(dt)
     try:
@@ -517,22 +554,17 @@ def align_asof(index: pd.DatetimeIndex, dt: pd.Timestamp) -> pd.Timestamp:
         pass
     return ts
 
-
 def slice_asof(df: pd.DataFrame, analysis_date: pd.Timestamp) -> pd.DataFrame:
     if df.empty:
         return df.copy()
     end_ts = align_asof(df.index, pd.Timestamp(analysis_date) + pd.Timedelta(hours=23, minutes=59, seconds=59))
     return df.loc[df.index <= end_ts].copy()
 
-
-
-
 def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for n in [1, 2, 5]:
         out[f"fwd_ret_{n}"] = out["Close"].shift(-n) / out["Close"] - 1
     return out
-
 
 ANALOG_FEATURES = [
     "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3",
@@ -543,29 +575,12 @@ ANALOG_FEATURES = [
 ]
 
 ANALOG_WEIGHTS = {
-    "uo_pctile": 1.4,
-    "uo_gap": 1.5,
-    "uo_slope_1": 1.2,
-    "uo_slope_3": 1.4,
-    "rsi_14_pctile": 0.9,
-    "rsi_14": 0.7,
-    "cci_20_pctile": 1.0,
-    "cci_20": 0.8,
-    "tsi_pctile": 1.0,
-    "tsi": 0.8,
-    "tsi_gap": 1.2,
-    "pct_b_pctile": 0.9,
-    "pct_b": 0.8,
-    "atr_stretch_pctile": 0.8,
-    "atr_stretch": 0.7,
-    "dist_ema20_pctile": 0.8,
-    "dist_ema20_pct": 0.7,
-    "rs_bench_slope_5": 0.8,
-    "adx_14_pctile": 0.7,
-    "adx_14": 0.6,
-    "candle_score": 0.5,
+    "uo_pctile": 1.4, "uo_gap": 1.5, "uo_slope_1": 1.2, "uo_slope_3": 1.4,
+    "rsi_14_pctile": 0.9, "rsi_14": 0.7, "cci_20_pctile": 1.0, "cci_20": 0.8,
+    "tsi_pctile": 1.0, "tsi": 0.8, "tsi_gap": 1.2, "pct_b_pctile": 0.9, "pct_b": 0.8,
+    "atr_stretch_pctile": 0.8, "atr_stretch": 0.7, "dist_ema20_pctile": 0.8, "dist_ema20_pct": 0.7,
+    "rs_bench_slope_5": 0.8, "adx_14_pctile": 0.7, "adx_14": 0.6, "candle_score": 0.5,
 }
-
 
 def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 25, exclusion_bars: int = 10) -> pd.DataFrame:
     if frame is None or frame.empty or current_ts not in frame.index:
@@ -587,9 +602,9 @@ def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 25, exc
     zw = z.fillna(0.0).to_numpy() * weights
     pool["distance"] = np.sqrt((zw ** 2).sum(axis=1))
     pool["similarity"] = 1 / (1 + pool["distance"])
+    # Tighter filtering for robustness
+    pool = pool[pool["distance"] < 5.0] 
     return pool.nsmallest(n, "distance").copy()
-
-
 
 def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
     if analogs is None or analogs.empty:
@@ -605,8 +620,6 @@ def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
         out[f"ret_{n}_p_down"] = float(np.average((vals < 0).astype(float), weights=w))
     return out
 
-
-
 def analog_bias(summary: Dict[str, float]) -> Tuple[str, float]:
     if not summary:
         return "n/a", 0.0
@@ -618,8 +631,6 @@ def analog_bias(summary: Dict[str, float]) -> Tuple[str, float]:
     if dn2 >= 0.62 and mean2 < 0:
         return "bearish", min(1.0, (dn2 - 0.5) * 3 + max(0.0, -mean2 * 30))
     return "mixed", abs(up2 - dn2)
-
-
 
 def final_recommendation(combined_call: str, proxy_reco: str, daily_reco: str, analog_summary: Dict[str, float]) -> str:
     bias, strength = analog_bias(analog_summary)
@@ -663,17 +674,116 @@ def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, 
     fig.update_layout(height=950, xaxis_rangeslider_visible=False, legend_orientation="h")
     st.plotly_chart(fig, width='stretch')
 
+# -----------------------------
+# PARALLEL WORKER
+# -----------------------------
+def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: pd.DataFrame, proxy_mode: str, analysis_mode: str, analysis_date_val, alpha_key: str) -> Tuple[Optional[Dict], Optional[Dict]]:
+    try:
+        if sym not in data_map or data_map[sym].empty:
+            # Fallback try for single fetch if bulk missed it
+            df_fb = fetch_alpha_vantage_daily(sym, alpha_key)
+            if df_fb.empty:
+                return None, None
+            data_map[sym] = df_fb
+        
+        daily_raw = data_map[sym]
+        proxy_raw, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_raw, proxy_mode)
+        weekly_raw = resample_weekly(daily_raw)
+
+        proxy_df = enrich_price_features(proxy_raw, proxy_timeframe, bench_df)
+        daily_df = enrich_price_features(daily_raw, "daily", bench_df)
+        weekly_df = enrich_price_features(weekly_raw, "weekly", bench_df)
+
+        asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date_val)
+        proxy_view = slice_asof(proxy_df, asof)
+        daily_view = slice_asof(daily_df, asof)
+        weekly_view = slice_asof(weekly_df, asof)
+
+        if daily_view.empty:
+            return None, None
+
+        proxy_row = proxy_view.iloc[-1] if not proxy_view.empty else pd.Series(dtype=float)
+        daily_row = daily_view.iloc[-1]
+        weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
+
+        proxy_call, proxy_conf, proxy_reason = classify_timeframe_call(proxy_row, proxy_timeframe)
+        proxy_cross = compute_distance_to_cross(proxy_row, proxy_view)
+        daily_call, daily_conf, daily_reason = classify_timeframe_call(daily_row, "daily")
+        weekly_call, weekly_conf, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
+        combined_call, combined_reason = combine_calls(proxy_call, daily_call, weekly_call)
+        
+        proxy_severity = compute_state_severity(proxy_view, proxy_row)
+        daily_severity = compute_state_severity(daily_view, daily_row)
+        weekly_severity = compute_state_severity(weekly_view, weekly_row)
+        
+        proxy_reco = recommendation_from_state(proxy_call, proxy_severity, proxy_timeframe)
+        daily_reco = recommendation_from_state(daily_call, daily_severity, "daily")
+        weekly_reco = recommendation_from_state(weekly_call, weekly_severity, "weekly")
+        
+        analogs = find_analogs(daily_df, daily_row.name, n=25)
+        analog_summary = summarize_analogs(analogs)
+        combined_reco = final_recommendation(combined_call, proxy_reco, daily_reco, analog_summary)
+
+        # Row for Table
+        row_data = {
+            "Symbol": sym,
+            "Status": "OK",
+            "As Of": str(daily_row.name.date()),
+            "Close": round(float(daily_row.get("Close", np.nan)), 2),
+            "Proxy Mode": proxy_label,
+            "Proxy Call": proxy_call,
+            "Daily Call": daily_call,
+            "Weekly Call": weekly_call,
+            "Combined": combined_call,
+            "Proxy Recommendation": proxy_reco,
+            "Daily Recommendation": daily_reco,
+            "Weekly Recommendation": weekly_reco,
+            "Combined Recommendation": combined_reco,
+            "Proxy %ile": round(float(proxy_row.get("uo_pctile", np.nan)) * 100, 1) if not proxy_row.empty else np.nan,
+            "Cross Dist %": round(float(proxy_cross.get("range_pct", np.nan)), 1) if proxy_cross else np.nan,
+            "Daily %ile": round(float(daily_row.get("uo_pctile", np.nan)) * 100, 1),
+            "Weekly %ile": round(float(weekly_row.get("uo_pctile", np.nan)) * 100, 1) if not weekly_row.empty else np.nan,
+            "Candle Score": round(float(daily_row.get("candle_score", np.nan)), 1),
+            "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1),
+            "CCI20": round(float(daily_row.get("cci_20", np.nan)), 1),
+            "Analog N": int(analog_summary.get("n", 0)) if analog_summary else 0,
+            "Analog 2d Med": round(float(analog_summary.get("ret_2_median", np.nan)) * 100, 2) if analog_summary else np.nan,
+            "Analog 2d Up %": round(float(analog_summary.get("ret_2_p_up", np.nan)) * 100, 1) if analog_summary else np.nan,
+        }
+
+        # Detail Dict
+        detail_data = {
+            "proxy": proxy_view,
+            "daily": daily_view,
+            "weekly": weekly_view,
+            "proxy_call": (proxy_call, proxy_conf, proxy_reason),
+            "proxy_label": proxy_label,
+            "proxy_cross": proxy_cross,
+            "daily_call": (daily_call, daily_conf, daily_reason),
+            "weekly_call": (weekly_call, weekly_conf, weekly_reason),
+            "combined": (combined_call, combined_reason),
+            "severity": {"proxy": proxy_severity, "daily": daily_severity, "weekly": weekly_severity},
+            "recommendation": {"proxy": proxy_reco, "daily": daily_reco, "weekly": weekly_reco, "combined": combined_reco},
+            "analogs": analogs,
+            "analog_summary": analog_summary,
+            "asof": asof,
+        }
+        return row_data, detail_data
+
+    except Exception as e:
+        # st.error(f"Error processing {sym}: {e}") # Don't st.error in thread
+        return {"Symbol": sym, "Status": f"Error: {str(e)[:20]}", "Combined Recommendation": "ERROR"}, None
 
 # -----------------------------
-# App
+# APP MAIN
 # -----------------------------
-st.title("📈 Stable Market Engine")
-st.caption("Daily-first | fast daily proxy instead of true hourly | calendar lookback with as-of values")
+st.title("📈 Stable Market Engine Pro")
+st.caption("Batch Fetching | Disk Cache | Parallel Processing | Hybrid rank+severity normalization")
 
 with st.sidebar:
     st.header("Inputs")
-    manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="SMH, QQQ, INTC", height=110)
-    alpha_vantage_key = st.text_input("Alpha Vantage API key (optional)", type="password")
+    manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="SMH, QQQ, INTC, NVDA, AMD, TSLA, META", height=110)
+    alpha_vantage_key = st.text_input("Alpha Vantage API key (optional fallback)", type="password")
 
     st.header("Settings")
     benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "RSP", "IWM"], index=0)
@@ -681,10 +791,8 @@ with st.sidebar:
     analysis_mode = st.radio("Analysis mode", ["Current", "Historical"], index=0)
     default_date = pd.Timestamp.today().date()
     analysis_date = st.date_input("Calendar lookback", value=default_date, disabled=(analysis_mode == "Current"))
-    proxy_mode = st.radio("Tactical proxy", ["hourly", "2hour"], index=0, format_func=lambda x: "Hourly Proxy" if x == "hourly" else "2-Hour Proxy")
+    proxy_mode = st.radio("Tactical proxy", ["hourly", "2hour"], index=0)
     run_analysis = st.button("Run Analysis", type="primary", width='stretch')
-
-st.info("This build uses daily data only. The tactical panel is a switchable daily-built proxy, not true intraday bars.")
 
 if not run_analysis:
     st.stop()
@@ -695,150 +803,61 @@ if not symbols:
     st.error("Provide at least one symbol.")
     st.stop()
 
-benchmark_daily_raw, bench_source, bench_meta = fetch_daily_priority(benchmark, history_years, alpha_vantage_key)
-benchmark_daily = normalize_ohlcv(benchmark_daily_raw)
-if benchmark_daily.empty:
-    st.error(f"Could not fetch benchmark {benchmark}.")
+# 1. Bulk Fetch Data
+# Combine symbols + benchmark to ensure we have everything in one go
+all_fetch_symbols = list(set(symbols + [benchmark]))
+all_data_map = fetch_yahoo_batch(all_fetch_symbols, history_years)
+
+if benchmark not in all_data_map or all_data_map[benchmark].empty:
+    st.error(f"Could not fetch benchmark {benchmark}. Check cache or network.")
     st.stop()
 
-st.caption(f"Benchmark source: {bench_source} | Yahoo={bench_meta.get('yahoo_status')} | Alpha={bench_meta.get('alpha_status')} | Defeat={bench_meta.get('defeat_status')}")
+benchmark_df = all_data_map[benchmark]
 
-rows: List[Dict[str, object]] = []
-detail: Dict[str, Dict[str, object]] = {}
+# 2. Parallel Processing
+rows: List[Dict] = []
+detail: Dict[str, Dict] = {}
 progress = st.progress(0.0)
+status_text = st.empty()
 
-for idx, symbol in enumerate(symbols):
-    progress.progress((idx + 1) / len(symbols))
-    daily_raw, source, meta = fetch_daily_priority(symbol, history_years, alpha_vantage_key)
-    daily_raw = normalize_ohlcv(daily_raw)
-    if daily_raw.empty:
-        rows.append({
-            "Symbol": symbol,
-            "Status": "No data",
-            "History Source": source,
-            "Yahoo Daily": meta.get("yahoo_status", "n/a"),
-            "Alpha Daily": meta.get("alpha_status", "n/a"),
-            "DefeatBeta": meta.get("defeat_status", "n/a"),
-            "Fetch Detail": f"yahoo={meta.get('yahoo_status','n/a')} | alpha={meta.get('alpha_status','n/a')} | defeat={meta.get('defeat_status','n/a')}",
-        })
-        continue
-
-    proxy_raw, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_raw, proxy_mode)
-    weekly_raw = resample_weekly(daily_raw)
-
-    proxy_df = enrich_price_features(proxy_raw, proxy_timeframe, benchmark_daily)
-    daily_df = enrich_price_features(daily_raw, "daily", benchmark_daily)
-    weekly_df = enrich_price_features(weekly_raw, "weekly", benchmark_daily)
-
-    asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date)
-    proxy_view = slice_asof(proxy_df, asof)
-    daily_view = slice_asof(daily_df, asof)
-    weekly_view = slice_asof(weekly_df, asof)
-
-    if daily_view.empty:
-        rows.append({
-            "Symbol": symbol,
-            "Status": "No data as of date",
-            "History Source": source,
-            "Yahoo Daily": meta.get("yahoo_status", "n/a"),
-            "Alpha Daily": meta.get("alpha_status", "n/a"),
-            "DefeatBeta": meta.get("defeat_status", "n/a"),
-            "Fetch Detail": f"asof={asof.date()} | no rows before date",
-        })
-        continue
-
-    proxy_row = proxy_view.iloc[-1] if not proxy_view.empty else pd.Series(dtype=float)
-    daily_row = daily_view.iloc[-1]
-    weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
-
-    proxy_call, proxy_conf, proxy_reason = classify_timeframe_call(proxy_row, proxy_timeframe)
-    proxy_cross = compute_distance_to_cross(proxy_row, proxy_view)
-    daily_call, daily_conf, daily_reason = classify_timeframe_call(daily_row, "daily")
-    weekly_call, weekly_conf, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
-    combined_call, combined_reason = combine_calls(proxy_call, daily_call, weekly_call)
-    proxy_severity = compute_state_severity(proxy_view, proxy_row)
-    daily_severity = compute_state_severity(daily_view, daily_row)
-    weekly_severity = compute_state_severity(weekly_view, weekly_row)
-    proxy_reco = recommendation_from_state(proxy_call, proxy_severity, proxy_timeframe)
-    daily_reco = recommendation_from_state(daily_call, daily_severity, "daily")
-    weekly_reco = recommendation_from_state(weekly_call, weekly_severity, "weekly")
-    analogs = find_analogs(daily_df, daily_row.name, n=25)
-    analog_summary = summarize_analogs(analogs)
-    combined_reco = final_recommendation(combined_call, proxy_reco, daily_reco, analog_summary)
-
-    rows.append({
-        "Symbol": symbol,
-        "Status": "OK",
-        "History Source": source,
-        "Yahoo Daily": meta.get("yahoo_status", "n/a"),
-        "Alpha Daily": meta.get("alpha_status", "n/a"),
-        "DefeatBeta": meta.get("defeat_status", "n/a"),
-        "As Of": str(daily_row.name.date()),
-        "Close": round(float(daily_row.get("Close", np.nan)), 2),
-        "Proxy Mode": proxy_label,
-        "Proxy Call": proxy_call,
-        "Daily Call": daily_call,
-        "Weekly Call": weekly_call,
-        "Combined": combined_call,
-        "Proxy Recommendation": proxy_reco,
-        "Daily Recommendation": daily_reco,
-        "Weekly Recommendation": weekly_reco,
-        "Combined Recommendation": combined_reco,
-        "Proxy UO": round(float(proxy_row.get("uo", np.nan)), 4) if not proxy_row.empty else np.nan,
-        "Proxy Sig": round(float(proxy_row.get("uo_signal", np.nan)), 4) if not proxy_row.empty else np.nan,
-        "Proxy %ile": round(float(proxy_row.get("uo_pctile", np.nan)) * 100, 1) if not proxy_row.empty else np.nan,
-        "Cross Gap": round(float(proxy_cross.get("gap", np.nan)), 4) if proxy_cross else np.nan,
-        "Cross Dist %": round(float(proxy_cross.get("range_pct", np.nan)), 1) if proxy_cross else np.nan,
-        "Daily UO": round(float(daily_row.get("uo", np.nan)), 4),
-        "Daily Sig": round(float(daily_row.get("uo_signal", np.nan)), 4),
-        "Daily %ile": round(float(daily_row.get("uo_pctile", np.nan)) * 100, 1),
-        "Weekly UO": round(float(weekly_row.get("uo", np.nan)), 4) if not weekly_row.empty else np.nan,
-        "Weekly %ile": round(float(weekly_row.get("uo_pctile", np.nan)) * 100, 1) if not weekly_row.empty else np.nan,
-        "Candle Score": round(float(daily_row.get("candle_score", np.nan)), 1),
-        "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1),
-        "CCI20": round(float(daily_row.get("cci_20", np.nan)), 1),
-        "TSI": round(float(daily_row.get("tsi", np.nan)), 2),
-        "Analog N": int(analog_summary.get("n", 0)) if analog_summary else 0,
-        "Analog 1d Med": round(float(analog_summary.get("ret_1_median", np.nan)) * 100, 2) if analog_summary else np.nan,
-        "Analog 2d Med": round(float(analog_summary.get("ret_2_median", np.nan)) * 100, 2) if analog_summary else np.nan,
-        "Analog 5d Med": round(float(analog_summary.get("ret_5_median", np.nan)) * 100, 2) if analog_summary else np.nan,
-        "Analog 2d Up %": round(float(analog_summary.get("ret_2_p_up", np.nan)) * 100, 1) if analog_summary else np.nan,
-        "Analog 2d Down %": round(float(analog_summary.get("ret_2_p_down", np.nan)) * 100, 1) if analog_summary else np.nan,
-        "Fetch Detail": f"yahoo={meta.get('yahoo_status','n/a')} | alpha={meta.get('alpha_status','n/a')} | defeat={meta.get('defeat_status','n/a')}",
-    })
-
-    detail[symbol] = {
-        "proxy": proxy_view,
-        "daily": daily_view,
-        "weekly": weekly_view,
-        "proxy_call": (proxy_call, proxy_conf, proxy_reason),
-        "proxy_label": proxy_label,
-        "proxy_cross": proxy_cross,
-        "daily_call": (daily_call, daily_conf, daily_reason),
-        "weekly_call": (weekly_call, weekly_conf, weekly_reason),
-        "combined": (combined_call, combined_reason),
-        "severity": {"proxy": proxy_severity, "daily": daily_severity, "weekly": weekly_severity},
-        "recommendation": {"proxy": proxy_reco, "daily": daily_reco, "weekly": weekly_reco, "combined": combined_reco},
-        "analogs": analogs,
-        "analog_summary": analog_summary,
-        "fetch_meta": meta,
-        "history_source": source,
-        "asof": asof,
+# Use ThreadPoolExecutor to process indicators in parallel
+# max_workers=4 is safe; indicator calculation is CPU bound but Pandas releases GIL
+with ThreadPoolExecutor(max_workers=4) as executor:
+    futures = {
+        executor.submit(process_symbol_task, s, all_data_map, benchmark_df, proxy_mode, analysis_mode, analysis_date, alpha_vantage_key): s 
+        for s in symbols
     }
+    
+    for i, future in enumerate(as_completed(futures)):
+        sym = futures[future]
+        status_text.text(f"Processing {sym} ({i+1}/{len(symbols)})...")
+        progress.progress((i + 1) / len(symbols))
+        
+        try:
+            row, det = future.result()
+            if row:
+                rows.append(row)
+            if det:
+                detail[sym] = det
+        except Exception as e:
+            rows.append({"Symbol": sym, "Status": "Crash", "Combined Recommendation": "ERROR"})
 
 progress.empty()
-results_df = pd.DataFrame(rows)
+status_text.empty()
 
+# 3. Display Results
+results_df = pd.DataFrame(rows)
 st.subheader("Ranked Results")
 if results_df.empty:
-    st.warning("No results.")
+    st.warning("No results generated.")
     st.stop()
 
-sort_col = "Daily %ile" if "Daily %ile" in results_df.columns else None
-if sort_col:
-    results_df = results_df.sort_values(sort_col, ascending=False)
+# Sort by Daily Percentile (highest momentum/extension first)
+if "Daily %ile" in results_df.columns:
+    results_df = results_df.sort_values("Daily %ile", ascending=False)
+
 st.dataframe(results_df, width='stretch', hide_index=True)
-st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_results.csv", "text/csv")
+st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_pro.csv", "text/csv")
 
 valid_symbols = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
 if not valid_symbols:
@@ -847,11 +866,13 @@ if not valid_symbols:
 st.subheader("Detailed Analysis")
 selected = st.selectbox("Select symbol", valid_symbols)
 item = detail[selected]
-proxy_call, proxy_conf, proxy_reason = item["proxy_call"]
+
+# Metric Columns
+proxy_call, _, proxy_reason = item["proxy_call"]
 proxy_label = item.get("proxy_label", "Proxy")
 proxy_cross = item.get("proxy_cross", {})
-daily_call, daily_conf, daily_reason = item["daily_call"]
-weekly_call, weekly_conf, weekly_reason = item["weekly_call"]
+daily_call, _, daily_reason = item["daily_call"]
+weekly_call, _, weekly_reason = item["weekly_call"]
 combined_call, combined_reason = item["combined"]
 
 c1, c2, c3, c4 = st.columns(4)
@@ -863,20 +884,19 @@ st.markdown(f"**{proxy_label} reason:** {proxy_reason}")
 st.markdown(f"**Daily reason:** {daily_reason}")
 st.markdown(f"**Weekly reason:** {weekly_reason}")
 st.markdown(f"**Combined read:** {combined_reason}")
+
 reco = item.get("recommendation", {})
 sev = item.get("severity", {})
 st.markdown(f"**Recommendation:** {reco.get('combined', combined_call)}")
-st.caption(f"History source: {item['history_source']} | Fetch detail: {item['fetch_meta']}")
 
+# Cross Stats
 cd1, cd2, cd3 = st.columns(3)
 cd1.metric("Distance to cross", f"{proxy_cross.get('abs_gap', np.nan):.4f}" if pd.notna(proxy_cross.get('abs_gap', np.nan)) else "n/a")
-if pd.notna(proxy_cross.get("gap", np.nan)):
-    gap_label = "Above signal" if proxy_cross.get("gap", np.nan) >= 0 else "Below signal"
-else:
-    gap_label = "n/a"
+gap_label = "Above signal" if proxy_cross.get("gap", np.nan) >= 0 else "Below signal" if pd.notna(proxy_cross.get("gap", np.nan)) else "n/a"
 cd2.metric("Cross gap sign", gap_label)
-cd3.metric("Cross distance %", f"{proxy_cross.get('range_pct', np.nan):.1f}%" if pd.notna(proxy_cross.get('range_pct', np.nan)) else "n/a")
+cd3.metric("Cross distance %", f"{proxy_cross.get('range_pct', np.nan):.1f}%" if pd.notna(proxy_cross.get("range_pct", np.nan)) else "n/a")
 
+# Severity Stats
 sv1, sv2, sv3, sv4 = st.columns(4)
 proxy_sev = sev.get("proxy", {})
 sv1.metric("Bars > 90", str(proxy_sev.get("bars_above_90", 0)))
@@ -884,6 +904,7 @@ sv2.metric("Bars < 10", str(proxy_sev.get("bars_below_10", 0)))
 sv3.metric("Late-cycle", "Yes" if proxy_sev.get("late_cycle_flag", 0) else "No")
 sv4.metric("Divergence", "Yes" if proxy_sev.get("lower_high_div", 0) else ("Repair" if proxy_sev.get("higher_low_repair", 0) else "No"))
 
+# As-Of Table
 proxy_last = item["proxy"].iloc[-1] if not item["proxy"].empty else pd.Series(dtype=float)
 daily_last = item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)
 weekly_last = item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float)
@@ -927,6 +948,7 @@ asof_table = pd.DataFrame(
 )
 st.dataframe(asof_table, width='stretch', hide_index=True)
 
+# Analogs
 st.markdown("### Historical analogs")
 analog_summary = item.get("analog_summary", {})
 if analog_summary:
