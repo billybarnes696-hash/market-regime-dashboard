@@ -370,6 +370,96 @@ def compute_distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, 
     return {"gap": gap, "abs_gap": abs_gap, "range_pct": range_pct}
 
 
+def compute_state_severity(frame: pd.DataFrame, row: pd.Series) -> Dict[str, float]:
+    if row is None or row.empty or frame is None or frame.empty:
+        return {
+            "uo_slope_1": np.nan, "uo_slope_3": np.nan, "bars_above_80": 0, "bars_above_90": 0,
+            "bars_below_20": 0, "bars_below_10": 0, "signal_catchup": np.nan, "lower_high_div": 0,
+            "higher_low_repair": 0, "late_cycle_flag": 0, "early_repair_flag": 0,
+        }
+
+    gap = (frame["uo"] - frame["uo_signal"]).dropna()
+    uo = frame["uo"].dropna()
+    pct = frame["uo_pctile"].dropna()
+    close = frame["Close"].dropna() if "Close" in frame.columns else pd.Series(dtype=float)
+
+    def count_recent(cond: pd.Series) -> int:
+        vals = cond.fillna(False).astype(bool).tolist()
+        c = 0
+        for ok in reversed(vals):
+            if ok:
+                c += 1
+            else:
+                break
+        return c
+
+    bars_above_80 = count_recent(pct > 0.80)
+    bars_above_90 = count_recent(pct > 0.90)
+    bars_below_20 = count_recent(pct < 0.20)
+    bars_below_10 = count_recent(pct < 0.10)
+
+    signal_catchup = np.nan
+    if len(gap) >= 4:
+        signal_catchup = float(gap.iloc[-1] - gap.iloc[-4])
+
+    lower_high_div = 0
+    higher_low_repair = 0
+    if len(uo) >= 8 and len(close) >= 8:
+        recent_uo = uo.tail(8)
+        recent_close = close.reindex(recent_uo.index).dropna()
+        if len(recent_close) >= 6:
+            uo_now = float(recent_uo.iloc[-1])
+            uo_prev_peak = float(recent_uo.iloc[:-2].max())
+            px_now = float(recent_close.iloc[-1])
+            px_prev_peak = float(recent_close.iloc[:-2].max())
+            lower_high_div = int(px_now >= px_prev_peak * 0.998 and uo_now < uo_prev_peak)
+
+            uo_now_low = float(recent_uo.iloc[-1])
+            uo_prev_low = float(recent_uo.iloc[:-2].min())
+            px_now_low = float(recent_close.iloc[-1])
+            px_prev_low = float(recent_close.iloc[:-2].min())
+            higher_low_repair = int(px_now_low <= px_prev_low * 1.002 and uo_now_low > uo_prev_low)
+
+    late_cycle_flag = int(bars_above_90 >= 4 and float(row.get("uo_slope_3", 0.0)) <= 0 and (signal_catchup if pd.notna(signal_catchup) else 0) < 0)
+    early_repair_flag = int(bars_below_10 >= 3 and float(row.get("uo_slope_3", 0.0)) >= 0 and (signal_catchup if pd.notna(signal_catchup) else 0) > 0)
+
+    return {
+        "uo_slope_1": float(row.get("uo_slope_1", np.nan)),
+        "uo_slope_3": float(row.get("uo_slope_3", np.nan)),
+        "bars_above_80": bars_above_80,
+        "bars_above_90": bars_above_90,
+        "bars_below_20": bars_below_20,
+        "bars_below_10": bars_below_10,
+        "signal_catchup": signal_catchup,
+        "lower_high_div": lower_high_div,
+        "higher_low_repair": higher_low_repair,
+        "late_cycle_flag": late_cycle_flag,
+        "early_repair_flag": early_repair_flag,
+    }
+
+
+def recommendation_from_state(call: str, severity: Dict[str, float], timeframe: str) -> str:
+    if call == "CALL":
+        if severity.get("late_cycle_flag", 0) or severity.get("lower_high_div", 0):
+            return "WAIT, aging uptrend" if timeframe == "daily" else "CALL, but extended"
+        if severity.get("bars_above_90", 0) >= 6:
+            return "CALL, but extended"
+        return "CALL"
+    if call == "PUT":
+        if severity.get("bars_above_90", 0) >= 3 or severity.get("lower_high_div", 0):
+            return "PUT setup forming" if timeframe != "weekly" else "PUT"
+        return "PUT"
+    if call == "NEUTRAL":
+        if severity.get("late_cycle_flag", 0):
+            return "WAIT, aging uptrend"
+        if severity.get("early_repair_flag", 0) or severity.get("higher_low_repair", 0):
+            return "WAIT, repair forming"
+        return "NEUTRAL / mixed"
+    if call == "AVOID CHASE":
+        return "WAIT, too extended"
+    return call
+
+
 def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, float, str]:
     if row is None or row.empty:
         return "NO DATA", 0.0, "No data"
@@ -548,6 +638,20 @@ for idx, symbol in enumerate(symbols):
     daily_call, daily_conf, daily_reason = classify_timeframe_call(daily_row, "daily")
     weekly_call, weekly_conf, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
     combined_call, combined_reason = combine_calls(proxy_call, daily_call, weekly_call)
+    proxy_severity = compute_state_severity(proxy_view, proxy_row)
+    daily_severity = compute_state_severity(daily_view, daily_row)
+    weekly_severity = compute_state_severity(weekly_view, weekly_row)
+    proxy_reco = recommendation_from_state(proxy_call, proxy_severity, proxy_timeframe)
+    daily_reco = recommendation_from_state(daily_call, daily_severity, "daily")
+    weekly_reco = recommendation_from_state(weekly_call, weekly_severity, "weekly")
+    if combined_call == "CALL" and ("extended" in proxy_reco.lower() or "aging" in daily_reco.lower()):
+        combined_reco = "CALL on pullback / extended"
+    elif combined_call == "PUT" and ("forming" in proxy_reco.lower() or "aging" in daily_reco.lower()):
+        combined_reco = "PUT setup forming"
+    elif combined_call.startswith("WAIT"):
+        combined_reco = combined_call
+    else:
+        combined_reco = combined_call
 
     rows.append({
         "Symbol": symbol,
@@ -563,6 +667,10 @@ for idx, symbol in enumerate(symbols):
         "Daily Call": daily_call,
         "Weekly Call": weekly_call,
         "Combined": combined_call,
+        "Proxy Recommendation": proxy_reco,
+        "Daily Recommendation": daily_reco,
+        "Weekly Recommendation": weekly_reco,
+        "Combined Recommendation": combined_reco,
         "Proxy UO": round(float(proxy_row.get("uo", np.nan)), 4) if not proxy_row.empty else np.nan,
         "Proxy Sig": round(float(proxy_row.get("uo_signal", np.nan)), 4) if not proxy_row.empty else np.nan,
         "Proxy %ile": round(float(proxy_row.get("uo_pctile", np.nan)) * 100, 1) if not proxy_row.empty else np.nan,
@@ -590,6 +698,8 @@ for idx, symbol in enumerate(symbols):
         "daily_call": (daily_call, daily_conf, daily_reason),
         "weekly_call": (weekly_call, weekly_conf, weekly_reason),
         "combined": (combined_call, combined_reason),
+        "severity": {"proxy": proxy_severity, "daily": daily_severity, "weekly": weekly_severity},
+        "recommendation": {"proxy": proxy_reco, "daily": daily_reco, "weekly": weekly_reco, "combined": combined_reco},
         "fetch_meta": meta,
         "history_source": source,
         "asof": asof,
@@ -632,12 +742,26 @@ st.markdown(f"**{proxy_label} reason:** {proxy_reason}")
 st.markdown(f"**Daily reason:** {daily_reason}")
 st.markdown(f"**Weekly reason:** {weekly_reason}")
 st.markdown(f"**Combined read:** {combined_reason}")
+reco = item.get("recommendation", {})
+sev = item.get("severity", {})
+st.markdown(f"**Recommendation:** {reco.get('combined', combined_call)}")
 st.caption(f"History source: {item['history_source']} | Fetch detail: {item['fetch_meta']}")
 
 cd1, cd2, cd3 = st.columns(3)
 cd1.metric("Distance to cross", f"{proxy_cross.get('abs_gap', np.nan):.4f}" if pd.notna(proxy_cross.get('abs_gap', np.nan)) else "n/a")
-cd2.metric("Cross gap sign", "Above signal" if proxy_cross.get("gap", np.nan) >= 0 else "Below signal") if pd.notna(proxy_cross.get("gap", np.nan)) else cd2.metric("Cross gap sign", "n/a")
+if pd.notna(proxy_cross.get("gap", np.nan)):
+    gap_label = "Above signal" if proxy_cross.get("gap", np.nan) >= 0 else "Below signal"
+else:
+    gap_label = "n/a"
+cd2.metric("Cross gap sign", gap_label)
 cd3.metric("Cross distance %", f"{proxy_cross.get('range_pct', np.nan):.1f}%" if pd.notna(proxy_cross.get('range_pct', np.nan)) else "n/a")
+
+sv1, sv2, sv3, sv4 = st.columns(4)
+proxy_sev = sev.get("proxy", {})
+sv1.metric("Bars > 90", str(proxy_sev.get("bars_above_90", 0)))
+sv2.metric("Bars < 10", str(proxy_sev.get("bars_below_10", 0)))
+sv3.metric("Late-cycle", "Yes" if proxy_sev.get("late_cycle_flag", 0) else "No")
+sv4.metric("Divergence", "Yes" if proxy_sev.get("lower_high_div", 0) else ("Repair" if proxy_sev.get("higher_low_repair", 0) else "No"))
 
 proxy_last = item["proxy"].iloc[-1] if not item["proxy"].empty else pd.Series(dtype=float)
 daily_last = item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)
@@ -656,6 +780,7 @@ asof_table = pd.DataFrame(
             "Candle Score": round(float(proxy_last.get("candle_score", np.nan)), 1) if not proxy_last.empty else np.nan,
             "Cross Gap": round(float(proxy_cross.get("gap", np.nan)), 4) if pd.notna(proxy_cross.get("gap", np.nan)) else np.nan,
             "Cross Dist %": round(float(proxy_cross.get("range_pct", np.nan)), 1) if pd.notna(proxy_cross.get("range_pct", np.nan)) else np.nan,
+            "Recommendation": item.get("recommendation", {}).get("proxy", proxy_call),
         },
         {
             "Frame": "Daily",
@@ -665,6 +790,7 @@ asof_table = pd.DataFrame(
             "Signal": round(float(daily_last.get("uo_signal", np.nan)), 4) if not daily_last.empty else np.nan,
             "Percentile": round(float(daily_last.get("uo_pctile", np.nan)) * 100, 1) if not daily_last.empty else np.nan,
             "Candle Score": round(float(daily_last.get("candle_score", np.nan)), 1) if not daily_last.empty else np.nan,
+            "Recommendation": item.get("recommendation", {}).get("daily", daily_call),
         },
         {
             "Frame": "Weekly",
@@ -674,6 +800,7 @@ asof_table = pd.DataFrame(
             "Signal": round(float(weekly_last.get("uo_signal", np.nan)), 4) if not weekly_last.empty else np.nan,
             "Percentile": round(float(weekly_last.get("uo_pctile", np.nan)) * 100, 1) if not weekly_last.empty else np.nan,
             "Candle Score": round(float(weekly_last.get("candle_score", np.nan)), 1) if not weekly_last.empty else np.nan,
+            "Recommendation": item.get("recommendation", {}).get("weekly", weekly_call),
         },
     ]
 )
