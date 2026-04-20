@@ -525,6 +525,124 @@ def slice_asof(df: pd.DataFrame, analysis_date: pd.Timestamp) -> pd.DataFrame:
     return df.loc[df.index <= end_ts].copy()
 
 
+
+
+def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for n in [1, 2, 5]:
+        out[f"fwd_ret_{n}"] = out["Close"].shift(-n) / out["Close"] - 1
+    return out
+
+
+ANALOG_FEATURES = [
+    "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3",
+    "rsi_14_pctile", "rsi_14", "cci_20_pctile", "cci_20",
+    "tsi_pctile", "tsi", "tsi_gap", "pct_b_pctile", "pct_b",
+    "atr_stretch_pctile", "atr_stretch", "dist_ema20_pctile", "dist_ema20_pct",
+    "rs_bench_slope_5", "adx_14_pctile", "adx_14", "candle_score",
+]
+
+ANALOG_WEIGHTS = {
+    "uo_pctile": 1.4,
+    "uo_gap": 1.5,
+    "uo_slope_1": 1.2,
+    "uo_slope_3": 1.4,
+    "rsi_14_pctile": 0.9,
+    "rsi_14": 0.7,
+    "cci_20_pctile": 1.0,
+    "cci_20": 0.8,
+    "tsi_pctile": 1.0,
+    "tsi": 0.8,
+    "tsi_gap": 1.2,
+    "pct_b_pctile": 0.9,
+    "pct_b": 0.8,
+    "atr_stretch_pctile": 0.8,
+    "atr_stretch": 0.7,
+    "dist_ema20_pctile": 0.8,
+    "dist_ema20_pct": 0.7,
+    "rs_bench_slope_5": 0.8,
+    "adx_14_pctile": 0.7,
+    "adx_14": 0.6,
+    "candle_score": 0.5,
+}
+
+
+def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 25, exclusion_bars: int = 10) -> pd.DataFrame:
+    if frame is None or frame.empty or current_ts not in frame.index:
+        return pd.DataFrame()
+    enriched = add_forward_returns(frame)
+    use = [c for c in ANALOG_FEATURES if c in enriched.columns]
+    if len(use) < 8:
+        return pd.DataFrame()
+    current_pos = enriched.index.get_loc(current_ts)
+    pool = enriched.iloc[:max(0, current_pos - exclusion_bars)].copy()
+    pool = pool.dropna(subset=use + ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"])
+    if len(pool) < max(60, n + 20):
+        return pd.DataFrame()
+    current = enriched.loc[current_ts, use].astype(float)
+    X = pool[use].astype(float)
+    std = X.std().replace(0, np.nan)
+    z = (X - current) / std
+    weights = np.array([ANALOG_WEIGHTS.get(c, 1.0) for c in use], dtype=float)
+    zw = z.fillna(0.0).to_numpy() * weights
+    pool["distance"] = np.sqrt((zw ** 2).sum(axis=1))
+    pool["similarity"] = 1 / (1 + pool["distance"])
+    return pool.nsmallest(n, "distance").copy()
+
+
+
+def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
+    if analogs is None or analogs.empty:
+        return {}
+    w = analogs["similarity"].fillna(1.0)
+    out: Dict[str, float] = {"n": float(len(analogs))}
+    for n in [1, 2, 5]:
+        col = f"fwd_ret_{n}"
+        vals = analogs[col].fillna(0)
+        out[f"ret_{n}_median"] = float(vals.median())
+        out[f"ret_{n}_mean_w"] = float(np.average(vals, weights=w))
+        out[f"ret_{n}_p_up"] = float(np.average((vals > 0).astype(float), weights=w))
+        out[f"ret_{n}_p_down"] = float(np.average((vals < 0).astype(float), weights=w))
+    return out
+
+
+
+def analog_bias(summary: Dict[str, float]) -> Tuple[str, float]:
+    if not summary:
+        return "n/a", 0.0
+    up2 = summary.get("ret_2_p_up", 0.5)
+    dn2 = summary.get("ret_2_p_down", 0.5)
+    mean2 = summary.get("ret_2_mean_w", 0.0)
+    if up2 >= 0.62 and mean2 > 0:
+        return "bullish", min(1.0, (up2 - 0.5) * 3 + max(0.0, mean2 * 30))
+    if dn2 >= 0.62 and mean2 < 0:
+        return "bearish", min(1.0, (dn2 - 0.5) * 3 + max(0.0, -mean2 * 30))
+    return "mixed", abs(up2 - dn2)
+
+
+
+def final_recommendation(combined_call: str, proxy_reco: str, daily_reco: str, analog_summary: Dict[str, float]) -> str:
+    bias, strength = analog_bias(analog_summary)
+    if combined_call in {"WAIT / PROXY TOO HOT", "NEUTRAL"}:
+        if bias == "bullish" and strength >= 0.45:
+            return "WAIT / bullish analogs"
+        if bias == "bearish" and strength >= 0.45:
+            return "PUT setup forming"
+        return proxy_reco if proxy_reco != "NEUTRAL / mixed" else "NEUTRAL / mixed"
+    if combined_call == "CALL":
+        if "aging" in daily_reco.lower() and bias == "bearish" and strength >= 0.45:
+            return "WAIT, aging uptrend"
+        if bias == "bullish":
+            return "CALL" if strength < 0.45 else "CALL / analogs supportive"
+        if bias == "bearish" and strength >= 0.5:
+            return "CALL, but extended"
+        return daily_reco if daily_reco != "CALL" else "CALL"
+    if combined_call == "PUT":
+        if bias == "bullish" and strength >= 0.5:
+            return "WAIT, bearish state but bullish analogs"
+        return "PUT" if bias != "bearish" else "PUT / analogs confirm"
+    return combined_call
+
 def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, proxy_label: str) -> None:
     fig = make_subplots(
         rows=4, cols=1, vertical_spacing=0.06,
@@ -644,14 +762,9 @@ for idx, symbol in enumerate(symbols):
     proxy_reco = recommendation_from_state(proxy_call, proxy_severity, proxy_timeframe)
     daily_reco = recommendation_from_state(daily_call, daily_severity, "daily")
     weekly_reco = recommendation_from_state(weekly_call, weekly_severity, "weekly")
-    if combined_call == "CALL" and ("extended" in proxy_reco.lower() or "aging" in daily_reco.lower()):
-        combined_reco = "CALL on pullback / extended"
-    elif combined_call == "PUT" and ("forming" in proxy_reco.lower() or "aging" in daily_reco.lower()):
-        combined_reco = "PUT setup forming"
-    elif combined_call.startswith("WAIT"):
-        combined_reco = combined_call
-    else:
-        combined_reco = combined_call
+    analogs = find_analogs(daily_df, daily_row.name, n=25)
+    analog_summary = summarize_analogs(analogs)
+    combined_reco = final_recommendation(combined_call, proxy_reco, daily_reco, analog_summary)
 
     rows.append({
         "Symbol": symbol,
@@ -685,6 +798,12 @@ for idx, symbol in enumerate(symbols):
         "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1),
         "CCI20": round(float(daily_row.get("cci_20", np.nan)), 1),
         "TSI": round(float(daily_row.get("tsi", np.nan)), 2),
+        "Analog N": int(analog_summary.get("n", 0)) if analog_summary else 0,
+        "Analog 1d Med": round(float(analog_summary.get("ret_1_median", np.nan)) * 100, 2) if analog_summary else np.nan,
+        "Analog 2d Med": round(float(analog_summary.get("ret_2_median", np.nan)) * 100, 2) if analog_summary else np.nan,
+        "Analog 5d Med": round(float(analog_summary.get("ret_5_median", np.nan)) * 100, 2) if analog_summary else np.nan,
+        "Analog 2d Up %": round(float(analog_summary.get("ret_2_p_up", np.nan)) * 100, 1) if analog_summary else np.nan,
+        "Analog 2d Down %": round(float(analog_summary.get("ret_2_p_down", np.nan)) * 100, 1) if analog_summary else np.nan,
         "Fetch Detail": f"yahoo={meta.get('yahoo_status','n/a')} | alpha={meta.get('alpha_status','n/a')} | defeat={meta.get('defeat_status','n/a')}",
     })
 
@@ -700,6 +819,8 @@ for idx, symbol in enumerate(symbols):
         "combined": (combined_call, combined_reason),
         "severity": {"proxy": proxy_severity, "daily": daily_severity, "weekly": weekly_severity},
         "recommendation": {"proxy": proxy_reco, "daily": daily_reco, "weekly": weekly_reco, "combined": combined_reco},
+        "analogs": analogs,
+        "analog_summary": analog_summary,
         "fetch_meta": meta,
         "history_source": source,
         "asof": asof,
@@ -805,5 +926,25 @@ asof_table = pd.DataFrame(
     ]
 )
 st.dataframe(asof_table, width='stretch', hide_index=True)
+
+st.markdown("### Historical analogs")
+analog_summary = item.get("analog_summary", {})
+if analog_summary:
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Analog count", str(int(analog_summary.get("n", 0))))
+    a2.metric("2d median", f"{analog_summary.get('ret_2_median', np.nan) * 100:.2f}%" if pd.notna(analog_summary.get('ret_2_median', np.nan)) else "n/a")
+    a3.metric("2d up %", f"{analog_summary.get('ret_2_p_up', np.nan) * 100:.1f}%" if pd.notna(analog_summary.get('ret_2_p_up', np.nan)) else "n/a")
+    a4.metric("5d median", f"{analog_summary.get('ret_5_median', np.nan) * 100:.2f}%" if pd.notna(analog_summary.get('ret_5_median', np.nan)) else "n/a")
+    analogs = item.get("analogs", pd.DataFrame())
+    if analogs is not None and not analogs.empty:
+        show_cols = [c for c in ["Close", "uo", "uo_signal", "distance", "similarity", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"] if c in analogs.columns]
+        show = analogs[show_cols].head(12).copy()
+        try:
+            show.index = show.index.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        st.dataframe(show, width='stretch')
+else:
+    st.caption("No analog set available for this as-of date.")
 
 plot_dashboard(selected, item["proxy"], item["daily"], item["weekly"], item["asof"], proxy_label)
