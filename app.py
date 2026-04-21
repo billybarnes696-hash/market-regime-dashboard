@@ -1,113 +1,48 @@
+from __future__ import annotations
+
 import io
-import time
-import shutil
-import datetime
-import glob
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import requests
 import streamlit as st
-import yfinance as yf
-
-try:
-    from defeatbeta_api import Ticker as DefeatTicker
-except Exception:
-    try:
-        from defeatbeta_api.data.ticker import Ticker as DefeatTicker
-    except Exception:
-        DefeatTicker = None
-
-# -----------------------------
-# CONFIG & SETUP
-# -----------------------------
-st.set_page_config(page_title="Stable Market Engine Pro", layout="wide", initial_sidebar_state="expanded")
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 APP_DIR = Path(__file__).resolve().parent
-CACHE_DIR = APP_DIR / "cache_store"
-DATA_DIR = CACHE_DIR / "market_data"  # Persistent Parquet Storage
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR = APP_DIR / "cache_store_alpaca"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+NY_TZ = "America/New_York"
+
+st.set_page_config(page_title="Stable Market Engine Clean", layout="wide", initial_sidebar_state="expanded")
 
 # -----------------------------
-# VECTORIZED UTILS
+# Utility helpers
 # -----------------------------
-def rolling_rank_pct(series: pd.Series, window: int = 252, min_periods: Optional[int] = None) -> pd.Series:
-    """True rolling percentile rank of the latest observation in each window.
-
-    This is slower than pure vectorized min-max scaling, but it preserves the user's
-    original cross-asset intent: compare each indicator to its own recent history,
-    not merely its recent min/max range.
-    """
-    s = pd.to_numeric(series, errors="coerce")
-    values = s.to_numpy(dtype=float)
-    out = np.full(len(values), np.nan, dtype=float)
-    min_periods = min_periods or max(20, window // 5)
-    for i, v in enumerate(values):
-        if i + 1 < min_periods or not np.isfinite(v):
-            continue
-        w = values[max(0, i - window + 1): i + 1]
-        w = w[np.isfinite(w)]
-        if len(w) < min_periods:
-            continue
-        out[i] = float((w <= v).mean())
-    return pd.Series(out, index=series.index)
-
-
-def rolling_minmax_scale(series: pd.Series, window: int = 252) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    if len(s) < 2:
-        return pd.Series([np.nan] * len(s), index=s.index)
-    roll_min = s.rolling(window, min_periods=max(10, window // 10)).min()
-    roll_max = s.rolling(window, min_periods=max(10, window // 10)).max()
-    diff = (roll_max - roll_min).replace(0, np.nan)
-    return (s - roll_min) / diff
-
-
-def rolling_zscore_score(series: pd.Series, window: int = 252) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    mean = s.rolling(window, min_periods=max(20, window // 5)).mean()
-    std = s.rolling(window, min_periods=max(20, window // 5)).std().replace(0, np.nan)
-    z = (s - mean) / std
-    # Compress extremes but preserve severity better than rank alone.
-    return 0.5 * (1 + np.tanh(z / 2.0))
-
-
-def rolling_percentile(series: pd.Series, window: int = 252) -> pd.Series:
-    """Best-of-both-worlds normalization.
-
-    Blend true rolling percentile rank (cross-asset comparability) with z-score-based
-    severity and a small min-max component (range awareness). The output stays in
-    the familiar 0..1 band expected by the oscillator, analog engine, and UI.
-    """
-    rank_pct = rolling_rank_pct(series, window)
-    z_score = rolling_zscore_score(series, window)
-    minmax = rolling_minmax_scale(series, window)
-
-    pieces = pd.concat([rank_pct, z_score, minmax], axis=1)
-    pieces.columns = ["rank", "z", "mm"]
-
-    # Weighted blend: prioritize true percentile, but keep absolute-stretch severity.
-    blended = 0.55 * pieces["rank"] + 0.30 * pieces["z"] + 0.15 * pieces["mm"]
-
-    # If one component is missing, use the average of what remains.
-    return blended.where(blended.notna(), pieces.mean(axis=1, skipna=True))
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
+
 def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
+
+
+def slope(series: pd.Series, bars: int = 3) -> pd.Series:
+    return series.diff(bars) / bars
+
 
 def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(window).mean()
+
 
 def rsi(series: pd.Series, window: int = 14) -> pd.Series:
     delta = series.diff()
@@ -118,11 +53,13 @@ def rsi(series: pd.Series, window: int = 14) -> pd.Series:
     rs = avg_up / avg_down.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+
 def cci(df: pd.DataFrame, window: int = 20) -> pd.Series:
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
     ma = tp.rolling(window).mean()
     md = (tp - ma).abs().rolling(window).mean()
     return (tp - ma) / (0.015 * md.replace(0, np.nan))
+
 
 def tsi(series: pd.Series, long_period: int = 25, short_period: int = 13, signal_period: int = 7) -> Tuple[pd.Series, pd.Series]:
     delta = series.diff()
@@ -133,12 +70,14 @@ def tsi(series: pd.Series, long_period: int = 25, short_period: int = 13, signal
     signal_line = ema(tsi_line, signal_period)
     return tsi_line, signal_line
 
+
 def bollinger_pct_b(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.Series:
     mid = series.rolling(window).mean()
     std = series.rolling(window).std()
     upper = mid + num_std * std
     lower = mid - num_std * std
     return (series - lower) / (upper - lower).replace(0, np.nan)
+
 
 def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
@@ -153,302 +92,256 @@ def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     return dx.rolling(window).mean()
 
-def slope(series: pd.Series, bars: int = 3) -> pd.Series:
-    return series.diff(bars) / bars
+
+def true_percentile(series: pd.Series, window: int = 252) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    out = np.full(len(values), np.nan, dtype=float)
+    min_valid = max(30, window // 5)
+    for i, v in enumerate(values):
+        if i + 1 < min_valid or not np.isfinite(v):
+            continue
+        w = values[max(0, i - window + 1) : i + 1]
+        w = w[np.isfinite(w)]
+        if len(w) < min_valid:
+            continue
+        out[i] = float((w <= v).mean())
+    return pd.Series(out, index=series.index)
+
+
+def rolling_zscore(series: pd.Series, window: int = 252) -> pd.Series:
+    mean = series.rolling(window, min_periods=max(30, window // 5)).mean()
+    std = series.rolling(window, min_periods=max(30, window // 5)).std()
+    return (series - mean) / std.replace(0, np.nan)
+
+
+def hybrid_normalize(series: pd.Series, window: int) -> pd.Series:
+    pct = true_percentile(series, window)
+    z = rolling_zscore(series, window).clip(-3, 3)
+    z01 = (z + 3) / 6
+    lo = series.rolling(window, min_periods=max(20, window // 5)).min()
+    hi = series.rolling(window, min_periods=max(20, window // 5)).max()
+    mm = (series - lo) / (hi - lo).replace(0, np.nan)
+    out = 0.55 * pct + 0.35 * z01 + 0.10 * mm
+    return out.clip(0, 1)
+
 
 def centered_pct(series: pd.Series) -> pd.Series:
     return (series.fillna(0.5) - 0.5) * 2
 
-# -----------------------------
-# DATA FETCHING (ROBUST LAYER)
-# -----------------------------
+
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
     if isinstance(out.columns, pd.MultiIndex):
         out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
-    rename = {str(c): str(c).title() for c in out.columns}
-    out = out.rename(columns=rename)
+    out.columns = [str(c).title() for c in out.columns]
     keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in out.columns]
     if len(keep) < 4:
         return pd.DataFrame()
     out = out[keep].copy()
     out.index = pd.to_datetime(out.index, errors="coerce")
-    try:
-        out.index = out.index.tz_localize(None)
-    except Exception:
-        try:
-            out.index = out.index.tz_convert(None)
-        except Exception:
-            pass
-    out = out[~out.index.isna()].sort_index()
-    for col in keep:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out.dropna(subset=["Open", "High", "Low", "Close"])
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_convert(NY_TZ).tz_localize(None)
+    out = out.sort_index()
+    for c in keep:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
     if "Volume" not in out.columns:
         out["Volume"] = np.nan
+    return out.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+def parse_symbol_csv(uploaded) -> List[str]:
+    if uploaded is None:
+        return []
+    raw = uploaded.getvalue()
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception:
+        return []
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    sym_col = cols.get("symbol") or cols.get("ticker") or next(iter(df.columns), None)
+    if sym_col is None:
+        return []
+    return [str(x).strip().upper() for x in df[sym_col].dropna().tolist() if str(x).strip()]
+
+
+def clean_symbols(text: str, uploaded_symbols: List[str]) -> List[str]:
+    symbols: List[str] = []
+    if text.strip():
+        symbols.extend([s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()])
+    symbols.extend(uploaded_symbols)
+    out = []
+    for s in symbols:
+        if s and s not in out:
+            out.append(s)
     return out
 
-def get_cache_path(symbol: str) -> Path:
-    safe_name = "".join(c for c in symbol if c.isalnum() or c in ('_', '-', '.'))
-    return DATA_DIR / f"{safe_name}.parquet"
 
-def is_cache_fresh(filepath: Path, max_hours: int = 24) -> bool:
-    if not filepath.exists():
-        return False
-    mod_time = datetime.datetime.fromtimestamp(filepath.stat().st_mtime)
-    return (datetime.datetime.now() - mod_time) < datetime.timedelta(hours=max_hours)
+def cache_path(symbol: str, kind: str) -> Path:
+    safe = "".join(c for c in symbol if c.isalnum() or c in "._-")
+    return CACHE_DIR / f"{safe}_{kind}.parquet"
 
 
 def clear_symbol_cache(symbols: List[str]) -> None:
     for s in symbols:
-        path = get_cache_path(s)
-        if path.exists():
+        for kind in ["daily", "2hour", "hourly_proxy", "2hour_proxy"]:
+            p = cache_path(s, kind)
+            if p.exists():
+                p.unlink(missing_ok=True)
+
+
+def is_fresh(path: Path, max_hours: int = 18) -> bool:
+    if not path.exists():
+        return False
+    age = pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")
+    return age < pd.Timedelta(hours=max_hours)
+
+
+def alpaca_client(key: str, secret: str) -> StockHistoricalDataClient:
+    return StockHistoricalDataClient(key, secret)
+
+
+def _bars_df_for_symbol(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.index, pd.MultiIndex):
+        if "symbol" in df.index.names:
             try:
-                path.unlink()
+                sub = df.xs(symbol, level="symbol").copy()
             except Exception:
-                pass
-
-
-def compression_span(length: int, bars_per_day: float, minimum: int = 2) -> int:
-    return max(minimum, int(round(length / bars_per_day)))
-
-
-
-def _alpaca_headers(key: str, secret: str) -> dict:
-    return {"APCA-API-KEY-ID": (key or "").strip(), "APCA-API-SECRET-KEY": (secret or "").strip()}
+                return pd.DataFrame()
+        else:
+            return pd.DataFrame()
+    else:
+        sub = df.copy()
+    if "timestamp" in sub.columns:
+        sub = sub.set_index("timestamp")
+    return normalize_ohlcv(sub)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_alpaca_daily_batch(symbols: List[str], years: int, api_key: str, api_secret: str, feed: str = "iex") -> Dict[str, pd.DataFrame]:
-    api_key = (api_key or "").strip()
-    api_secret = (api_secret or "").strip()
-    if not api_key or not api_secret or not symbols:
+def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: str, feed: str) -> Dict[str, pd.DataFrame]:
+    if not symbols:
         return {}
-    end = pd.Timestamp.utcnow().floor("min")
-    start = end - pd.Timedelta(days=int(max(years, 5) * 370))
-    url = "https://data.alpaca.markets/v2/stocks/bars"
-    params = {
-        "symbols": ",".join(symbols),
-        "timeframe": "1Day",
-        "start": start.isoformat().replace("+00:00", "Z"),
-        "end": end.isoformat().replace("+00:00", "Z"),
-        "adjustment": "raw",
-        "feed": feed,
-        "limit": 10000,
-    }
-    out: Dict[str, pd.DataFrame] = {}
-    page_token = None
-    while True:
-        if page_token:
-            params["page_token"] = page_token
-        r = requests.get(url, headers=_alpaca_headers(api_key, api_secret), params=params, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
-        bars = payload.get("bars", {})
-        for sym, rows in bars.items():
-            if not rows:
+    data_map: Dict[str, pd.DataFrame] = {}
+    fresh = []
+    missing = []
+    for s in symbols:
+        p = cache_path(s, "daily")
+        if is_fresh(p):
+            try:
+                data_map[s] = pd.read_parquet(p)
+                fresh.append(s)
                 continue
-            df = pd.DataFrame(rows)
-            df = df.rename(columns={"t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-            df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce").dt.tz_convert(None)
-            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[keep].apply(pd.to_numeric, errors="coerce").dropna(subset=["Open", "High", "Low", "Close"])
-            if sym in out and not out[sym].empty:
-                out[sym] = pd.concat([out[sym], df]).sort_index()
-                out[sym] = out[sym][~out[sym].index.duplicated(keep="last")]
-            else:
-                out[sym] = df
-        page_token = payload.get("next_page_token")
-        if not page_token:
-            break
-    return out
+            except Exception:
+                pass
+        missing.append(s)
+    if not missing:
+        return data_map
+
+    client = alpaca_client(key, secret)
+    start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(years=max(years, 5))).normalize().tz_localize(None)
+    end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
+    req = StockBarsRequest(symbol_or_symbols=missing, timeframe=TimeFrame.Day, start=start, end=end, adjustment="raw", feed=feed)
+    raw = client.get_stock_bars(req).df
+    for s in missing:
+        sub = _bars_df_for_symbol(raw, s)
+        if not sub.empty:
+            sub.to_parquet(cache_path(s, "daily"))
+            data_map[s] = sub
+    return data_map
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_alpaca_intraday(symbol: str, api_key: str, api_secret: str, feed: str = "iex") -> pd.DataFrame:
-    api_key = (api_key or "").strip()
-    api_secret = (api_secret or "").strip()
-    symbol = (symbol or "").strip().upper()
-    if not api_key or not api_secret or not symbol:
+def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: str) -> pd.DataFrame:
+    p = cache_path(symbol, "2hour")
+    if is_fresh(p, max_hours=6):
+        try:
+            return pd.read_parquet(p)
+        except Exception:
+            pass
+    client = alpaca_client(key, secret)
+    start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
+    end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
+    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(30, TimeFrameUnit.Minute), start=start, end=end, adjustment="raw", feed=feed)
+    raw = client.get_stock_bars(req).df
+    sub = _bars_df_for_symbol(raw, symbol)
+    if sub.empty:
         return pd.DataFrame()
-    end = pd.Timestamp.utcnow().floor("min")
-    start = end - pd.Timedelta(days=730)
-    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": "1Hour",
-        "start": start.isoformat().replace("+00:00", "Z"),
-        "end": end.isoformat().replace("+00:00", "Z"),
-        "adjustment": "raw",
-        "feed": feed,
-        "limit": 10000,
-    }
-    parts = []
-    page_token = None
-    while True:
-        if page_token:
-            params["page_token"] = page_token
-        r = requests.get(url, headers=_alpaca_headers(api_key, api_secret), params=params, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
-        rows = payload.get("bars", [])
-        if rows:
-            df = pd.DataFrame(rows)
-            df = df.rename(columns={"t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-            df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce").dt.tz_convert(None)
-            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[keep].apply(pd.to_numeric, errors="coerce").dropna(subset=["Open", "High", "Low", "Close"])
-            parts.append(df)
-        page_token = payload.get("next_page_token")
-        if not page_token:
-            break
-    if not parts:
-        return pd.DataFrame()
-    df = pd.concat(parts).sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df
-
-
-def resample_intraday_to_2h(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
+    # Convert to NY local naive times, filter regular session, then resample 2H anchored at 9:30.
+    idx = pd.DatetimeIndex(sub.index)
+    if idx.tz is not None:
+        idx = idx.tz_convert(NY_TZ).tz_localize(None)
+    sub.index = idx
+    sub = sub.between_time("09:30", "16:00")
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    out = df.resample("2H").agg(agg).dropna(how="any")
+    pieces = []
+    for _, day_df in sub.groupby(sub.index.date):
+        if day_df.empty:
+            continue
+        anchor = pd.Timestamp(day_df.index[0].date()) + pd.Timedelta(hours=9, minutes=30)
+        tmp = day_df.copy()
+        shifted = tmp.copy()
+        shifted.index = shifted.index - (anchor - pd.Timestamp(day_df.index[0].date())) - pd.Timedelta(hours=9, minutes=30)
+        # simpler deterministic windows: [9:30-11:29], [11:30-13:29], [13:30-15:29], [15:30-16:00]
+        bins = []
+        ranges = [
+            (anchor, anchor + pd.Timedelta(hours=2)),
+            (anchor + pd.Timedelta(hours=2), anchor + pd.Timedelta(hours=4)),
+            (anchor + pd.Timedelta(hours=4), anchor + pd.Timedelta(hours=6)),
+            (anchor + pd.Timedelta(hours=6), anchor + pd.Timedelta(hours=6, minutes=30)),
+        ]
+        for start_ts, end_ts in ranges:
+            chunk = day_df[(day_df.index >= start_ts) & (day_df.index < end_ts)]
+            if chunk.empty:
+                continue
+            row = pd.DataFrame(
+                {
+                    "Open": [chunk["Open"].iloc[0]],
+                    "High": [chunk["High"].max()],
+                    "Low": [chunk["Low"].min()],
+                    "Close": [chunk["Close"].iloc[-1]],
+                    "Volume": [chunk["Volume"].sum()],
+                },
+                index=[start_ts],
+            )
+            bins.append(row)
+        if bins:
+            pieces.append(pd.concat(bins))
+    out = pd.concat(pieces).sort_index() if pieces else pd.DataFrame()
+    out = normalize_ohlcv(out)
+    if not out.empty:
+        out.to_parquet(p)
     return out
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yahoo_batch(symbols: List[str], years: int = 10) -> Dict[str, pd.DataFrame]:
-    """Bulk fetch to avoid rate limits, with persistent disk caching."""
-    if not symbols:
-        return {}
-    
-    # 1. Identify fresh cached data
-    symbols_to_fetch = []
-    for s in symbols:
-        if not is_cache_fresh(get_cache_path(s)):
-            symbols_to_fetch.append(s)
-            
-    cache_status = f"{len(symbols) - len(symbols_to_fetch)} Loaded from Disk, {len(symbols_to_fetch)} Fetching..."
-    if len(symbols_to_fetch) > 0:
-        st.info(f"🔄 Updating Market Data ({cache_status})")
+
+def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    return df.resample("W-FRI").agg(agg).dropna(how="any")
+
+
+def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, str, str]:
+    # Convert daily bars into tactical approximations using time-compression math.
+    # 6.5 trading hours/day -> about 3.25 two-hour bars/day.
+    out = df.copy()
+    if target == "2hour_proxy":
+        label = "2-Hour Proxy"
+        timeframe_name = "2hour_proxy"
     else:
-        st.success(f"✅ Data Fresh ({cache_status})")
+        label = "Hourly Proxy"
+        timeframe_name = "hourly_proxy"
+    return out, timeframe_name, label
 
-    if not symbols_to_fetch:
-        # Load all from disk
-        data_map = {}
-        for s in symbols:
-            path = get_cache_path(s)
-            if path.exists():
-                try:
-                    data_map[s] = pd.read_parquet(path)
-                except Exception:
-                    pass
-        return data_map
 
-    # 2. Bulk Download (Anti-Rate Limit)
-    try:
-        bulk_df = yf.download(
-            symbols_to_fetch, 
-            period=f"{max(years, 5)}y", 
-            interval="1d", 
-            group_by='ticker', 
-            auto_adjust=False,
-            progress=False,
-            threads=True
-        )
-    except Exception as e:
-        st.warning(f"Bulk download warning: {e}")
-        bulk_df = {}
-
-    # 3. Save to Disk
-    saved_map = {}
-    if len(symbols_to_fetch) == 1:
-        bulk_df = {symbols_to_fetch[0]: bulk_df}
-    else:
-        # Handle multi-index response safely
-        if isinstance(bulk_df, pd.DataFrame):
-            available_cols = [c for c in bulk_df.columns.levels[0] if c in symbols_to_fetch]
-            bulk_df = {ticker: bulk_df[ticker].copy() for ticker in available_cols}
-
-    for ticker, df in bulk_df.items():
-        df_clean = normalize_ohlcv(df)
-        if not df_clean.empty:
-            df_clean.to_parquet(get_cache_path(ticker))
-            saved_map[ticker] = df_clean
-
-    # 4. Final Assembly (Fresh + Cache)
-    final_map = {}
-    for s in symbols:
-        path = get_cache_path(s)
-        if path.exists():
-            try:
-                final_map[s] = pd.read_parquet(path)
-            except Exception:
-                pass
-    return final_map
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_alpha_vantage_daily(symbol: str, api_key: str) -> pd.DataFrame:
-    api_key = (api_key or "").strip()
-    if not api_key:
-        return pd.DataFrame()
-    try:
-        url = "https://www.alphavantage.co/query"
-        params = {
-            "function": "TIME_SERIES_DAILY_ADJUSTED",
-            "symbol": symbol,
-            "outputsize": "full",
-            "apikey": api_key,
-        }
-        r = requests.get(url, params=params, timeout=20)
-        payload = r.json()
-        key = "Time Series (Daily)"
-        if key not in payload:
-            return pd.DataFrame()
-        rows = []
-        for ds, item in payload[key].items():
-            rows.append(
-                {
-                    "Date": pd.to_datetime(ds, errors="coerce"),
-                    "Open": float(item.get("1. open", np.nan)),
-                    "High": float(item.get("2. high", np.nan)),
-                    "Low": float(item.get("3. low", np.nan)),
-                    "Close": float(item.get("4. close", np.nan)),
-                    "Volume": float(item.get("6. volume", np.nan)),
-                }
-            )
-        df = pd.DataFrame(rows).dropna(subset=["Date"]).set_index("Date").sort_index()
-        # Save to cache manually for AV
-        if not df.empty:
-            df.to_parquet(get_cache_path(symbol))
-        return normalize_ohlcv(df)
-    except Exception:
-        return pd.DataFrame()
-
-# -----------------------------
-# FEATURE ENGINEERING
-# -----------------------------
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
     spans = {
-        # Time-compressed from intraday-style oscillators onto daily bars.
-        # Approx 6.5 one-hour bars/day and 3.25 two-hour bars/day.
-        # These are intentionally smoother than literal conversions while keeping relative speed.
-        "proxy_hourly": (
-            compression_span(18, 6.5, minimum=3),
-            compression_span(40, 6.5, minimum=6),
-            compression_span(12, 6.5, minimum=2),
-        ),
-        "proxy_2hour": (
-            compression_span(18, 3.25, minimum=4),
-            compression_span(40, 3.25, minimum=8),
-            compression_span(12, 3.25, minimum=3),
-        ),
+        # 25/13/7 compressed by ~3.25 for 2-hour, by ~6.5 for 1-hour, then smoothed modestly.
+        "2hour_proxy": (8, 4, 2),
+        "hourly_proxy": (4, 2, 2),
         "daily": (8, 21, 7),
         "weekly": (5, 13, 5),
+        "real_2hour": (25, 13, 7),
     }
 
     def pct_col(name: str) -> pd.Series:
@@ -464,20 +357,19 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
         + 0.12 * pct_col("atr_stretch_pctile")
         + 0.10 * pct_col("dist_ema20_pctile")
     )
-    momentum = 0.20 * pct_col("tsi_pctile") + 0.08 * np.tanh(out["price_slope_3"].fillna(0) * 25)
+    momentum = 0.22 * pct_col("tsi_pctile") + 0.08 * np.tanh(out["price_slope_3"].fillna(0) * 25)
     rs_part = 0.10 * np.tanh(out["rs_bench_slope_5"].fillna(0) * 25)
-    quality = 1 + 0.15 * pct_col("adx_14_pctile")
-    if "dist_vwap_pctile" in out.columns:
-        stretch = stretch + 0.10 * centered_pct(out["dist_vwap_pctile"].fillna(0.5))
+    quality = 1 + 0.12 * pct_col("adx_14_pctile")
     out["uo_base"] = (stretch + momentum + rs_part) * quality
     out["uo"] = ema(out["uo_base"], fast) - ema(out["uo_base"], slow)
     out["uo_signal"] = ema(out["uo"], sig)
-    out["uo_hist"] = out["uo"] - out["uo_signal"]
-    out["uo_gap"] = out["uo_hist"]
+    out["uo_gap"] = out["uo"] - out["uo_signal"]
     out["uo_slope_1"] = out["uo"].diff(1)
     out["uo_slope_3"] = out["uo"].diff(3)
-    out["uo_pctile"] = rolling_percentile(out["uo"], 120 if timeframe_name in {"proxy_hourly", "proxy_2hour"} else 252)
+    lookback = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_2hour"} else 252
+    out["uo_pctile"] = true_percentile(out["uo"], lookback)
     return out
+
 
 def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     if df.empty:
@@ -499,199 +391,20 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     out["adx_14"] = adx(out, 14)
     out["price_slope_3"] = slope(out["Close"], 3)
     out["dist_ema20_pct"] = (out["Close"] / out["ema_20"]) - 1
-    out["volume_ma_20"] = out["Volume"].rolling(20).mean()
-    out["volume_ratio"] = out["Volume"] / out["volume_ma_20"].replace(0, np.nan)
     out["close_in_range"] = (out["Close"] - out["Low"]) / (out["High"] - out["Low"]).replace(0, np.nan)
     out["upper_wick_pct"] = (out["High"] - out[["Close", "Open"]].max(axis=1)) / (out["High"] - out["Low"]).replace(0, np.nan)
     out["candle_score"] = 50 + out["upper_wick_pct"].fillna(0) * 30 - (out["close_in_range"].fillna(0.5) - 0.5) * 20
-    out["dist_vwap_pct"] = np.nan
     if benchmark_df is not None and not benchmark_df.empty:
         aligned = benchmark_df["Close"].reindex(out.index).ffill()
-        out["rs_vs_benchmark"] = out["Close"] / aligned
-        out["rs_bench_slope_5"] = slope(out["rs_vs_benchmark"], 5)
+        out["rs_bench_slope_5"] = slope(out["Close"] / aligned, 5)
     else:
-        out["rs_vs_benchmark"] = 1.0
         out["rs_bench_slope_5"] = 0.0
-    win = 120 if timeframe_name in {"proxy_hourly", "proxy_2hour"} else 252
-    for col in ["rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14", "dist_ema20_pct", "volume_ratio", "dist_vwap_pct"]:
-        if col in out.columns:
-            out[f"{col}_pctile"] = rolling_percentile(out[col], win)
+    win = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_2hour"} else 252
+    for col in ["rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14", "dist_ema20_pct"]:
+        out[f"{col}_pctile"] = hybrid_normalize(out[col], win)
     out = add_ultimate_oscillator(out, timeframe_name)
     return out
 
-def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    return df.resample("W-FRI").agg(agg).dropna(how="any")
-
-def build_proxy_from_daily(df: pd.DataFrame, proxy_mode: str) -> Tuple[pd.DataFrame, str, str]:
-    # Time-compression math:
-    # 1 daily bar ~= 6.5 one-hour bars or ~= 3.25 two-hour bars.
-    # We keep the same daily OHLCV series but use compressed oscillator spans downstream.
-    label = "Hourly Proxy" if proxy_mode == "hourly" else "2-Hour Proxy"
-    timeframe_name = "proxy_hourly" if proxy_mode == "hourly" else "proxy_2hour"
-    return df.copy(), timeframe_name, label
-
-# -----------------------------
-# ANALYSIS LOGIC
-# -----------------------------
-def compute_distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, float]:
-    if row is None or row.empty or frame is None or frame.empty:
-        return {"gap": np.nan, "abs_gap": np.nan, "range_pct": np.nan}
-    gap = float(row.get("uo", np.nan) - row.get("uo_signal", np.nan))
-    abs_gap = abs(gap) if pd.notna(gap) else np.nan
-    recent = (frame["uo"] - frame["uo_signal"]).dropna().tail(40)
-    if recent.empty:
-        range_pct = np.nan
-    else:
-        denom = max(float(recent.abs().max()), 1e-9)
-        range_pct = float(np.clip(abs_gap / denom, 0, 1) * 100) if pd.notna(abs_gap) else np.nan
-    return {"gap": gap, "abs_gap": abs_gap, "range_pct": range_pct}
-
-def compute_state_severity(frame: pd.DataFrame, row: pd.Series) -> Dict[str, float]:
-    if row is None or row.empty or frame is None or frame.empty:
-        return {
-            "uo_slope_1": np.nan, "uo_slope_3": np.nan, "bars_above_80": 0, "bars_above_90": 0,
-            "bars_below_20": 0, "bars_below_10": 0, "signal_catchup": np.nan, "lower_high_div": 0,
-            "higher_low_repair": 0, "late_cycle_flag": 0, "early_repair_flag": 0,
-        }
-    gap = (frame["uo"] - frame["uo_signal"]).dropna()
-    uo = frame["uo"].dropna()
-    pct = frame["uo_pctile"].dropna()
-    close = frame["Close"].dropna() if "Close" in frame.columns else pd.Series(dtype=float)
-
-    def count_recent(cond: pd.Series) -> int:
-        vals = cond.fillna(False).astype(bool).tolist()
-        c = 0
-        for ok in reversed(vals):
-            if ok: c += 1
-            else: break
-        return c
-
-    bars_above_80 = count_recent(pct > 0.80)
-    bars_above_90 = count_recent(pct > 0.90)
-    bars_below_20 = count_recent(pct < 0.20)
-    bars_below_10 = count_recent(pct < 0.10)
-
-    signal_catchup = np.nan
-    if len(gap) >= 4:
-        signal_catchup = float(gap.iloc[-1] - gap.iloc[-4])
-
-    lower_high_div = 0
-    higher_low_repair = 0
-    if len(uo) >= 8 and len(close) >= 8:
-        recent_uo = uo.tail(8)
-        recent_close = close.reindex(recent_uo.index).dropna()
-        if len(recent_close) >= 6:
-            uo_now = float(recent_uo.iloc[-1])
-            uo_prev_peak = float(recent_uo.iloc[:-2].max())
-            px_now = float(recent_close.iloc[-1])
-            px_prev_peak = float(recent_close.iloc[:-2].max())
-            lower_high_div = int(px_now >= px_prev_peak * 0.998 and uo_now < uo_prev_peak)
-
-            uo_now_low = float(recent_uo.iloc[-1])
-            uo_prev_low = float(recent_uo.iloc[:-2].min())
-            px_now_low = float(recent_close.iloc[-1])
-            px_prev_low = float(recent_close.iloc[:-2].min())
-            higher_low_repair = int(px_now_low <= px_prev_low * 1.002 and uo_now_low > uo_prev_low)
-
-    late_cycle_flag = int(bars_above_90 >= 4 and float(row.get("uo_slope_3", 0.0)) <= 0 and (signal_catchup if pd.notna(signal_catchup) else 0) < 0)
-    early_repair_flag = int(bars_below_10 >= 3 and float(row.get("uo_slope_3", 0.0)) >= 0 and (signal_catchup if pd.notna(signal_catchup) else 0) > 0)
-
-    return {
-        "uo_slope_1": float(row.get("uo_slope_1", np.nan)),
-        "uo_slope_3": float(row.get("uo_slope_3", np.nan)),
-        "bars_above_80": bars_above_80,
-        "bars_above_90": bars_above_90,
-        "bars_below_20": bars_below_20,
-        "bars_below_10": bars_below_10,
-        "signal_catchup": signal_catchup,
-        "lower_high_div": lower_high_div,
-        "higher_low_repair": higher_low_repair,
-        "late_cycle_flag": late_cycle_flag,
-        "early_repair_flag": early_repair_flag,
-    }
-
-def recommendation_from_state(call: str, severity: Dict[str, float], timeframe: str) -> str:
-    if call == "CALL":
-        if severity.get("late_cycle_flag", 0) or severity.get("lower_high_div", 0):
-            return "WAIT, aging uptrend" if timeframe == "daily" else "CALL, but extended"
-        if severity.get("bars_above_90", 0) >= 6:
-            return "CALL, but extended"
-        return "CALL"
-    if call == "PUT":
-        if severity.get("bars_above_90", 0) >= 3 or severity.get("lower_high_div", 0):
-            return "PUT setup forming" if timeframe != "weekly" else "PUT"
-        return "PUT"
-    if call == "NEUTRAL":
-        if severity.get("late_cycle_flag", 0):
-            return "WAIT, aging uptrend"
-        if severity.get("early_repair_flag", 0) or severity.get("higher_low_repair", 0):
-            return "WAIT, repair forming"
-        return "NEUTRAL / mixed"
-    if call == "AVOID CHASE":
-        return "WAIT, too extended"
-    return call
-
-def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, float, str]:
-    if row is None or row.empty:
-        return "NO DATA", 0.0, "No data"
-    uo_pct = row.get("uo_pctile", 0.5)
-    uo_gap = row.get("uo_gap", 0.0)
-    uo_slope = row.get("uo_slope_3", 0.0)
-    rsi_val = row.get("rsi_14", 50.0)
-    cci_val = row.get("cci_20", 0.0)
-    tsi_gap = row.get("tsi_gap", 0.0)
-    pct_b = row.get("pct_b", 0.5)
-    adx_val = row.get("adx_14", 15.0)
-    dist_ema = row.get("dist_ema20_pct", 0.0)
-
-    if uo_pct > 0.80 and (uo_slope < 0 or uo_gap < 0 or tsi_gap < 0) and rsi_val > 70:
-        conf = min(95.0, 55 + (uo_pct - 0.80) * 150)
-        return "PUT", conf, "Rolling from elevated zone"
-    if timeframe in {"proxy_hourly", "proxy_2hour"} and rsi_val > 75 and cci_val > 90 and pct_b > 0.90 and (uo_gap <= 0 or tsi_gap <= 0):
-        return "PUT", 78.0, "Proxy overheated and rolling"
-    if timeframe in {"proxy_hourly", "proxy_2hour"} and rsi_val > 75 and cci_val > 90 and pct_b > 0.90 and adx_val > 25 and uo_gap > 0:
-        return "AVOID CHASE", 72.0, "Pinned continuation risk"
-    if uo_pct < 0.20 and (uo_slope > 0 or uo_gap > 0 or tsi_gap > 0) and rsi_val < 35:
-        conf = min(95.0, 55 + (0.20 - uo_pct) * 150)
-        return "CALL", conf, "Turning up from washed-out zone"
-    if uo_gap > 0 and uo_slope > 0 and dist_ema > -0.02:
-        return "CALL", 62.0 + max(0.0, min(15.0, (uo_pct - 0.5) * 20)), "Composite rising above signal"
-    if uo_gap < 0 and uo_slope < 0 and dist_ema < 0.02:
-        return "PUT", 62.0 + max(0.0, min(15.0, (0.5 - uo_pct) * 20)), "Composite below signal and falling"
-    if abs(uo_gap) < 0.02:
-        return "NEUTRAL", 45.0, "Near signal-line equilibrium"
-    return "NEUTRAL", 50.0, "Mixed state"
-
-def combine_calls(proxy_call: str, daily_call: str, weekly_call: str) -> Tuple[str, str]:
-    score_map = {"CALL": 1.0, "PUT": -1.0, "NEUTRAL": 0.0, "AVOID CHASE": -0.35, "NO DATA": 0.0}
-    score = 0.30 * score_map.get(proxy_call, 0.0) + 0.45 * score_map.get(daily_call, 0.0) + 0.25 * score_map.get(weekly_call, 0.0)
-    if proxy_call in {"PUT", "AVOID CHASE"} and daily_call == "CALL" and weekly_call == "CALL":
-        return "WAIT / PROXY TOO HOT", "Bullish trend, but short-term timing is poor"
-    if score >= 0.55:
-        return "CALL", "Timeframes supportive"
-    if score <= -0.55:
-        return "PUT", "Timeframes lean bearish"
-    if daily_call == "CALL" and weekly_call == "CALL":
-        return "CALL ON PULLBACK", "Higher timeframe trend constructive, but entry needs reset"
-    return "NEUTRAL", "Mixed timeframe signals"
-
-def align_asof(index: pd.DatetimeIndex, dt: pd.Timestamp) -> pd.Timestamp:
-    ts = pd.Timestamp(dt)
-    try:
-        if index.tz is not None and ts.tzinfo is None:
-            return ts.tz_localize(index.tz)
-        if index.tz is None and ts.tzinfo is not None:
-            return ts.tz_localize(None)
-    except Exception:
-        pass
-    return ts
-
-def slice_asof(df: pd.DataFrame, analysis_date: pd.Timestamp) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-    end_ts = align_asof(df.index, pd.Timestamp(analysis_date) + pd.Timedelta(hours=23, minutes=59, seconds=59))
-    return df.loc[df.index <= end_ts].copy()
 
 def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -699,436 +412,364 @@ def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
         out[f"fwd_ret_{n}"] = out["Close"].shift(-n) / out["Close"] - 1
     return out
 
+
 ANALOG_FEATURES = [
-    "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3",
-    "rsi_14_pctile", "rsi_14", "cci_20_pctile", "cci_20",
-    "tsi_pctile", "tsi", "tsi_gap", "pct_b_pctile", "pct_b",
-    "atr_stretch_pctile", "atr_stretch", "dist_ema20_pctile", "dist_ema20_pct",
-    "rs_bench_slope_5", "adx_14_pctile", "adx_14", "candle_score",
+    "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3", "rsi_14_pctile", "rsi_14",
+    "cci_20_pctile", "cci_20", "tsi_pctile", "tsi", "tsi_gap", "pct_b_pctile", "pct_b",
+    "atr_stretch_pctile", "atr_stretch", "dist_ema20_pctile", "dist_ema20_pct", "rs_bench_slope_5",
+    "adx_14_pctile", "adx_14", "candle_score",
 ]
 
-ANALOG_WEIGHTS = {
-    "uo_pctile": 1.4, "uo_gap": 1.5, "uo_slope_1": 1.2, "uo_slope_3": 1.4,
-    "rsi_14_pctile": 0.9, "rsi_14": 0.7, "cci_20_pctile": 1.0, "cci_20": 0.8,
-    "tsi_pctile": 1.0, "tsi": 0.8, "tsi_gap": 1.2, "pct_b_pctile": 0.9, "pct_b": 0.8,
-    "atr_stretch_pctile": 0.8, "atr_stretch": 0.7, "dist_ema20_pctile": 0.8, "dist_ema20_pct": 0.7,
-    "rs_bench_slope_5": 0.8, "adx_14_pctile": 0.7, "adx_14": 0.6, "candle_score": 0.5,
-}
 
-def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 25, exclusion_bars: int = 10) -> pd.DataFrame:
-    if frame is None or frame.empty or current_ts not in frame.index:
-        return pd.DataFrame()
+def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 25) -> pd.DataFrame:
     enriched = add_forward_returns(frame)
     use = [c for c in ANALOG_FEATURES if c in enriched.columns]
-    if len(use) < 8:
+    if current_ts not in enriched.index or len(use) < 8:
         return pd.DataFrame()
-    current_pos = enriched.index.get_loc(current_ts)
-    pool = enriched.iloc[:max(0, current_pos - exclusion_bars)].copy()
-    pool = pool.dropna(subset=use + ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"])
-    if len(pool) < max(60, n + 20):
+    cur_pos = enriched.index.get_loc(current_ts)
+    pool = enriched.iloc[:max(0, cur_pos - 10)].dropna(subset=use + ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"]).copy()
+    if len(pool) < 50:
         return pd.DataFrame()
     current = enriched.loc[current_ts, use].astype(float)
     X = pool[use].astype(float)
     std = X.std().replace(0, np.nan)
-    z = (X - current) / std
-    weights = np.array([ANALOG_WEIGHTS.get(c, 1.0) for c in use], dtype=float)
-    zw = z.fillna(0.0).to_numpy() * weights
-    pool["distance"] = np.sqrt((zw ** 2).sum(axis=1))
+    z = ((X - current) / std).fillna(0.0)
+    pool["distance"] = np.sqrt((z.to_numpy() ** 2).sum(axis=1))
     pool["similarity"] = 1 / (1 + pool["distance"])
-    # Tighter filtering for robustness
-    pool = pool[pool["distance"] < 5.0] 
     return pool.nsmallest(n, "distance").copy()
 
+
 def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
-    if analogs is None or analogs.empty:
+    if analogs.empty:
         return {}
     w = analogs["similarity"].fillna(1.0)
-    out: Dict[str, float] = {"n": float(len(analogs))}
+    out = {"n": float(len(analogs))}
     for n in [1, 2, 5]:
-        col = f"fwd_ret_{n}"
-        vals = analogs[col].fillna(0)
+        c = f"fwd_ret_{n}"
+        vals = analogs[c].fillna(0)
         out[f"ret_{n}_median"] = float(vals.median())
-        out[f"ret_{n}_mean_w"] = float(np.average(vals, weights=w))
         out[f"ret_{n}_p_up"] = float(np.average((vals > 0).astype(float), weights=w))
         out[f"ret_{n}_p_down"] = float(np.average((vals < 0).astype(float), weights=w))
     return out
 
-def analog_bias(summary: Dict[str, float]) -> Tuple[str, float]:
-    if not summary:
-        return "n/a", 0.0
-    up2 = summary.get("ret_2_p_up", 0.5)
-    dn2 = summary.get("ret_2_p_down", 0.5)
-    mean2 = summary.get("ret_2_mean_w", 0.0)
-    if up2 >= 0.62 and mean2 > 0:
-        return "bullish", min(1.0, (up2 - 0.5) * 3 + max(0.0, mean2 * 30))
-    if dn2 >= 0.62 and mean2 < 0:
-        return "bearish", min(1.0, (dn2 - 0.5) * 3 + max(0.0, -mean2 * 30))
-    return "mixed", abs(up2 - dn2)
 
-def final_recommendation(combined_call: str, proxy_reco: str, daily_reco: str, analog_summary: Dict[str, float]) -> str:
-    bias, strength = analog_bias(analog_summary)
-    if combined_call in {"WAIT / PROXY TOO HOT", "NEUTRAL"}:
-        if bias == "bullish" and strength >= 0.45:
-            return "WAIT / bullish analogs"
-        if bias == "bearish" and strength >= 0.45:
-            return "PUT setup forming"
-        return proxy_reco if proxy_reco != "NEUTRAL / mixed" else "NEUTRAL / mixed"
-    if combined_call == "CALL":
-        if "aging" in daily_reco.lower() and bias == "bearish" and strength >= 0.45:
-            return "WAIT, aging uptrend"
-        if bias == "bullish":
-            return "CALL" if strength < 0.45 else "CALL / analogs supportive"
-        if bias == "bearish" and strength >= 0.5:
+def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
+    if row is None or row.empty:
+        return "NO DATA", "No data"
+    if row.get("uo_pctile", 0.5) > 0.80 and (row.get("uo_gap", 0.0) < 0 or row.get("uo_slope_3", 0.0) < 0) and row.get("rsi_14", 50) > 70:
+        return "PUT", "Rolling from elevated zone"
+    if timeframe in {"2hour_proxy", "hourly_proxy", "real_2hour"} and row.get("rsi_14", 50) > 75 and row.get("cci_20", 0) > 90 and row.get("pct_b", 0.5) > 0.90 and row.get("uo_gap", 0.0) > 0:
+        return "CALL", "Still rising, but extended"
+    if row.get("uo_pctile", 0.5) < 0.20 and (row.get("uo_gap", 0.0) > 0 or row.get("uo_slope_3", 0.0) > 0) and row.get("rsi_14", 50) < 35:
+        return "CALL", "Turning up from washed-out zone"
+    if row.get("uo_gap", 0.0) > 0 and row.get("uo_slope_3", 0.0) > 0:
+        return "CALL", "Composite rising above signal"
+    if row.get("uo_gap", 0.0) < 0 and row.get("uo_slope_3", 0.0) < 0:
+        return "PUT", "Composite below signal and falling"
+    return "NEUTRAL", "Mixed state"
+
+
+def compute_severity(frame: pd.DataFrame, row: pd.Series) -> Dict[str, float]:
+    pct = frame["uo_pctile"].dropna() if not frame.empty else pd.Series(dtype=float)
+    def count_recent(cond: pd.Series) -> int:
+        c = 0
+        for ok in reversed(cond.fillna(False).astype(bool).tolist()):
+            if ok:
+                c += 1
+            else:
+                break
+        return c
+    bars_above_90 = count_recent(pct > 0.90)
+    bars_below_10 = count_recent(pct < 0.10)
+    return {
+        "bars_above_90": bars_above_90,
+        "bars_below_10": bars_below_10,
+        "late_cycle_flag": int(bars_above_90 >= 4 and float(row.get("uo_slope_3", 0.0)) <= 0),
+    }
+
+
+def recommendation(call: str, severity: Dict[str, float], analogs: Dict[str, float]) -> str:
+    if call == "CALL":
+        if severity.get("late_cycle_flag", 0):
             return "CALL, but extended"
-        return daily_reco if daily_reco != "CALL" else "CALL"
-    if combined_call == "PUT":
-        if bias == "bullish" and strength >= 0.5:
-            return "WAIT, bearish state but bullish analogs"
-        return "PUT" if bias != "bearish" else "PUT / analogs confirm"
-    return combined_call
+        if analogs and analogs.get("ret_2_p_up", 0.5) > 0.62:
+            return "CALL / analogs supportive"
+        return "CALL"
+    if call == "PUT":
+        if analogs and analogs.get("ret_2_p_down", 0.5) > 0.62:
+            return "PUT / analogs confirm"
+        return "PUT setup forming"
+    return "NEUTRAL / mixed"
 
-def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, proxy_label: str) -> None:
+
+def combine(proxy_call: str, daily_call: str, weekly_call: str) -> str:
+    score = {"CALL": 1, "PUT": -1, "NEUTRAL": 0, "NO DATA": 0}
+    net = 0.30 * score.get(proxy_call, 0) + 0.45 * score.get(daily_call, 0) + 0.25 * score.get(weekly_call, 0)
+    if net >= 0.55:
+        return "CALL"
+    if net <= -0.55:
+        return "PUT"
+    if daily_call == "CALL" and weekly_call == "CALL":
+        return "CALL ON PULLBACK"
+    return "NEUTRAL"
+
+
+def align_asof(index: pd.DatetimeIndex, dt: pd.Timestamp) -> pd.Timestamp:
+    ts = pd.Timestamp(dt)
+    if getattr(index, "tz", None) is not None and ts.tzinfo is None:
+        return ts.tz_localize(index.tz)
+    if getattr(index, "tz", None) is None and ts.tzinfo is not None:
+        return ts.tz_localize(None)
+    return ts
+
+
+def slice_asof(df: pd.DataFrame, analysis_date: pd.Timestamp) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    end_ts = align_asof(df.index, pd.Timestamp(analysis_date) + pd.Timedelta(hours=23, minutes=59, seconds=59))
+    return df.loc[df.index <= end_ts].copy()
+
+
+def distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, float]:
+    if row is None or row.empty or frame.empty:
+        return {"gap": np.nan, "abs_gap": np.nan, "range_pct": np.nan}
+    gap = float(row.get("uo", np.nan) - row.get("uo_signal", np.nan))
+    recent = (frame["uo"] - frame["uo_signal"]).dropna().tail(40)
+    denom = max(float(recent.abs().max()), 1e-9) if not recent.empty else np.nan
+    return {"gap": gap, "abs_gap": abs(gap) if pd.notna(gap) else np.nan, "range_pct": abs(gap) / denom * 100 if pd.notna(gap) and pd.notna(denom) else np.nan}
+
+
+def plot_dashboard(symbol: str, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str) -> None:
     fig = make_subplots(
         rows=4, cols=1, vertical_spacing=0.05,
-        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", f"{proxy_label} Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
-        row_heights=[0.34, 0.22, 0.22, 0.22],
+        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", f"{tactical_label} Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
+        row_heights=[0.36, 0.22, 0.22, 0.20],
     )
     if not daily_df.empty:
-        d = daily_df.tail(220)
+        d = daily_df.tail(260)
         fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Daily"), row=1, col=1)
         fig.add_trace(go.Scatter(x=d.index, y=d["ema_20"], name="EMA20", line=dict(color="orange")), row=1, col=1)
         fig.add_trace(go.Scatter(x=d.index, y=d["sma_50"], name="SMA50", line=dict(color="blue")), row=1, col=1)
-    for row_num, frame in zip([2, 3, 4], [proxy_df.tail(220), daily_df.tail(220), weekly_df.tail(150)]):
+    for row_num, frame in zip([2, 3, 4], [tactical_df.tail(260), daily_df.tail(260), weekly_df.tail(160)]):
         if frame.empty:
             continue
-        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo"], name=f"UO {row_num}", line=dict(color="red", width=3)), row=row_num, col=1)
-        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"Signal {row_num}", line=dict(color="black", width=2)), row=row_num, col=1)
+        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo"], name=f"UO {row_num}", line=dict(color="red", width=2.5)), row=row_num, col=1)
+        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"Signal {row_num}", line=dict(color="black", width=1.4)), row=row_num, col=1)
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row_num, col=1)
-    fig.update_layout(height=1250, xaxis_rangeslider_visible=False, legend_orientation="h", margin=dict(t=90, b=20))
-    st.plotly_chart(fig, width='stretch')
+    fig.update_layout(height=1150, xaxis_rangeslider_visible=False, legend_orientation="h")
+    st.plotly_chart(fig, width="stretch")
+
 
 # -----------------------------
-# PARALLEL WORKER
+# Sidebar
 # -----------------------------
-def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: pd.DataFrame, proxy_mode: str, analysis_mode: str, analysis_date_val, data_provider: str = "yahoo", alpaca_key: str = "", alpaca_secret: str = "", alpaca_feed: str = "iex", true_intraday: bool = False) -> Tuple[Optional[Dict], Optional[Dict]]:
-    try:
-        if sym not in data_map or data_map[sym].empty:
-            return None, None
-
-        daily_raw = data_map[sym]
-        weekly_raw = resample_weekly(daily_raw)
-
-        if data_provider == "alpaca" and true_intraday and proxy_mode == "2hour":
-            intraday = fetch_alpaca_intraday(sym, alpaca_key, alpaca_secret, alpaca_feed)
-            proxy_raw = resample_intraday_to_2h(intraday)
-            if proxy_raw.empty:
-                proxy_raw, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_raw, proxy_mode)
-            else:
-                proxy_timeframe, proxy_label = "proxy_2hour", "2-Hour (Alpaca)"
-        else:
-            proxy_raw, proxy_timeframe, proxy_label = build_proxy_from_daily(daily_raw, proxy_mode)
-
-        proxy_df = enrich_price_features(proxy_raw, proxy_timeframe, bench_df)
-        daily_df = enrich_price_features(daily_raw, "daily", bench_df)
-        weekly_df = enrich_price_features(weekly_raw, "weekly", bench_df)
-
-        asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date_val)
-        proxy_view = slice_asof(proxy_df, asof)
-        daily_view = slice_asof(daily_df, asof)
-        weekly_view = slice_asof(weekly_df, asof)
-
-        if daily_view.empty:
-            return None, None
-
-        proxy_row = proxy_view.iloc[-1] if not proxy_view.empty else pd.Series(dtype=float)
-        daily_row = daily_view.iloc[-1]
-        weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
-
-        proxy_call, proxy_conf, proxy_reason = classify_timeframe_call(proxy_row, proxy_timeframe)
-        proxy_cross = compute_distance_to_cross(proxy_row, proxy_view)
-        daily_call, daily_conf, daily_reason = classify_timeframe_call(daily_row, "daily")
-        weekly_call, weekly_conf, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
-        combined_call, combined_reason = combine_calls(proxy_call, daily_call, weekly_call)
-        
-        proxy_severity = compute_state_severity(proxy_view, proxy_row)
-        daily_severity = compute_state_severity(daily_view, daily_row)
-        weekly_severity = compute_state_severity(weekly_view, weekly_row)
-        
-        proxy_reco = recommendation_from_state(proxy_call, proxy_severity, proxy_timeframe)
-        daily_reco = recommendation_from_state(daily_call, daily_severity, "daily")
-        weekly_reco = recommendation_from_state(weekly_call, weekly_severity, "weekly")
-        
-        analogs = find_analogs(daily_df, daily_row.name, n=25)
-        analog_summary = summarize_analogs(analogs)
-        combined_reco = final_recommendation(combined_call, proxy_reco, daily_reco, analog_summary)
-
-        # Row for Table
-        row_data = {
-            "Symbol": sym,
-            "Status": "OK",
-            "As Of": str(daily_row.name.date()),
-            "Close": round(float(daily_row.get("Close", np.nan)), 2),
-            "Proxy Mode": proxy_label,
-            "Proxy Call": proxy_call,
-            "Daily Call": daily_call,
-            "Weekly Call": weekly_call,
-            "Combined": combined_call,
-            "Proxy Recommendation": proxy_reco,
-            "Daily Recommendation": daily_reco,
-            "Weekly Recommendation": weekly_reco,
-            "Combined Recommendation": combined_reco,
-            "Proxy %ile": round(float(proxy_row.get("uo_pctile", np.nan)) * 100, 1) if not proxy_row.empty else np.nan,
-            "Cross Dist %": round(float(proxy_cross.get("range_pct", np.nan)), 1) if proxy_cross else np.nan,
-            "Daily %ile": round(float(daily_row.get("uo_pctile", np.nan)) * 100, 1),
-            "Weekly %ile": round(float(weekly_row.get("uo_pctile", np.nan)) * 100, 1) if not weekly_row.empty else np.nan,
-            "Candle Score": round(float(daily_row.get("candle_score", np.nan)), 1),
-            "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1),
-            "CCI20": round(float(daily_row.get("cci_20", np.nan)), 1),
-            "Analog N": int(analog_summary.get("n", 0)) if analog_summary else 0,
-            "Analog 2d Med": round(float(analog_summary.get("ret_2_median", np.nan)) * 100, 2) if analog_summary else np.nan,
-            "Analog 2d Up %": round(float(analog_summary.get("ret_2_p_up", np.nan)) * 100, 1) if analog_summary else np.nan,
-            "Overheat Score": round(float(0.55 * proxy_row.get("uo_pctile", 0.5) * 100 + 0.45 * daily_row.get("uo_pctile", 0.5) * 100 + max(0.0, (daily_row.get("rsi_14", 50.0) - 60)) * 0.4 + max(0.0, (daily_row.get("cci_20", 0.0) - 100)) * 0.03), 1),
-        }
-
-        # Detail Dict
-        detail_data = {
-            "proxy": proxy_view,
-            "daily": daily_view,
-            "weekly": weekly_view,
-            "proxy_call": (proxy_call, proxy_conf, proxy_reason),
-            "proxy_label": proxy_label,
-            "proxy_cross": proxy_cross,
-            "daily_call": (daily_call, daily_conf, daily_reason),
-            "weekly_call": (weekly_call, weekly_conf, weekly_reason),
-            "combined": (combined_call, combined_reason),
-            "severity": {"proxy": proxy_severity, "daily": daily_severity, "weekly": weekly_severity},
-            "recommendation": {"proxy": proxy_reco, "daily": daily_reco, "weekly": weekly_reco, "combined": combined_reco},
-            "analogs": analogs,
-            "analog_summary": analog_summary,
-            "asof": asof,
-        }
-        return row_data, detail_data
-
-    except Exception as e:
-        # st.error(f"Error processing {sym}: {e}") # Don't st.error in thread
-        return {"Symbol": sym, "Status": f"Error: {str(e)[:20]}", "Combined Recommendation": "ERROR"}, None
-
-# -----------------------------
-# APP MAIN
-# -----------------------------
-st.title("📈 Stable Market Engine Pro")
-st.caption("Alpaca-only | Disk Cache | Parallel Processing | Hybrid rank+severity normalization")
+st.title("📈 Stable Market Engine Clean")
+st.caption("Alpaca-only | raw prices | cleaner date loader | real 2-hour option")
 
 with st.sidebar:
-    st.header("Inputs")
-    manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="SMH, QQQ, INTC, NVDA, AMD, TSLA, META", height=110)
-    st.markdown("---")
+    st.header("Credentials")
     alpaca_key = st.text_input("Alpaca API key", type="password")
     alpaca_secret = st.text_input("Alpaca API secret", type="password")
-    alpaca_feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0)
-    true_intraday = st.checkbox("Use true Alpaca 2-hour bars", value=True)
+    feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0)
+
+    st.header("Input")
+    symbols_text = st.text_area("Paste tickers (comma or line separated)", value="QQQ, SMH, INTC, NVDA, AMD, XLF", height=110)
+    upload_watchlist = st.file_uploader("Upload results/watchlist CSV", type=["csv"])
 
     st.header("Settings")
     benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "RSP", "IWM"], index=0)
     history_years = st.selectbox("Historical years", [3, 5, 10], index=1)
     analysis_mode = st.radio("Analysis mode", ["Current", "Historical"], index=0)
-    default_date = pd.Timestamp.today().date()
-    analysis_date = st.date_input("Calendar lookback", value=default_date, disabled=(analysis_mode == "Current"))
-    proxy_mode = st.radio("Tactical proxy", ["hourly", "2hour"], index=0)
-    force_refresh = st.checkbox("Force refresh Alpaca cache", value=False)
-    run_analysis = st.button("Run Analysis", type="primary", width='stretch')
+    analysis_date = st.date_input("Calendar lookback", value=pd.Timestamp.today().date(), disabled=(analysis_mode == "Current"))
+    tactical_mode = st.radio("Tactical mode", ["2hour_real", "2hour_proxy", "hourly_proxy"], index=0, format_func=lambda x: {"2hour_real": "Real Alpaca 2-Hour", "2hour_proxy": "2-Hour Proxy", "hourly_proxy": "Hourly Proxy"}[x])
+    force_refresh = st.checkbox("Force refresh data (clear cache)", value=False)
+    run_analysis = st.button("Run Analysis", type="primary", width="stretch")
 
 if not run_analysis:
     st.stop()
 
-symbols = [s.strip().upper() for s in manual_symbols.replace("\n", ",").split(",") if s.strip()]
-symbols = list(dict.fromkeys(symbols))
+if not alpaca_key or not alpaca_secret:
+    st.error("Enter Alpaca API key and secret.")
+    st.stop()
+
+uploaded_symbols = parse_symbol_csv(upload_watchlist)
+symbols = clean_symbols(symbols_text, uploaded_symbols)
 if not symbols:
     st.error("Provide at least one symbol.")
     st.stop()
 
-# 1. Bulk Fetch Data
-# Combine symbols + benchmark to ensure we have everything in one go
-all_fetch_symbols = list(set(symbols + [benchmark]))
+all_syms = list(dict.fromkeys(symbols + [benchmark]))
 if force_refresh:
-    clear_symbol_cache(all_fetch_symbols)
+    clear_symbol_cache(all_syms)
     fetch_alpaca_daily_batch.clear()
-    fetch_alpaca_intraday.clear()
+    fetch_alpaca_2hour.clear()
 
-if not (alpaca_key or '').strip() or not (alpaca_secret or '').strip():
-    st.error("Enter both Alpaca API key and Alpaca API secret.")
+st.info("Loading Alpaca daily data...")
+daily_map = fetch_alpaca_daily_batch(all_syms, history_years, alpaca_key, alpaca_secret, feed)
+if benchmark not in daily_map or daily_map[benchmark].empty:
+    st.error(f"Could not load benchmark {benchmark} from Alpaca.")
     st.stop()
+benchmark_daily = daily_map[benchmark]
 
-all_data_map = fetch_alpaca_daily_batch(all_fetch_symbols, history_years, alpaca_key, alpaca_secret, alpaca_feed)
-if (not all_data_map) and alpaca_feed == "sip":
-    st.warning("Alpaca SIP feed may require a paid plan. Try IEX if SIP returns no data.")
-
-if benchmark not in all_data_map or all_data_map[benchmark].empty:
-    st.error(f"Could not fetch benchmark {benchmark}. Check credentials, cache, or network.")
-    st.stop()
-
-benchmark_df = all_data_map[benchmark]
-
-# 2. Parallel Processing
-rows: List[Dict] = []
-detail: Dict[str, Dict] = {}
+rows: List[Dict[str, object]] = []
+detail: Dict[str, Dict[str, object]] = {}
 progress = st.progress(0.0)
-status_text = st.empty()
+for i, sym in enumerate(symbols):
+    progress.progress((i + 1) / max(1, len(symbols)))
+    daily_raw = daily_map.get(sym, pd.DataFrame())
+    if daily_raw.empty:
+        rows.append({"Symbol": sym, "Status": "No data"})
+        continue
 
-# Use ThreadPoolExecutor to process indicators in parallel
-# max_workers=4 is safe; indicator calculation is CPU bound but Pandas releases GIL
-with ThreadPoolExecutor(max_workers=4) as executor:
-    futures = {
-        executor.submit(process_symbol_task, s, all_data_map, benchmark_df, proxy_mode, analysis_mode, analysis_date, "alpaca", alpaca_key, alpaca_secret, alpaca_feed, true_intraday): s 
-        for s in symbols
+    if tactical_mode == "2hour_real":
+        tactical_raw = fetch_alpaca_2hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
+        tactical_timeframe = "real_2hour"
+        tactical_label = "Real 2-Hour"
+        if tactical_raw.empty:
+            tactical_raw, tactical_timeframe, tactical_label = time_compressed_proxy(daily_raw, "2hour_proxy")
+    elif tactical_mode == "2hour_proxy":
+        tactical_raw, tactical_timeframe, tactical_label = time_compressed_proxy(daily_raw, "2hour_proxy")
+    else:
+        tactical_raw, tactical_timeframe, tactical_label = time_compressed_proxy(daily_raw, "hourly_proxy")
+
+    weekly_raw = resample_weekly(daily_raw)
+    tactical_df = enrich_price_features(tactical_raw, tactical_timeframe, benchmark_daily)
+    daily_df = enrich_price_features(daily_raw, "daily", benchmark_daily)
+    weekly_df = enrich_price_features(weekly_raw, "weekly", benchmark_daily)
+
+    asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date)
+    tactical_view = slice_asof(tactical_df, asof)
+    daily_view = slice_asof(daily_df, asof)
+    weekly_view = slice_asof(weekly_df, asof)
+    if daily_view.empty:
+        rows.append({"Symbol": sym, "Status": "No data on date"})
+        continue
+
+    tactical_row = tactical_view.iloc[-1] if not tactical_view.empty else pd.Series(dtype=float)
+    daily_row = daily_view.iloc[-1]
+    weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
+
+    tactical_call, tactical_reason = classify_timeframe_call(tactical_row, tactical_timeframe)
+    daily_call, daily_reason = classify_timeframe_call(daily_row, "daily")
+    weekly_call, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
+    sev = compute_severity(tactical_view, tactical_row)
+    analogs = find_analogs(daily_df, daily_row.name)
+    analog_summary = summarize_analogs(analogs)
+    reco = recommendation(tactical_call if tactical_call != "NEUTRAL" else daily_call, sev, analog_summary)
+    combined = combine(tactical_call, daily_call, weekly_call)
+    cross = distance_to_cross(tactical_row, tactical_view)
+    overheat_score = (
+        (float(tactical_row.get("uo_pctile", 0.5)) * 0.30)
+        + (float(daily_row.get("uo_pctile", 0.5)) * 0.35)
+        + (min(max(float(daily_row.get("rsi_14", 50)) / 100, 0), 1) * 0.15)
+        + (min(max((float(daily_row.get("cci_20", 0)) + 200) / 400, 0), 1) * 0.20)
+    ) * 100
+
+    rows.append({
+        "Symbol": sym,
+        "Status": "OK",
+        "As Of": str(daily_row.name.date()),
+        "Tactical": tactical_call,
+        "Daily": daily_call,
+        "Weekly": weekly_call,
+        "Combined": combined,
+        "Recommendation": reco,
+        "Price": round(float(daily_row.get("Close", np.nan)), 2),
+        "Overheat Score": round(overheat_score, 1),
+        "Tactical %ile": round(float(tactical_row.get("uo_pctile", np.nan)) * 100, 1) if not tactical_row.empty else np.nan,
+        "Daily %ile": round(float(daily_row.get("uo_pctile", np.nan)) * 100, 1),
+        "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1),
+        "CCI20": round(float(daily_row.get("cci_20", np.nan)), 1),
+        "Analog N": int(analog_summary.get("n", 0)) if analog_summary else 0,
+        "Analog 2d Med": round(float(analog_summary.get("ret_2_median", np.nan)) * 100, 2) if analog_summary else np.nan,
+        "Analog 2d Up %": round(float(analog_summary.get("ret_2_p_up", np.nan)) * 100, 1) if analog_summary else np.nan,
+    })
+    detail[sym] = {
+        "tactical": tactical_view,
+        "daily": daily_view,
+        "weekly": weekly_view,
+        "tactical_call": (tactical_call, tactical_reason),
+        "daily_call": (daily_call, daily_reason),
+        "weekly_call": (weekly_call, weekly_reason),
+        "combined": combined,
+        "recommendation": reco,
+        "severity": sev,
+        "analogs": analogs,
+        "analog_summary": analog_summary,
+        "cross": cross,
+        "asof": asof,
+        "tactical_label": tactical_label,
     }
-    
-    for i, future in enumerate(as_completed(futures)):
-        sym = futures[future]
-        status_text.text(f"Processing {sym} ({i+1}/{len(symbols)})...")
-        progress.progress((i + 1) / len(symbols))
-        
-        try:
-            row, det = future.result()
-            if row:
-                rows.append(row)
-            if det:
-                detail[sym] = det
-        except Exception as e:
-            rows.append({"Symbol": sym, "Status": "Crash", "Combined Recommendation": "ERROR"})
-
 progress.empty()
-status_text.empty()
 
-# 3. Display Results
 results_df = pd.DataFrame(rows)
-if not results_df.empty:
-    # Rank uploaded scan/watchlist results by current overheat state using proxy + daily.
-    if "Overheat Score" in results_df.columns:
-        results_df = results_df.sort_values(["Overheat Score", "Daily %ile"], ascending=False)
-    elif "Daily %ile" in results_df.columns:
-        results_df = results_df.sort_values("Daily %ile", ascending=False)
-    st.session_state["analysis_results"] = results_df
-    st.session_state["analysis_detail"] = detail
-    st.session_state["analysis_valid_symbols"] = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
-else:
-    st.session_state["analysis_results"] = pd.DataFrame()
-    st.session_state["analysis_detail"] = {}
-    st.session_state["analysis_valid_symbols"] = []
-
-results_df = st.session_state.get("analysis_results", pd.DataFrame())
-detail = st.session_state.get("analysis_detail", {})
-valid_symbols = st.session_state.get("analysis_valid_symbols", [])
-
 st.subheader("Ranked Results")
-if results_df is None or results_df.empty:
+if results_df.empty:
     st.warning("No results generated.")
     st.stop()
+results_df = results_df.sort_values("Overheat Score", ascending=False)
+st.dataframe(results_df, width="stretch", hide_index=True)
+st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_clean.csv", "text/csv")
 
-st.dataframe(results_df, width='stretch', hide_index=True)
-st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_pro.csv", "text/csv")
-
+valid_symbols = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
 if not valid_symbols:
     st.stop()
-
-if st.session_state.get("selected_symbol") not in valid_symbols:
-    st.session_state["selected_symbol"] = valid_symbols[0]
-
-st.subheader("Detailed Analysis")
-selected = st.selectbox("Select symbol", valid_symbols, key="selected_symbol")
+if "selected_symbol" not in st.session_state or st.session_state.selected_symbol not in valid_symbols:
+    st.session_state.selected_symbol = valid_symbols[0]
+selected = st.selectbox("Select symbol", valid_symbols, index=valid_symbols.index(st.session_state.selected_symbol))
+st.session_state.selected_symbol = selected
 item = detail[selected]
 
-# Metric Columns
-proxy_call, _, proxy_reason = item["proxy_call"]
-proxy_label = item.get("proxy_label", "Proxy")
-proxy_cross = item.get("proxy_cross", {})
-daily_call, _, daily_reason = item["daily_call"]
-weekly_call, _, weekly_reason = item["weekly_call"]
-combined_call, combined_reason = item["combined"]
+st.subheader("Detailed Analysis")
+tactical_call, tactical_reason = item["tactical_call"]
+daily_call, daily_reason = item["daily_call"]
+weekly_call, weekly_reason = item["weekly_call"]
+tactical_label = item["tactical_label"]
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric(proxy_label, proxy_call)
+c1.metric(tactical_label, tactical_call)
 c2.metric("Daily", daily_call)
 c3.metric("Weekly", weekly_call)
-c4.metric("Combined", combined_call)
-st.markdown(f"**{proxy_label} reason:** {proxy_reason}")
+c4.metric("Combined", item["combined"])
+st.markdown(f"**{tactical_label} reason:** {tactical_reason}")
 st.markdown(f"**Daily reason:** {daily_reason}")
 st.markdown(f"**Weekly reason:** {weekly_reason}")
-st.markdown(f"**Combined read:** {combined_reason}")
+st.markdown(f"**Recommendation:** {item['recommendation']}")
 
-reco = item.get("recommendation", {})
-sev = item.get("severity", {})
-st.markdown(f"**Recommendation:** {reco.get('combined', combined_call)}")
-
-# Cross Stats
+cross = item["cross"]
 cd1, cd2, cd3 = st.columns(3)
-cd1.metric("Distance to cross", f"{proxy_cross.get('abs_gap', np.nan):.4f}" if pd.notna(proxy_cross.get('abs_gap', np.nan)) else "n/a")
-gap_label = "Above signal" if proxy_cross.get("gap", np.nan) >= 0 else "Below signal" if pd.notna(proxy_cross.get("gap", np.nan)) else "n/a"
+cd1.metric("Distance to cross", f"{cross.get('abs_gap', np.nan):.4f}" if pd.notna(cross.get("abs_gap", np.nan)) else "n/a")
+gap_label = "Above signal" if cross.get("gap", np.nan) >= 0 else ("Below signal" if pd.notna(cross.get("gap", np.nan)) else "n/a")
 cd2.metric("Cross gap sign", gap_label)
-cd3.metric("Cross distance %", f"{proxy_cross.get('range_pct', np.nan):.1f}%" if pd.notna(proxy_cross.get("range_pct", np.nan)) else "n/a")
+cd3.metric("Cross distance %", f"{cross.get('range_pct', np.nan):.1f}%" if pd.notna(cross.get("range_pct", np.nan)) else "n/a")
 
-# Severity Stats
-sv1, sv2, sv3, sv4 = st.columns(4)
-proxy_sev = sev.get("proxy", {})
-sv1.metric("Bars > 90", str(proxy_sev.get("bars_above_90", 0)))
-sv2.metric("Bars < 10", str(proxy_sev.get("bars_below_10", 0)))
-sv3.metric("Late-cycle", "Yes" if proxy_sev.get("late_cycle_flag", 0) else "No")
-sv4.metric("Divergence", "Yes" if proxy_sev.get("lower_high_div", 0) else ("Repair" if proxy_sev.get("higher_low_repair", 0) else "No"))
+sev = item["severity"]
+sv1, sv2, sv3 = st.columns(3)
+sv1.metric("Bars > 90", str(sev.get("bars_above_90", 0)))
+sv2.metric("Bars < 10", str(sev.get("bars_below_10", 0)))
+sv3.metric("Late-cycle", "Yes" if sev.get("late_cycle_flag", 0) else "No")
 
-# As-Of Table
-proxy_last = item["proxy"].iloc[-1] if not item["proxy"].empty else pd.Series(dtype=float)
-daily_last = item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)
-weekly_last = item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float)
-
+# As-of table
+last_t = item["tactical"].iloc[-1] if not item["tactical"].empty else pd.Series(dtype=float)
+last_d = item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)
+last_w = item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float)
+asof_table = pd.DataFrame([
+    {"Frame": tactical_label, "Date": str(last_t.name.date()) if not last_t.empty else "n/a", "Price": round(float(last_t.get("Close", np.nan)), 2) if not last_t.empty else np.nan, "UO": round(float(last_t.get("uo", np.nan)), 4) if not last_t.empty else np.nan, "Signal": round(float(last_t.get("uo_signal", np.nan)), 4) if not last_t.empty else np.nan, "Percentile": round(float(last_t.get("uo_pctile", np.nan))*100, 1) if not last_t.empty else np.nan, "Candle Score": round(float(last_t.get("candle_score", np.nan)), 1) if not last_t.empty else np.nan},
+    {"Frame": "Daily", "Date": str(last_d.name.date()) if not last_d.empty else "n/a", "Price": round(float(last_d.get("Close", np.nan)), 2) if not last_d.empty else np.nan, "UO": round(float(last_d.get("uo", np.nan)), 4) if not last_d.empty else np.nan, "Signal": round(float(last_d.get("uo_signal", np.nan)), 4) if not last_d.empty else np.nan, "Percentile": round(float(last_d.get("uo_pctile", np.nan))*100, 1) if not last_d.empty else np.nan, "Candle Score": round(float(last_d.get("candle_score", np.nan)), 1) if not last_d.empty else np.nan},
+    {"Frame": "Weekly", "Date": str(last_w.name.date()) if not last_w.empty else "n/a", "Price": round(float(last_w.get("Close", np.nan)), 2) if not last_w.empty else np.nan, "UO": round(float(last_w.get("uo", np.nan)), 4) if not last_w.empty else np.nan, "Signal": round(float(last_w.get("uo_signal", np.nan)), 4) if not last_w.empty else np.nan, "Percentile": round(float(last_w.get("uo_pctile", np.nan))*100, 1) if not last_w.empty else np.nan, "Candle Score": round(float(last_w.get("candle_score", np.nan)), 1) if not last_w.empty else np.nan},
+])
 st.markdown("### As-of values")
-asof_table = pd.DataFrame(
-    [
-        {
-            "Frame": proxy_label,
-            "Date": str(proxy_last.name.date()) if not proxy_last.empty else "n/a",
-            "Price": round(float(proxy_last.get("Close", np.nan)), 2) if not proxy_last.empty else np.nan,
-            "UO": round(float(proxy_last.get("uo", np.nan)), 4) if not proxy_last.empty else np.nan,
-            "Signal": round(float(proxy_last.get("uo_signal", np.nan)), 4) if not proxy_last.empty else np.nan,
-            "Percentile": round(float(proxy_last.get("uo_pctile", np.nan)) * 100, 1) if not proxy_last.empty else np.nan,
-            "Candle Score": round(float(proxy_last.get("candle_score", np.nan)), 1) if not proxy_last.empty else np.nan,
-            "Cross Gap": round(float(proxy_cross.get("gap", np.nan)), 4) if pd.notna(proxy_cross.get("gap", np.nan)) else np.nan,
-            "Cross Dist %": round(float(proxy_cross.get("range_pct", np.nan)), 1) if pd.notna(proxy_cross.get("range_pct", np.nan)) else np.nan,
-            "Recommendation": item.get("recommendation", {}).get("proxy", proxy_call),
-        },
-        {
-            "Frame": "Daily",
-            "Date": str(daily_last.name.date()) if not daily_last.empty else "n/a",
-            "Price": round(float(daily_last.get("Close", np.nan)), 2) if not daily_last.empty else np.nan,
-            "UO": round(float(daily_last.get("uo", np.nan)), 4) if not daily_last.empty else np.nan,
-            "Signal": round(float(daily_last.get("uo_signal", np.nan)), 4) if not daily_last.empty else np.nan,
-            "Percentile": round(float(daily_last.get("uo_pctile", np.nan)) * 100, 1) if not daily_last.empty else np.nan,
-            "Candle Score": round(float(daily_last.get("candle_score", np.nan)), 1) if not daily_last.empty else np.nan,
-            "Recommendation": item.get("recommendation", {}).get("daily", daily_call),
-        },
-        {
-            "Frame": "Weekly",
-            "Date": str(weekly_last.name.date()) if not weekly_last.empty else "n/a",
-            "Price": round(float(weekly_last.get("Close", np.nan)), 2) if not weekly_last.empty else np.nan,
-            "UO": round(float(weekly_last.get("uo", np.nan)), 4) if not weekly_last.empty else np.nan,
-            "Signal": round(float(weekly_last.get("uo_signal", np.nan)), 4) if not weekly_last.empty else np.nan,
-            "Percentile": round(float(weekly_last.get("uo_pctile", np.nan)) * 100, 1) if not weekly_last.empty else np.nan,
-            "Candle Score": round(float(weekly_last.get("candle_score", np.nan)), 1) if not weekly_last.empty else np.nan,
-            "Recommendation": item.get("recommendation", {}).get("weekly", weekly_call),
-        },
-    ]
-)
-st.dataframe(asof_table, width='stretch', hide_index=True)
+st.dataframe(asof_table, width="stretch", hide_index=True)
 
-# Analogs
 st.markdown("### Historical analogs")
-analog_summary = item.get("analog_summary", {})
+analog_summary = item["analog_summary"]
 if analog_summary:
     a1, a2, a3, a4 = st.columns(4)
     a1.metric("Analog count", str(int(analog_summary.get("n", 0))))
-    a2.metric("2d median", f"{analog_summary.get('ret_2_median', np.nan) * 100:.2f}%" if pd.notna(analog_summary.get('ret_2_median', np.nan)) else "n/a")
-    a3.metric("2d up %", f"{analog_summary.get('ret_2_p_up', np.nan) * 100:.1f}%" if pd.notna(analog_summary.get('ret_2_p_up', np.nan)) else "n/a")
-    a4.metric("5d median", f"{analog_summary.get('ret_5_median', np.nan) * 100:.2f}%" if pd.notna(analog_summary.get('ret_5_median', np.nan)) else "n/a")
-    analogs = item.get("analogs", pd.DataFrame())
+    a2.metric("2d median", f"{analog_summary.get('ret_2_median', np.nan)*100:.2f}%" if pd.notna(analog_summary.get("ret_2_median", np.nan)) else "n/a")
+    a3.metric("2d up %", f"{analog_summary.get('ret_2_p_up', np.nan)*100:.1f}%" if pd.notna(analog_summary.get("ret_2_p_up", np.nan)) else "n/a")
+    a4.metric("5d median", f"{analog_summary.get('ret_5_median', np.nan)*100:.2f}%" if pd.notna(analog_summary.get("ret_5_median", np.nan)) else "n/a")
+    analogs = item["analogs"]
     if analogs is not None and not analogs.empty:
         show_cols = [c for c in ["Close", "uo", "uo_signal", "distance", "similarity", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"] if c in analogs.columns]
         show = analogs[show_cols].head(12).copy()
@@ -1136,8 +777,8 @@ if analog_summary:
             show.index = show.index.strftime("%Y-%m-%d")
         except Exception:
             pass
-        st.dataframe(show, width='stretch')
+        st.dataframe(show, width="stretch")
 else:
     st.caption("No analog set available for this as-of date.")
 
-plot_dashboard(selected, item["proxy"], item["daily"], item["weekly"], item["asof"], proxy_label)
+plot_dashboard(selected, item["tactical"], item["daily"], item["weekly"], item["asof"], tactical_label)
