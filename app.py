@@ -339,8 +339,10 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
         # 25/13/7 compressed by ~3.25 for 2-hour, by ~6.5 for 1-hour, then smoothed modestly.
         "2hour_proxy": (8, 4, 2),
         "hourly_proxy": (4, 2, 2),
-        "daily": (8, 21, 7),
-        "weekly": (5, 13, 5),
+        # Slow the daily/weekly structure so crosses are less frequent and more regime-like.
+        "daily": (16, 42, 10),
+        "weekly": (8, 21, 7),
+        # Keep real 2-hour aligned to the underlying intraday TSI family, but smooth the composite first.
         "real_2hour": (25, 13, 7),
     }
 
@@ -361,13 +363,35 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     rs_part = 0.10 * np.tanh(out["rs_bench_slope_5"].fillna(0) * 25)
     quality = 1 + 0.12 * pct_col("adx_14_pctile")
     out["uo_base"] = (stretch + momentum + rs_part) * quality
-    out["uo"] = ema(out["uo_base"], fast) - ema(out["uo_base"], slow)
+
+    # Intraday can stay nimble; daily/weekly need extra smoothing to avoid over-frequent crosses.
+    pre_smooth = 1
+    if timeframe_name == "daily":
+        pre_smooth = 5
+    elif timeframe_name == "weekly":
+        pre_smooth = 3
+    elif timeframe_name == "real_2hour":
+        pre_smooth = 2
+    if pre_smooth > 1:
+        out["uo_base_sm"] = ema(out["uo_base"], pre_smooth)
+    else:
+        out["uo_base_sm"] = out["uo_base"]
+
+    out["uo"] = ema(out["uo_base_sm"], fast) - ema(out["uo_base_sm"], slow)
     out["uo_signal"] = ema(out["uo"], sig)
     out["uo_gap"] = out["uo"] - out["uo_signal"]
     out["uo_slope_1"] = out["uo"].diff(1)
     out["uo_slope_3"] = out["uo"].diff(3)
     lookback = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_2hour"} else 252
     out["uo_pctile"] = true_percentile(out["uo"], lookback)
+
+    # Cross confirmation features: require more than a one-bar wiggle for daily/weekly.
+    out["uo_above_signal"] = (out["uo"] > out["uo_signal"]).astype(int)
+    out["uo_below_signal"] = (out["uo"] < out["uo_signal"]).astype(int)
+    out["uo_above_signal_2"] = (out["uo_above_signal"].rolling(2, min_periods=2).sum() == 2).astype(int)
+    out["uo_below_signal_2"] = (out["uo_below_signal"].rolling(2, min_periods=2).sum() == 2).astype(int)
+    gap_scale = out["uo_gap"].abs().rolling(40, min_periods=10).max().replace(0, np.nan)
+    out["uo_gap_strength"] = (out["uo_gap"].abs() / gap_scale).clip(0, 1)
     return out
 
 
@@ -456,15 +480,45 @@ def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
 def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     if row is None or row.empty:
         return "NO DATA", "No data"
-    if row.get("uo_pctile", 0.5) > 0.80 and (row.get("uo_gap", 0.0) < 0 or row.get("uo_slope_3", 0.0) < 0) and row.get("rsi_14", 50) > 70:
-        return "PUT", "Rolling from elevated zone"
-    if timeframe in {"2hour_proxy", "hourly_proxy", "real_2hour"} and row.get("rsi_14", 50) > 75 and row.get("cci_20", 0) > 90 and row.get("pct_b", 0.5) > 0.90 and row.get("uo_gap", 0.0) > 0:
-        return "CALL", "Still rising, but extended"
-    if row.get("uo_pctile", 0.5) < 0.20 and (row.get("uo_gap", 0.0) > 0 or row.get("uo_slope_3", 0.0) > 0) and row.get("rsi_14", 50) < 35:
-        return "CALL", "Turning up from washed-out zone"
-    if row.get("uo_gap", 0.0) > 0 and row.get("uo_slope_3", 0.0) > 0:
+
+    uo_pct = float(row.get("uo_pctile", 0.5))
+    uo_gap = float(row.get("uo_gap", 0.0))
+    uo_slope3 = float(row.get("uo_slope_3", 0.0))
+    rsi_val = float(row.get("rsi_14", 50.0))
+    cci_val = float(row.get("cci_20", 0.0))
+    pct_b = float(row.get("pct_b", 0.5))
+    gap_strength = float(row.get("uo_gap_strength", 0.0))
+
+    is_tactical = timeframe in {"2hour_proxy", "hourly_proxy", "real_2hour"}
+    is_structural = timeframe in {"daily", "weekly"}
+
+    # Fast tactical layer can respond quickly, but do not invert the heat structure.
+    if is_tactical and uo_pct > 0.88 and uo_gap < 0 and uo_slope3 < 0 and rsi_val > 68:
+        return "PUT", "Tactical momentum rolling from elevated zone"
+    if is_tactical and uo_pct > 0.80 and uo_gap > 0 and uo_slope3 >= 0:
         return "CALL", "Composite rising above signal"
-    if row.get("uo_gap", 0.0) < 0 and row.get("uo_slope_3", 0.0) < 0:
+    if is_tactical and uo_pct < 0.20 and uo_gap > 0 and uo_slope3 > 0 and rsi_val < 38:
+        return "CALL", "Turning up from washed-out zone"
+    if is_tactical and uo_gap < 0 and uo_slope3 < 0:
+        return "PUT", "Composite below signal and falling"
+
+    # Daily/weekly require confirmed gap persistence and stronger gap before a regime cross counts.
+    if is_structural:
+        above2 = int(row.get("uo_above_signal_2", 0)) == 1
+        below2 = int(row.get("uo_below_signal_2", 0)) == 1
+        if uo_pct > 0.85 and below2 and uo_slope3 < 0 and gap_strength >= 0.18 and rsi_val > 65:
+            return "PUT", "Confirmed daily rollover from elevated zone"
+        if uo_pct < 0.18 and above2 and uo_slope3 > 0 and gap_strength >= 0.18 and rsi_val < 40:
+            return "CALL", "Confirmed turn up from washed-out zone"
+        if above2 and uo_slope3 > 0 and gap_strength >= 0.15:
+            return "CALL", "Confirmed composite above signal"
+        if below2 and uo_slope3 < 0 and gap_strength >= 0.15:
+            return "PUT", "Confirmed composite below signal"
+        return "NEUTRAL", "No confirmed structural cross"
+
+    if uo_gap > 0 and uo_slope3 > 0:
+        return "CALL", "Composite rising above signal"
+    if uo_gap < 0 and uo_slope3 < 0:
         return "PUT", "Composite below signal and falling"
     return "NEUTRAL", "Mixed state"
 
@@ -499,6 +553,8 @@ def recommendation(call: str, severity: Dict[str, float], analogs: Dict[str, flo
         if analogs and analogs.get("ret_2_p_down", 0.5) > 0.62:
             return "PUT / analogs confirm"
         return "PUT setup forming"
+    if severity.get("late_cycle_flag", 0):
+        return "WAIT, aging trend"
     return "NEUTRAL / mixed"
 
 
