@@ -72,9 +72,16 @@ def normalize_rolling(series: pd.Series, window: int) -> pd.Series:
     return out.clip(0, 100)
 
 
+def _to_ny_index(idx) -> pd.DatetimeIndex:
+    idx = pd.to_datetime(idx)
+    if getattr(idx, "tz", None) is None:
+        return idx.tz_localize("America/New_York")
+    return idx.tz_convert("America/New_York")
+
+
 def anchored_intraday_vwap(df: pd.DataFrame) -> pd.Series:
     out = pd.Series(index=df.index, dtype=float)
-    local_idx = pd.to_datetime(df.index).tz_convert("America/New_York")
+    local_idx = _to_ny_index(df.index)
     day_keys = pd.Series(local_idx.date, index=df.index)
     for _, part in df.groupby(day_keys):
         tp = (part["High"] + part["Low"] + part["Close"]) / 3.0
@@ -171,7 +178,7 @@ def filter_regular_hours(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     x = df.copy()
-    local = x.index.tz_convert("America/New_York")
+    local = _to_ny_index(x.index)
     minutes = local.hour * 60 + local.minute
     keep = (minutes >= 570) & (minutes <= 930)
     return x.loc[keep]
@@ -181,12 +188,12 @@ def to_2h_session(df_1h: pd.DataFrame) -> pd.DataFrame:
     if df_1h.empty:
         return df_1h.copy()
     x = filter_regular_hours(df_1h).copy()
-    local_idx = x.index.tz_convert("America/New_York")
+    local_idx = _to_ny_index(x.index)
     days = pd.Series(local_idx.date, index=x.index)
     frames = []
     for _, part in x.groupby(days):
         part = part.sort_index().copy()
-        local_part = part.index.tz_convert("America/New_York")
+        local_part = _to_ny_index(part.index)
         minutes = local_part.hour * 60 + local_part.minute
         slot_map = {570: 0, 630: 0, 690: 1, 750: 1, 810: 2, 870: 2, 930: 3}
         part["slot"] = [slot_map.get(m, 99) for m in minutes]
