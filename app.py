@@ -1274,16 +1274,29 @@ if analog_summary:
 else:
     st.caption("No analog set available for this as-of date.")
 
+range_options = ["2W", "1M", "3M", "6M", "1Y", "2Y", "5Y", "10Y", "MAX"]
+
 st.markdown("### Mega view")
-plot_mega_view(selected, item["hourly"], item["tactical"], item["daily"], item["weekly"], item["asof"], tactical_label)
+mc1, mc2, mc3, mc4 = st.columns(4)
+mega_ranges = {
+    "1h": mc1.selectbox("Mega 1H Range", range_options, index=2, key="mega_range_1h"),
+    "2h": mc2.selectbox("Mega 2H Range", range_options, index=3, key="mega_range_2h"),
+    "daily": mc3.selectbox("Mega Daily Range", range_options, index=4, key="mega_range_daily"),
+    "weekly": mc4.selectbox("Mega Weekly Range", range_options, index=6, key="mega_range_weekly"),
+}
+plot_mega_view(selected, item["hourly"], item["tactical"], item["daily"], item["weekly"], item["asof"], tactical_label, mega_ranges)
 
 st.markdown("### Frame tabs")
 tab1, tab2, tab3, tab4 = st.tabs([hourly_label, tactical_label, "Daily", "Weekly"])
 with tab1:
-    plot_single_frame(selected, item["hourly"].tail(260) if not item["hourly"].empty else item["daily"].tail(260), item["hourly"].tail(260), item["asof"], hourly_label)
+    range_1h = st.selectbox("1H Range", range_options, index=2, key="tab_range_1h")
+    plot_single_frame(selected, item["hourly"] if not item["hourly"].empty else item["daily"], item["hourly"] if not item["hourly"].empty else item["daily"], item["asof"], hourly_label, range_1h)
 with tab2:
-    plot_single_frame(selected, item["tactical"].tail(260) if not item["tactical"].empty else item["daily"].tail(260), item["tactical"].tail(260), item["asof"], tactical_label)
+    range_2h = st.selectbox("2H Range", range_options, index=3, key="tab_range_2h")
+    plot_single_frame(selected, item["tactical"] if not item["tactical"].empty else item["daily"], item["tactical"] if not item["tactical"].empty else item["daily"], item["asof"], tactical_label, range_2h)
 with tab3:
-    plot_single_frame(selected, item["daily"].tail(260), item["daily"].tail(260), item["asof"], "Daily Ultimate Oscillator")
+    range_daily = st.selectbox("Daily Range", range_options, index=4, key="tab_range_daily")
+    plot_single_frame(selected, item["daily"], item["daily"], item["asof"], "Daily Ultimate Oscillator", range_daily)
 with tab4:
-    plot_single_frame(selected, item["weekly"].tail(160), item["weekly"].tail(160), item["asof"], "Weekly Ultimate Oscillator")
+    range_weekly = st.selectbox("Weekly Range", range_options, index=6, key="tab_range_weekly")
+    plot_single_frame(selected, item["weekly"], item["weekly"], item["asof"], "Weekly Ultimate Oscillator", range_weekly)
