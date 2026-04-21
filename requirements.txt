@@ -3,7 +3,6 @@ pandas>=2.0
 numpy>=1.26
 plotly>=5.20
 requests>=2.31
-yfinance>=0.2.37
 alpaca-py>=0.21.0
 python-dateutil>=2.9
 pytz>=2024.1
