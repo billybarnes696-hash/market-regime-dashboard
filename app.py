@@ -13,21 +13,20 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 
-# ----------------------------- Page setup -----------------------------
 st.set_page_config(
-    page_title="Stable Market Engine · TSI Heat Dashboard",
+    page_title="Stable Market Engine · TSI Cross Dashboard",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 Stable Market Engine · TSI Heat Dashboard")
+st.title("📈 Stable Market Engine · TSI Cross Dashboard")
 st.caption(
-    "Alpaca-only feed. Same visual framework, with a TSI-centered heat engine using "
-    "CCI, RSI, BB%, VWAP stretch, and price behavior."
+    "Alpaca-only feed. Raw TSI(25,13,7) cross is the primary trigger. "
+    "CCI, RSI, BB%, VWAP stretch, and price behavior qualify the signal. "
+    "1H/2H can be viewed as Real, Proxy-from-Daily, or both."
 )
 
 
-# ----------------------------- Indicator helpers -----------------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False, min_periods=max(2, span // 2)).mean()
 
@@ -126,48 +125,14 @@ def regime_bucket(tsi_heat: float, stretch_heat: float) -> str:
     return "Neutral"
 
 
-def state_from_row(row: pd.Series) -> str:
-    heat = row["Heat_osc"]
-    hs = row["Heat_slope"]
-    ts = row["TSI_slope"]
-    price_chg = row["Price_lookback_ret"]
-
-    if pd.isna(heat):
-        return "Neutral"
-    if heat >= 85:
-        if hs < 0 and ts < 0:
-            if abs(price_chg) < 0.0035:
-                return "Overheated · Rolling, No Price Damage"
-            return "Overheated · Rolling"
-        if hs >= 0:
-            return "Overheated · Supported"
-        return "Overheated"
-    if heat >= 68:
-        if hs < 0:
-            return "Warm · Fading"
-        return "Warm"
-    if heat <= 15:
-        if hs > 0 and ts > 0:
-            return "Oversold · Bull Turn"
-        return "Oversold"
-    if heat <= 32:
-        if hs > 0:
-            return "Cooling · Improving"
-        return "Cooling"
-    return "Neutral"
-
-
 def traffic_emoji(state: str) -> str:
-    if "Overheated" in state:
+    if state.startswith("PUT"):
         return "🔴"
-    if "Warm" in state:
-        return "🟠"
-    if "Oversold" in state or "Cooling" in state:
+    if state.startswith("CALL"):
         return "🟢"
     return "🟡"
 
 
-# ----------------------------- Alpaca loading -----------------------------
 def _normalize_bars_df(bars_df: pd.DataFrame) -> pd.DataFrame:
     if bars_df is None or len(bars_df) == 0:
         return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -190,10 +155,7 @@ def fetch_alpaca_bars(symbol: str, timeframe_name: str, years_back: int, api_key
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=int(years_back * 366))
 
-    tf_map = {
-        "1H": TimeFrame.Hour,
-        "1D": TimeFrame.Day,
-    }
+    tf_map = {"1H": TimeFrame.Hour, "1D": TimeFrame.Day}
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=tf_map[timeframe_name],
@@ -202,18 +164,47 @@ def fetch_alpaca_bars(symbol: str, timeframe_name: str, years_back: int, api_key
         feed=feed,
         adjustment="all",
     )
-    bars = client.get_stock_bars(req).df
-    return _normalize_bars_df(bars)
+    return _normalize_bars_df(client.get_stock_bars(req).df)
 
 
-def to_2h(df_1h: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame()
-    out["Open"] = df_1h["Open"].resample("2h").first()
-    out["High"] = df_1h["High"].resample("2h").max()
-    out["Low"] = df_1h["Low"].resample("2h").min()
-    out["Close"] = df_1h["Close"].resample("2h").last()
-    out["Volume"] = df_1h["Volume"].resample("2h").sum(min_count=1)
-    return out.dropna(subset=["Open", "High", "Low", "Close"])
+def filter_regular_hours(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    x = df.copy()
+    local = x.index.tz_convert("America/New_York")
+    minutes = local.hour * 60 + local.minute
+    keep = (minutes >= 570) & (minutes <= 930)
+    return x.loc[keep]
+
+
+def to_2h_session(df_1h: pd.DataFrame) -> pd.DataFrame:
+    if df_1h.empty:
+        return df_1h.copy()
+    x = filter_regular_hours(df_1h).copy()
+    local_idx = x.index.tz_convert("America/New_York")
+    days = pd.Series(local_idx.date, index=x.index)
+    frames = []
+    for _, part in x.groupby(days):
+        part = part.sort_index().copy()
+        local_part = part.index.tz_convert("America/New_York")
+        minutes = local_part.hour * 60 + local_part.minute
+        slot_map = {570: 0, 630: 0, 690: 1, 750: 1, 810: 2, 870: 2, 930: 3}
+        part["slot"] = [slot_map.get(m, 99) for m in minutes]
+        for _, grp in part.groupby("slot"):
+            grp = grp.sort_index()
+            if grp.empty or grp["slot"].iloc[0] == 99:
+                continue
+            row = pd.DataFrame({
+                "Open": [grp["Open"].iloc[0]],
+                "High": [grp["High"].max()],
+                "Low": [grp["Low"].min()],
+                "Close": [grp["Close"].iloc[-1]],
+                "Volume": [grp["Volume"].sum()],
+            }, index=[grp.index[-1]])
+            frames.append(row)
+    if not frames:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    return pd.concat(frames).sort_index()
 
 
 def to_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
@@ -226,29 +217,60 @@ def to_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["Open", "High", "Low", "Close"])
 
 
-# ----------------------------- Feature engine -----------------------------
+def build_proxy_intraday_from_daily(daily: pd.DataFrame, mode: str) -> pd.DataFrame:
+    if daily.empty:
+        return daily.copy()
+    records = []
+    anchors = ["10:30", "11:30", "12:30", "13:30", "14:30", "15:30"] if mode == "1H" else ["11:30", "13:30", "15:30"]
+    reps = len(anchors)
+    for ts, row in daily.iterrows():
+        base_ts = ts.tz_convert("America/New_York")
+        for a in anchors:
+            hh, mm = map(int, a.split(":"))
+            new_ts = pd.Timestamp(year=base_ts.year, month=base_ts.month, day=base_ts.day, hour=hh, minute=mm, tz="America/New_York")
+            records.append({
+                "timestamp": new_ts,
+                "Open": row["Open"],
+                "High": row["High"],
+                "Low": row["Low"],
+                "Close": row["Close"],
+                "Volume": row["Volume"] / reps if pd.notna(row["Volume"]) else np.nan,
+            })
+    return pd.DataFrame(records).set_index("timestamp").sort_index()
+
+
+def classify_state(row: pd.Series) -> str:
+    tsi_val, tsi_sig = row["TSI"], row["TSI_signal"]
+    tsi_slope, gap = row["TSI_slope"], row["TSI_gap"]
+    heat, price_chg = row["Exhaustion_score"], row["Price_lookback_ret"]
+    if tsi_val < tsi_sig:
+        if heat >= 72:
+            return "PUT · Exhausted, No Price Damage" if abs(price_chg) < 0.004 else "PUT · Exhausted"
+        return "PUT · Bearish" if (tsi_slope < 0 or gap < 0) else "NEUTRAL · Transition"
+    if tsi_val > tsi_sig:
+        if heat <= 28 and tsi_slope > 0:
+            return "CALL · Oversold Bull Turn"
+        return "CALL · Bullish" if (tsi_slope > 0 or gap > 0) else "NEUTRAL · Transition"
+    return "NEUTRAL · Transition"
+
+
 def compute_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     x = df.copy()
-
     x["EMA10"] = ema(x["Close"], 10)
     x["EMA20"] = ema(x["Close"], 20)
     x["SMA50"] = x["Close"].rolling(50, min_periods=10).mean()
-
     x["TSI"], x["TSI_signal"] = tsi(x["Close"], 25, 13, 7)
+    x["TSI_gap"] = x["TSI"] - x["TSI_signal"]
     x["RSI"] = rsi(x["Close"], 14)
     x["CCI"] = cci(x, 20)
     x["BBPct"] = bb_pct(x["Close"], 20, 2.0)
 
-    if tf in ["1H", "2H"]:
+    if tf in ["1H", "2H", "1H_PROXY", "2H_PROXY"]:
         x["VWAP"] = anchored_intraday_vwap(x)
-        roll_window = 140
-        div_lb = 10
-        price_lb = 4
+        roll_window, div_lb, price_lb = 140, 10, 4
     else:
         x["VWAP"] = rolling_vwap(x, 20)
-        roll_window = 252
-        div_lb = 6
-        price_lb = 3
+        roll_window, div_lb, price_lb = 252, 6, 3
 
     x["Dist_EMA10"] = 100 * (x["Close"] / x["EMA10"] - 1)
     x["Dist_VWAP"] = 100 * (x["Close"] / x["VWAP"] - 1)
@@ -259,222 +281,152 @@ def compute_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     x["RSI_heat"] = x["RSI"].clip(0, 100)
     x["BB_heat"] = (x["BBPct"] * 100).clip(0, 100)
     x["Stretch_heat"] = normalize_rolling(x["Dist_EMA10"] + 0.5 * x["Dist_VWAP"].fillna(0), roll_window)
+    raw_exhaust = 0.25*x["TSI_heat"] + 0.25*x["CCI_heat"] + 0.15*x["RSI_heat"] + 0.20*x["BB_heat"] + 0.15*x["Stretch_heat"]
+    x["Exhaustion_score"] = ema(raw_exhaust, 4)
 
-    x["Heat_osc"] = (
-        0.40 * x["TSI_heat"]
-        + 0.18 * x["CCI_heat"]
-        + 0.14 * x["RSI_heat"]
-        + 0.16 * x["BB_heat"]
-        + 0.12 * x["Stretch_heat"]
-    )
-    x["Heat_signal"] = ema(x["Heat_osc"], 5)
-    x["Heat_slope"] = slope(x["Heat_osc"], 3)
     x["TSI_slope"] = slope(x["TSI"], 3)
-    x["Divergence"] = recent_divergence(x["Close"], x["Heat_osc"], div_lb)
-    x["State"] = x.apply(state_from_row, axis=1)
+    x["Exhaustion_slope"] = slope(x["Exhaustion_score"], 3)
+    x["Divergence"] = recent_divergence(x["Close"], x["TSI"], div_lb)
     x["Regime_bucket"] = [regime_bucket(a, b) for a, b in zip(x["TSI_heat"], x["Stretch_heat"])]
-
+    x["State"] = x.apply(classify_state, axis=1)
     return x
 
 
 def merge_higher_state(lower_df: pd.DataFrame, higher_df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["State", "Regime_bucket", "Heat_osc", "Heat_slope", "TSI_slope"]
+    cols = ["State", "Regime_bucket", "TSI", "TSI_signal", "TSI_gap", "TSI_slope"]
     tmp = higher_df[cols].copy().sort_index()
-    out = pd.merge_asof(
-        lower_df.sort_index(),
-        tmp,
-        left_index=True,
-        right_index=True,
-        direction="backward",
-        suffixes=("", "_higher"),
-    )
-    out = out.rename(columns={
+    out = pd.merge_asof(lower_df.sort_index(), tmp, left_index=True, right_index=True, direction="backward", suffixes=("", "_higher"))
+    return out.rename(columns={
         "State_higher": "Higher_State",
         "Regime_bucket_higher": "Higher_Regime",
-        "Heat_osc_higher": "Higher_Heat",
-        "Heat_slope_higher": "Higher_Heat_slope",
+        "TSI_higher": "Higher_TSI",
+        "TSI_signal_higher": "Higher_TSI_signal",
+        "TSI_gap_higher": "Higher_TSI_gap",
         "TSI_slope_higher": "Higher_TSI_slope",
     })
-    return out
 
 
-# ----------------------------- Analogs -----------------------------
 FWD_BARS = {"1H": [1, 3, 6, 12], "2H": [1, 2, 4, 8], "Daily": [1, 2, 5, 10], "Weekly": [1, 2, 4, 8]}
 
-def analog_summary(df: pd.DataFrame, tf: str) -> Tuple[dict, pd.DataFrame]:
-    max_fwd = max(FWD_BARS[tf])
+def analog_summary(df: pd.DataFrame, tf_key: str) -> Tuple[dict, pd.DataFrame]:
+    max_fwd = max(FWD_BARS[tf_key])
     if len(df) <= max_fwd + 20:
         return {}, pd.DataFrame()
-
     base = df.iloc[:-max_fwd].copy()
     cur = df.iloc[-1]
-
     mask = base["State"].eq(cur["State"]) & base["Higher_Regime"].eq(cur["Higher_Regime"])
     if cur["Divergence"] in ["Bearish", "Bullish"]:
         mask &= base["Divergence"].eq(cur["Divergence"])
-
     matches = base.loc[mask].copy()
     if len(matches) < 15:
         matches = base.loc[base["State"].eq(cur["State"]) & base["Higher_Regime"].eq(cur["Higher_Regime"])].copy()
-
     if matches.empty:
         return {}, pd.DataFrame()
 
     fwd = pd.DataFrame(index=matches.index)
-    for h in FWD_BARS[tf]:
+    for h in FWD_BARS[tf_key]:
         fwd[f"ret_{h}"] = df["Close"].shift(-h).reindex(matches.index) / df["Close"].reindex(matches.index) - 1
-
-    path_labels = []
-    mid_h = FWD_BARS[tf][min(2, len(FWD_BARS[tf]) - 1)]
-    for idx in matches.index:
-        path = df.loc[idx:].iloc[: mid_h + 1]
-        if len(path) < mid_h + 1:
-            path_labels.append(np.nan)
-            continue
-        ret_end = path["Close"].iloc[-1] / path["Close"].iloc[0] - 1
-        max_dd = (path["Close"] / path["Close"].cummax() - 1).min()
-        if max_dd > -0.004 and abs(ret_end) < 0.003:
-            path_labels.append("Sideways cool")
-        elif ret_end > 0 and max_dd < -0.01:
-            path_labels.append("Corrective dip then resume")
-        elif ret_end < 0:
-            path_labels.append("Correction extends")
-        else:
-            path_labels.append("Mixed")
-    fwd["Path"] = path_labels
-
-    stats = {"sample": int(len(matches))}
-    for h in FWD_BARS[tf]:
-        s = fwd[f"ret_{h}"].dropna()
-        if len(s):
-            stats[f"median_{h}"] = float(s.median())
-            stats[f"up_pct_{h}"] = float((s > 0).mean())
-    mix = fwd["Path"].value_counts(normalize=True)
-    for k, v in mix.items():
-        stats[f"path_{k}"] = float(v)
-
-    return stats, fwd
+    return {"sample": int(len(matches))}, fwd
 
 
-def prediction_text(tf: str, row: pd.Series, stats: dict) -> str:
+def prediction_text(tf_key: str, row: pd.Series, stats: dict) -> str:
     if not stats:
-        return f"{tf}: not enough conditioned analogs yet."
-
-    horizon = FWD_BARS[tf][min(1, len(FWD_BARS[tf]) - 1)]
-    med = stats.get(f"median_{horizon}", np.nan)
-    up = stats.get(f"up_pct_{horizon}", np.nan)
-    resume = stats.get("path_Corrective dip then resume", 0.0)
-    extend = stats.get("path_Correction extends", 0.0)
-    sideways = stats.get("path_Sideways cool", 0.0)
-
-    if resume >= max(extend, sideways):
-        path = "corrective dip then resume"
-    elif extend >= sideways:
-        path = "correction extends"
-    else:
-        path = "sideways cool"
-
-    return (
-        f"{tf}: {row['State']}. Higher timeframe regime is {row['Higher_Regime']}. "
-        f"Conditioned analogs show median move over the next {horizon} bars of {med:.2%}, "
-        f"up-rate {up:.0%}, and the most common path is '{path}'."
-    )
+        return f"{tf_key}: not enough conditioned analogs yet."
+    return f"{tf_key}: {row['State']}. Higher timeframe regime is {row['Higher_Regime']}. Sample size {stats['sample']}."
 
 
-# ----------------------------- Charts / interpretation -----------------------------
-def make_panel(df: pd.DataFrame, bars: int) -> go.Figure:
+def make_panel(df: pd.DataFrame, bars: int, label: str, overlay_df: pd.DataFrame = None, overlay_label: str = None) -> go.Figure:
     d = df.tail(bars).copy()
-
     fig = go.Figure()
-    fig.add_trace(
-        go.Candlestick(
-            x=d.index,
-            open=d["Open"],
-            high=d["High"],
-            low=d["Low"],
-            close=d["Close"],
-            name="Price",
-            yaxis="y",
-        )
-    )
+    fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Price", yaxis="y"))
     fig.add_trace(go.Scatter(x=d.index, y=d["EMA20"], name="EMA20", yaxis="y"))
     fig.add_trace(go.Scatter(x=d.index, y=d["SMA50"], name="SMA50", yaxis="y"))
-    fig.add_trace(go.Scatter(x=d.index, y=d["Heat_osc"], name="TSI Heat", yaxis="y2"))
-    fig.add_trace(go.Scatter(x=d.index, y=d["Heat_signal"], name="Signal", yaxis="y2"))
-    fig.add_trace(go.Scatter(x=d.index, y=d["TSI_heat"], name="TSI Core", yaxis="y2", line={"dash": "dot"}, opacity=0.55))
-
-    fig.update_layout(
-        height=650,
-        margin=dict(l=10, r=10, t=20, b=10),
-        xaxis=dict(domain=[0, 1], rangeslider_visible=False),
-        yaxis=dict(domain=[0.36, 1.0], title="Price"),
-        yaxis2=dict(domain=[0, 0.28], title="Heat", range=[0, 100]),
-        legend=dict(orientation="h"),
-    )
+    fig.add_trace(go.Scatter(x=d.index, y=d["TSI"], name=f"{label} TSI", yaxis="y2"))
+    fig.add_trace(go.Scatter(x=d.index, y=d["TSI_signal"], name=f"{label} Signal", yaxis="y2"))
+    if overlay_df is not None and overlay_label is not None:
+        od = overlay_df.tail(bars).copy()
+        fig.add_trace(go.Scatter(x=od.index, y=od["TSI"], name=f"{overlay_label} TSI", yaxis="y2", line={"dash": "dot"}))
+        fig.add_trace(go.Scatter(x=od.index, y=od["TSI_signal"], name=f"{overlay_label} Signal", yaxis="y2", line={"dash": "dash"}))
+    fig.add_trace(go.Scatter(x=d.index, y=d["Exhaustion_score"], name="Exhaustion", yaxis="y3", opacity=0.55))
+    fig.update_layout(height=700, margin=dict(l=10, r=10, t=20, b=10), xaxis=dict(domain=[0,1], rangeslider_visible=False),
+                      yaxis=dict(domain=[0.42,1.0], title="Price"), yaxis2=dict(domain=[0.18,0.38], title="TSI"),
+                      yaxis3=dict(domain=[0.0,0.12], title="Exhaust", range=[0,100]), legend=dict(orientation="h"))
+    fig.add_hline(y=0, yref="y2", line_dash="dash", opacity=0.3)
     for y in [15, 32, 68, 85]:
-        fig.add_hline(y=y, yref="y2", line_dash="dash", opacity=0.35)
+        fig.add_hline(y=y, yref="y3", line_dash="dash", opacity=0.25)
     return fig
 
 
 def stacked_message(rows: Dict[str, pd.Series]) -> str:
     h1, h2, d, w = rows["1H"], rows["2H"], rows["Daily"], rows["Weekly"]
+    if h1["State"].startswith("PUT") and h2["State"].startswith("CALL") and d["Regime_bucket"] in ["Strong", "Strong & Extended"]:
+        return "1H has rolled bearish, but 2H and Daily are still supportive."
+    if h2["State"].startswith("PUT") and d["Regime_bucket"] in ["Strong", "Strong & Extended"]:
+        return "2H TSI is below signal inside a still-strong Daily regime."
+    if h2["State"].startswith("PUT") and d["Regime_bucket"] in ["Fading", "Weak"]:
+        return "2H bearish cross is aligned with a fading Daily regime."
+    if h1["State"].startswith("CALL") and d["Regime_bucket"] in ["Strong", "Strong & Extended"]:
+        return "1H has made a bullish turn while Daily still holds."
+    if d["State"].startswith("PUT") and w["Regime_bucket"] in ["Fading", "Weak"]:
+        return "Daily is bearish and Weekly is no longer supportive."
+    return "Mixed stack. Respect the higher timeframe."
 
-    if "Overheated" in h1["State"] and h2["Heat_slope"] >= 0 and d["Regime_bucket"] in ["Strong", "Strong & Extended"]:
-        return "1H is overheated, but 2H and Daily remain supportive. That is tactical heat, not confirmed regression yet."
-    if "Overheated" in h2["State"] and d["Regime_bucket"] in ["Strong", "Strong & Extended"]:
-        return "2H overheat is showing inside a still-strong Daily regime. Corrective regression risk is up, but bounce/resume is still a common path."
-    if "Overheated" in h2["State"] and d["Regime_bucket"] in ["Fading", "Weak"]:
-        return "2H overheat is aligned with a fading Daily regime. That raises the odds that weakness spreads upward in timeframe."
-    if "Bull Turn" in h1["State"] and d["Regime_bucket"] in ["Strong", "Strong & Extended"]:
-        return "1H has made a bull turn while Daily still holds. Watch for the lower timeframe dip to get absorbed by the broader trend."
-    if d["Regime_bucket"] in ["Fading", "Weak"] and w["Regime_bucket"] in ["Fading", "Weak"]:
-        return "Daily and Weekly are both deteriorating. This is no longer just hourly exhaustion; it is closer to regime fragility."
-    return "Mixed stack. Respect the higher timeframe before assuming the hourly signal will produce durable price regression."
-
-
-# ----------------------------- Sidebar -----------------------------
 with st.sidebar:
     st.header("Credentials")
     api_key = st.text_input("Alpaca API key", type="password", value=os.getenv("ALPACA_API_KEY", ""))
     secret_key = st.text_input("Alpaca API secret", type="password", value=os.getenv("ALPACA_SECRET_KEY", ""))
     feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0)
-
     st.header("Input")
     symbol = st.text_input("Select symbol", value="QQQ").strip().upper()
-
     st.header("Settings")
     intraday_years = st.slider("Intraday years (1H/2H)", 1, 2, 2)
     higher_years = st.slider("Daily/Weekly years", 3, 15, 10)
     bars_to_show = st.slider("Bars to show", 100, 400, 180, 20)
+    intraday_source = st.selectbox("Intraday source", ["Real Alpaca", "Proxy from Daily", "Both (overlay)"], index=0)
     force_refresh = st.checkbox("Force refresh data (clear cache)", value=False)
 
 if force_refresh:
     st.cache_data.clear()
-
 if not symbol:
     st.stop()
 if not api_key or not secret_key:
     st.warning("Enter your Alpaca API key and secret to use Alpaca bars.")
     st.stop()
 
-# ----------------------------- Load data -----------------------------
 with st.spinner(f"Loading Alpaca 1H bars for {symbol}..."):
-    intraday_1h = fetch_alpaca_bars(symbol, "1H", intraday_years, api_key, secret_key, feed)
-
+    intraday_1h_real = fetch_alpaca_bars(symbol, "1H", intraday_years, api_key, secret_key, feed)
 with st.spinner(f"Loading Alpaca daily bars for {symbol}..."):
     daily = fetch_alpaca_bars(symbol, "1D", higher_years, api_key, secret_key, feed)
 
-if intraday_1h.empty or daily.empty:
+if intraday_1h_real.empty or daily.empty:
     st.error("No data returned from Alpaca. Check symbol, credentials, and feed.")
     st.stop()
 
-intraday_2h = to_2h(intraday_1h)
+intraday_1h_real = filter_regular_hours(intraday_1h_real)
+intraday_2h_real = to_2h_session(intraday_1h_real)
+intraday_1h_proxy = build_proxy_intraday_from_daily(daily, "1H")
+intraday_2h_proxy = build_proxy_intraday_from_daily(daily, "2H")
 weekly = to_weekly(daily)
 
-feat_1h = compute_features(intraday_1h, "1H")
-feat_2h = compute_features(intraday_2h, "2H")
+feat_1h_real = compute_features(intraday_1h_real, "1H")
+feat_2h_real = compute_features(intraday_2h_real, "2H")
+feat_1h_proxy = compute_features(intraday_1h_proxy, "1H_PROXY")
+feat_2h_proxy = compute_features(intraday_2h_proxy, "2H_PROXY")
 feat_daily = compute_features(daily, "Daily")
 feat_weekly = compute_features(weekly, "Weekly")
+
+if intraday_source == "Real Alpaca":
+    feat_1h, feat_2h = feat_1h_real.copy(), feat_2h_real.copy()
+    overlay_1h = overlay_2h = None
+    active_1h_label, active_2h_label = "Real 1H", "Real 2H"
+elif intraday_source == "Proxy from Daily":
+    feat_1h, feat_2h = feat_1h_proxy.copy(), feat_2h_proxy.copy()
+    overlay_1h = overlay_2h = None
+    active_1h_label, active_2h_label = "Proxy 1H", "Proxy 2H"
+else:
+    feat_1h, feat_2h = feat_1h_real.copy(), feat_2h_real.copy()
+    overlay_1h, overlay_2h = feat_1h_proxy.copy(), feat_2h_proxy.copy()
+    active_1h_label, active_2h_label = "Real 1H", "Real 2H"
 
 feat_1h = merge_higher_state(feat_1h, feat_2h)
 feat_2h = merge_higher_state(feat_2h, feat_daily)
@@ -485,91 +437,71 @@ feat_weekly["Higher_Regime"] = feat_weekly["Regime_bucket"]
 frames = {"1H": feat_1h, "2H": feat_2h, "Daily": feat_daily, "Weekly": feat_weekly}
 latest = {k: v.iloc[-1] for k, v in frames.items()}
 
-# ----------------------------- Header / traffic lights -----------------------------
 st.subheader("Traffic lights")
 c1, c2, c3, c4 = st.columns(4)
 for col, tf in zip([c1, c2, c3, c4], ["1H", "2H", "Daily", "Weekly"]):
     row = latest[tf]
     with col:
-        st.metric(tf, f"{traffic_emoji(row['State'])} {row['State']}")
+        label_prefix = "Proxy " if (tf in ["1H","2H"] and intraday_source == "Proxy from Daily") else ""
+        st.metric(f"{label_prefix}{tf}", f"{traffic_emoji(row['State'])} {row['State']}")
         st.caption(f"Regime: {row['Regime_bucket']}")
         st.caption(f"Divergence: {row['Divergence']}")
 
 st.subheader("Combined")
 st.info(stacked_message(latest))
 
-# ----------------------------- Tabs -----------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["1-Hour (Real)", "2-Hour (Real)", "Daily", "Weekly"])
+if intraday_source == "Both (overlay)":
+    st.markdown("#### Real vs Proxy quick compare")
+    c1, c2 = st.columns(2)
+    with c1:
+        r, p = feat_1h_real.iloc[-1], feat_1h_proxy.iloc[-1]
+        st.write(f"**1H Real:** {r['State']}")
+        st.write(f"**1H Proxy:** {p['State']}")
+        st.write(f"TSI gap Real / Proxy: **{r['TSI_gap']:.2f} / {p['TSI_gap']:.2f}**")
+    with c2:
+        r, p = feat_2h_real.iloc[-1], feat_2h_proxy.iloc[-1]
+        st.write(f"**2H Real:** {r['State']}")
+        st.write(f"**2H Proxy:** {p['State']}")
+        st.write(f"TSI gap Real / Proxy: **{r['TSI_gap']:.2f} / {p['TSI_gap']:.2f}**")
 
-for tab, tf, label in [
-    (tab1, "1H", "1-Hour (Real)"),
-    (tab2, "2H", "2-Hour (Real)"),
-    (tab3, "Daily", "Daily"),
-    (tab4, "Weekly", "Weekly"),
-]:
+tab1, tab2, tab3, tab4 = st.tabs(["1-Hour", "2-Hour", "Daily", "Weekly"])
+for tab, tf, label, tf_key in [(tab1,"1H",active_1h_label,"1H"),(tab2,"2H",active_2h_label,"2H"),(tab3,"Daily","Daily","Daily"),(tab4,"Weekly","Weekly","Weekly")]:
     with tab:
         df = frames[tf]
         row = df.iloc[-1]
-        stats, paths = analog_summary(df, tf)
-
-        left, right = st.columns([2.2, 1.2], vertical_alignment="top")
+        stats, paths = analog_summary(df, tf_key)
+        left, right = st.columns([2.2,1.2], vertical_alignment="top")
         with left:
-            st.plotly_chart(make_panel(df, bars_to_show), use_container_width=True)
-
+            overlay_df = overlay_1h if (intraday_source=="Both (overlay)" and tf=="1H") else overlay_2h if (intraday_source=="Both (overlay)" and tf=="2H") else None
+            overlay_label = "Proxy 1H" if (intraday_source=="Both (overlay)" and tf=="1H") else "Proxy 2H" if (intraday_source=="Both (overlay)" and tf=="2H") else None
+            st.plotly_chart(make_panel(df, bars_to_show, label, overlay_df, overlay_label), use_container_width=True)
         with right:
             st.markdown(f"### {label}")
             st.write(f"State: **{row['State']}**")
             st.write(f"Higher timeframe regime: **{row['Higher_Regime']}**")
-            st.write(f"Heat oscillator: **{row['Heat_osc']:.1f}**")
-            st.write(f"Signal gap: **{(row['Heat_osc'] - row['Heat_signal']):.1f}**")
             st.write(f"TSI(25,13,7): **{row['TSI']:.1f}**")
-            st.write(f"RSI(14): **{row['RSI']:.1f}**")
-            st.write(f"CCI(20): **{row['CCI']:.1f}**")
-            st.write(f"%B(20,2): **{row['BBPct']:.2f}**")
-            st.write(f"Dist EMA10: **{row['Dist_EMA10']:.2f}%**")
-            if pd.notna(row["Dist_VWAP"]):
-                st.write(f"Dist VWAP: **{row['Dist_VWAP']:.2f}%**")
-            st.write(f"Heat slope: **{'Falling' if row['Heat_slope'] < 0 else 'Rising'}**")
-            st.write(f"TSI slope: **{'Falling' if row['TSI_slope'] < 0 else 'Rising'}**")
-            st.write(f"Divergence: **{row['Divergence']}**")
-
+            st.write(f"TSI Signal: **{row['TSI_signal']:.1f}**")
+            st.write(f"TSI Gap: **{row['TSI_gap']:.2f}**")
+            st.write(f"Exhaustion score: **{row['Exhaustion_score']:.1f}**")
+            if intraday_source == "Both (overlay)" and tf in ["1H","2H"]:
+                comp = overlay_1h.iloc[-1] if tf=="1H" else overlay_2h.iloc[-1]
+                st.markdown("### Proxy compare")
+                st.write(f"Proxy state: **{comp['State']}**")
+                st.write(f"Proxy TSI gap: **{comp['TSI_gap']:.2f}**")
             st.markdown("### Historical analogs")
             if stats:
                 st.write(f"Sample size: **{stats['sample']}**")
-                for h in FWD_BARS[tf]:
-                    if f"median_{h}" in stats:
-                        st.write(f"{h} bars ahead: median **{stats[f'median_{h}']:.2%}**, up-rate **{stats[f'up_pct_{h}']:.0%}**")
-                if "path_Corrective dip then resume" in stats:
-                    st.write(f"Corrective dip then resume: **{stats['path_Corrective dip then resume']:.0%}**")
-                if "path_Correction extends" in stats:
-                    st.write(f"Correction extends: **{stats['path_Correction extends']:.0%}**")
-                if "path_Sideways cool" in stats:
-                    st.write(f"Sideways cool: **{stats['path_Sideways cool']:.0%}**")
-                st.success(prediction_text(tf, row, stats))
+                st.success(prediction_text(tf_key, row, stats))
             else:
                 st.warning("Not enough conditioned analogs for the current state bucket yet.")
 
-        if not paths.empty:
-            st.markdown("#### Analog path mix")
-            path_mix = paths["Path"].value_counts(normalize=True).rename("Share").reset_index()
-            path_mix.columns = ["Path", "Share"]
-            st.dataframe(path_mix, use_container_width=True)
-
 with st.expander("How this version works"):
-    st.markdown(
-        """
-- **Alpaca-only bars** for 1H, 2H, Daily, and Weekly.
-- **Same style dashboard**: traffic lights, tabs, price + oscillator, summary panel, analogs.
-- **TSI-centered engine** with CCI / RSI / Bollinger %B / VWAP stretch layered in.
-- Exhaustion is determined from:
-  - TSI level and slope,
-  - price stretch,
-  - price behavior,
-  - and higher timeframe confirmation.
-- The dashboard is designed to say things like:
-  - **1H overheated but no price damage yet**
-  - **2H overheated inside strong Daily**
-  - **1H bull turn while Daily holds**
-  - **weakness spreading upward in timeframe**
-"""
-    )
+    st.markdown("""
+- **Primary trigger = raw TSI(25,13,7) cross**
+- **Alpaca-only bars** for real 1H, 2H, Daily, and Weekly
+- **Proxy 1H / 2H from Daily** can be viewed instead of real intraday, or overlaid for comparison
+- **CCI / RSI / BB% / VWAP stretch** qualify whether the cross is exhausted, supported, or weak
+- In **Both (overlay)** mode:
+  - Real 1H/2H remains the active decision engine
+  - Proxy 1H/2H appears as a comparison overlay so you can compare structure vs real-time motion
+""")
