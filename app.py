@@ -421,13 +421,21 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
         "daily": 5,
         "weekly": 3,
     }
-    post_smooth_map = {
+    decision_smooth_map = {
         "hourly_proxy": 2,
         "real_1hour": 2,
         "2hour_proxy": 2,
-        "real_2hour": 3,
+        "real_2hour": 2,
         "daily": 1,
         "weekly": 1,
+    }
+    viz_smooth_map = {
+        "hourly_proxy": 6,
+        "real_1hour": 7,
+        "2hour_proxy": 6,
+        "real_2hour": 8,
+        "daily": 3,
+        "weekly": 2,
     }
 
     fast, slow, sig = spans[timeframe_name]
@@ -441,8 +449,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     adx_dir = np.sign(out["tsi_gap"].fillna(0.0) + out["uo_seed_dir"].fillna(0.0))
     adx_n = (((out["adx_14"].fillna(18.0) - 18.0) / 22.0).clip(-1.0, 1.0)) * adx_dir.replace(0, 1)
 
-    # Slightly de-emphasize VWAP in higher timeframes; keep it meaningful intraday.
-    if timeframe_name in {"real_2hour", "2hour_proxy", "hourly_proxy"}:
+    if timeframe_name in {"real_1hour", "real_2hour", "2hour_proxy", "hourly_proxy"}:
         weights = dict(tsi=0.31, cci=0.22, bb=0.14, vwap=0.15, adx=0.10, z=0.08)
     elif timeframe_name == "daily":
         weights = dict(tsi=0.32, cci=0.20, bb=0.16, vwap=0.08, adx=0.12, z=0.12)
@@ -458,26 +465,34 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
         + weights["z"] * z_n
     )
 
-    # Mild pinning penalty on tactical frames only: if price rises while TSI is flat and CCI fades,
-    # keep the oscillator from spuriously re-accelerating.
-    if timeframe_name in {"real_2hour", "2hour_proxy", "hourly_proxy"}:
+    if timeframe_name in {"real_1hour", "real_2hour", "2hour_proxy", "hourly_proxy"}:
         pin_penalty = 0.12 * out["pinning_up_flag"].fillna(0.0) - 0.12 * out["pinning_down_flag"].fillna(0.0)
         out["uo_base"] = out["uo_base"] - pin_penalty
 
     pre_smooth = pre_smooth_map[timeframe_name]
     out["uo_base_sm"] = ema(out["uo_base"], pre_smooth) if pre_smooth > 1 else out["uo_base"]
     out["uo_raw"] = ema(out["uo_base_sm"], fast) - ema(out["uo_base_sm"], slow)
-    post_smooth = post_smooth_map[timeframe_name]
-    out["uo"] = ema(out["uo_raw"], post_smooth) if post_smooth > 1 else out["uo_raw"]
-    out["uo_signal"] = ema(out["uo"], sig)
-    out["uo_gap"] = out["uo"] - out["uo_signal"]
-    out["uo_slope_1"] = out["uo"].diff(1)
-    out["uo_slope_3"] = out["uo"].diff(3)
-    lookback = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"} else 252
-    out["uo_pctile"] = true_percentile(out["uo"], lookback)
 
-    out["uo_above_signal"] = (out["uo"] > out["uo_signal"]).astype(int)
-    out["uo_below_signal"] = (out["uo"] < out["uo_signal"]).astype(int)
+    decision_smooth = decision_smooth_map[timeframe_name]
+    viz_smooth = viz_smooth_map[timeframe_name]
+    out["uo_decision"] = ema(out["uo_raw"], decision_smooth) if decision_smooth > 1 else out["uo_raw"]
+    out["uo_signal_decision"] = ema(out["uo_decision"], sig)
+    out["uo_viz"] = ema(out["uo_decision"], viz_smooth) if viz_smooth > 1 else out["uo_decision"]
+    out["uo_signal_viz"] = ema(out["uo_viz"], sig)
+
+    # Backward-compatible visual columns for tables/charts.
+    out["uo"] = out["uo_viz"]
+    out["uo_signal"] = out["uo_signal_viz"]
+
+    # Decision columns drive classification / analogs / warnings.
+    out["uo_gap"] = out["uo_decision"] - out["uo_signal_decision"]
+    out["uo_slope_1"] = out["uo_decision"].diff(1)
+    out["uo_slope_3"] = out["uo_decision"].diff(3)
+    lookback = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"} else 252
+    out["uo_pctile"] = true_percentile(out["uo_decision"], lookback)
+
+    out["uo_above_signal"] = (out["uo_decision"] > out["uo_signal_decision"]).astype(int)
+    out["uo_below_signal"] = (out["uo_decision"] < out["uo_signal_decision"]).astype(int)
     out["uo_above_signal_2"] = (out["uo_above_signal"].rolling(2, min_periods=2).sum() == 2).astype(int)
     out["uo_below_signal_2"] = (out["uo_below_signal"].rolling(2, min_periods=2).sum() == 2).astype(int)
     gap_scale = out["uo_gap"].abs().rolling(40, min_periods=10).max().replace(0, np.nan)
@@ -573,7 +588,7 @@ def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 ANALOG_FEATURES = [
-    "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3",
+    "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3", "uo_decision", "uo_signal_decision",
     "tsi", "tsi_gap", "tsi_slope_3", "tsi_pctile",
     "cci_20", "cci_slope_3", "cci_20_pctile",
     "pct_b", "pct_b_pctile",
@@ -729,8 +744,8 @@ def slice_asof(df: pd.DataFrame, analysis_date: pd.Timestamp) -> pd.DataFrame:
 def distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, float]:
     if row is None or row.empty or frame.empty:
         return {"gap": np.nan, "abs_gap": np.nan, "range_pct": np.nan}
-    gap = float(row.get("uo", np.nan) - row.get("uo_signal", np.nan))
-    recent = (frame["uo"] - frame["uo_signal"]).dropna().tail(40)
+    gap = float(row.get("uo_decision", row.get("uo", np.nan)) - row.get("uo_signal_decision", row.get("uo_signal", np.nan)))
+    recent = (frame.get("uo_decision", frame["uo"]) - frame.get("uo_signal_decision", frame["uo_signal"])).dropna().tail(40)
     denom = max(float(recent.abs().max()), 1e-9) if not recent.empty else np.nan
     return {"gap": gap, "abs_gap": abs(gap) if pd.notna(gap) else np.nan, "range_pct": abs(gap) / denom * 100 if pd.notna(gap) and pd.notna(denom) else np.nan}
 
@@ -807,8 +822,8 @@ def plot_dashboard(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFra
     for row_num, frame, nm in zip([2,3,4,5], [hourly_df.tail(260), tactical_df.tail(260), daily_df.tail(260), weekly_df.tail(160)], ["Hourly","Tactical","Daily","Weekly"]):
         if frame.empty:
             continue
-        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo"], name=f"{nm} UO", line=dict(color="red", width=2.3)), row=row_num, col=1)
-        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"{nm} Signal", line=dict(color="black", width=1.3)), row=row_num, col=1)
+        fig.add_trace(go.Scatter(x=frame.index, y=frame.get("uo_viz", frame["uo"]), name=f"{nm} UO", line=dict(color="red", width=2.3)), row=row_num, col=1)
+        fig.add_trace(go.Scatter(x=frame.index, y=frame.get("uo_signal_viz", frame["uo_signal"]), name=f"{nm} Signal", line=dict(color="black", width=1.3)), row=row_num, col=1)
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row_num, col=1)
     fig.update_layout(height=1380, xaxis_rangeslider_visible=False, legend_orientation="h")
     st.plotly_chart(fig, width="stretch")
