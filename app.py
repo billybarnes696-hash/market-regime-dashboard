@@ -406,34 +406,42 @@ def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, 
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
     spans = {
         # lower frames are intentionally slowed to reduce noise and align with the trend stack.
-        "hourly_proxy": (8, 21, 7),
+        "proxy_smooth_1hour": (8, 21, 7),
         "real_1hour": (8, 21, 7),
-        "2hour_proxy": (10, 26, 8),
+        "proxy_smooth_2hour": (10, 26, 8),
         "real_2hour": (10, 26, 8),
+        "hourly_proxy": (8, 21, 7),
+        "2hour_proxy": (10, 26, 8),
         "daily": (16, 42, 10),
         "weekly": (8, 21, 7),
     }
     pre_smooth_map = {
-        "hourly_proxy": 3,
-        "real_1hour": 4,
-        "2hour_proxy": 3,
-        "real_2hour": 5,
+        "proxy_smooth_1hour": 4,
+        "real_1hour": 3,
+        "proxy_smooth_2hour": 5,
+        "real_2hour": 4,
+        "hourly_proxy": 4,
+        "2hour_proxy": 5,
         "daily": 5,
         "weekly": 3,
     }
     decision_smooth_map = {
+        "proxy_smooth_1hour": 2,
+        "real_1hour": 1,
+        "proxy_smooth_2hour": 2,
+        "real_2hour": 1,
         "hourly_proxy": 2,
-        "real_1hour": 2,
         "2hour_proxy": 2,
-        "real_2hour": 2,
         "daily": 1,
         "weekly": 1,
     }
     viz_smooth_map = {
-        "hourly_proxy": 6,
-        "real_1hour": 7,
-        "2hour_proxy": 6,
-        "real_2hour": 8,
+        "proxy_smooth_1hour": 8,
+        "real_1hour": 4,
+        "proxy_smooth_2hour": 10,
+        "real_2hour": 5,
+        "hourly_proxy": 8,
+        "2hour_proxy": 10,
         "daily": 3,
         "weekly": 2,
     }
@@ -449,7 +457,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     adx_dir = np.sign(out["tsi_gap"].fillna(0.0) + out["uo_seed_dir"].fillna(0.0))
     adx_n = (((out["adx_14"].fillna(18.0) - 18.0) / 22.0).clip(-1.0, 1.0)) * adx_dir.replace(0, 1)
 
-    if timeframe_name in {"real_1hour", "real_2hour", "2hour_proxy", "hourly_proxy"}:
+    if timeframe_name in {"real_1hour", "real_2hour", "proxy_smooth_2hour", "proxy_smooth_1hour", "2hour_proxy", "hourly_proxy"}:
         weights = dict(tsi=0.31, cci=0.22, bb=0.14, vwap=0.15, adx=0.10, z=0.08)
     elif timeframe_name == "daily":
         weights = dict(tsi=0.32, cci=0.20, bb=0.16, vwap=0.08, adx=0.12, z=0.12)
@@ -465,7 +473,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
         + weights["z"] * z_n
     )
 
-    if timeframe_name in {"real_1hour", "real_2hour", "2hour_proxy", "hourly_proxy"}:
+    if timeframe_name in {"real_1hour", "real_2hour", "proxy_smooth_2hour", "proxy_smooth_1hour", "2hour_proxy", "hourly_proxy"}:
         pin_penalty = 0.12 * out["pinning_up_flag"].fillna(0.0) - 0.12 * out["pinning_down_flag"].fillna(0.0)
         out["uo_base"] = out["uo_base"] - pin_penalty
 
@@ -488,7 +496,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     out["uo_gap"] = out["uo_decision"] - out["uo_signal_decision"]
     out["uo_slope_1"] = out["uo_decision"].diff(1)
     out["uo_slope_3"] = out["uo_decision"].diff(3)
-    lookback = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"} else 252
+    lookback = 120 if timeframe_name in {"proxy_smooth_2hour", "proxy_smooth_1hour", "2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"} else 252
     out["uo_pctile"] = true_percentile(out["uo_decision"], lookback)
 
     out["uo_above_signal"] = (out["uo_decision"] > out["uo_signal_decision"]).astype(int)
@@ -526,9 +534,9 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     out["price_slope_3"] = slope(out["Close"], 3)
     out["dist_ema20_pct"] = (out["Close"] / out["ema_20"]) - 1
 
-    if timeframe_name == "hourly_proxy":
-        out["vwap"] = session_vwap(out)
-    elif timeframe_name == "real_2hour":
+    if timeframe_name in {"hourly_proxy", "proxy_smooth_1hour"}:
+        out["vwap"] = rolling_vwap(out, 8)
+    elif timeframe_name in {"real_2hour", "proxy_smooth_2hour"}:
         # Session VWAP resets create step-changes on sparse 2-hour bars; rolling VWAP is smoother.
         out["vwap"] = rolling_vwap(out, 12)
     elif timeframe_name == "2hour_proxy":
@@ -537,7 +545,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
         out["vwap"] = rolling_vwap(out, 20)
     out["dist_vwap_pct"] = (out["Close"] / out["vwap"]) - 1
 
-    z_win = 120 if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_1hour", "real_2hour"} else 252
+    z_win = 120 if timeframe_name in {"proxy_smooth_1hour", "proxy_smooth_2hour", "hourly_proxy", "2hour_proxy", "real_1hour", "real_2hour"} else 252
     out["close_zscore"] = rolling_zscore(out["Close"], z_win)
     out["close_zscore_slope_3"] = slope(out["close_zscore"], 3)
 
@@ -569,7 +577,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     else:
         out["rs_bench_slope_5"] = 0.0
 
-    win = 120 if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_1hour", "real_2hour"} else 252
+    win = 120 if timeframe_name in {"proxy_smooth_1hour", "proxy_smooth_2hour", "hourly_proxy", "2hour_proxy", "real_1hour", "real_2hour"} else 252
     for col in [
         "rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14",
         "dist_ema20_pct", "dist_vwap_pct", "close_zscore"
@@ -644,7 +652,7 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     pct_b = float(row.get("pct_b", 0.5))
     gap_strength = float(row.get("uo_gap_strength", 0.0))
 
-    is_tactical = timeframe in {"2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"}
+    is_tactical = timeframe in {"proxy_smooth_1hour", "proxy_smooth_2hour", "2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"}
     is_structural = timeframe in {"daily", "weekly"}
 
     # Fast tactical layer can respond quickly, but do not invert the heat structure.
@@ -833,7 +841,7 @@ def plot_dashboard(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFra
 # Sidebar
 # -----------------------------
 st.title("📈 Stable Market Engine Clean")
-st.caption("Alpaca-only | raw prices | smooth ultimate oscillator (TSI/CCI/%B/VWAP/ADX/ZScore) | proxy default | 1h/2h/daily/weekly stack")
+st.caption("Alpaca-only | real 1h/2h logic | proxy smooth visuals | tanh-normalized aggregate oscillator | 1h/2h/daily/weekly stack")
 
 with st.sidebar:
     st.header("Credentials")
@@ -850,7 +858,7 @@ with st.sidebar:
     history_years = st.selectbox("Historical years", [3, 5, 10], index=1)
     analysis_mode = st.radio("Analysis mode", ["Current", "Historical"], index=0)
     analysis_date = st.date_input("Calendar lookback", value=pd.Timestamp.today().date(), disabled=(analysis_mode == "Current"))
-    intraday_source = st.radio("Intraday source", ["proxy", "real"], index=0, format_func=lambda x: {"proxy": "Proxy (default)", "real": "Real Alpaca"}[x])
+    intraday_source = st.radio("Intraday source", ["proxy", "real"], index=0, format_func=lambda x: {"proxy": "Proxy Smooth (default)", "real": "Real Alpaca"}[x])
     force_refresh = st.checkbox("Force refresh data (clear cache)", value=False)
     run_analysis = st.button("Run Analysis", type="primary", width="stretch")
 
@@ -906,10 +914,23 @@ for i, sym in enumerate(symbols):
         else:
             hourly_timeframe, hourly_label = "real_1hour", "1-Hour (Real)"
     else:
-        tactical_raw, tactical_timeframe, _ = time_compressed_proxy(daily_raw, "2hour_proxy")
-        tactical_label = "2-Hour (Proxy)"
-        hourly_raw, hourly_timeframe, _ = time_compressed_proxy(daily_raw, "hourly_proxy")
-        hourly_label = "1-Hour (Proxy)"
+        # Proxy mode now uses the SAME real Alpaca intraday bars when available,
+        # but applies heavier visualization smoothing so the turns stay accurate
+        # while the charts remain easier to read. Only if Alpaca intraday fails
+        # do we fall back to the old compressed proxy-from-daily behavior.
+        tactical_raw = fetch_alpaca_2hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
+        tactical_timeframe = "proxy_smooth_2hour"
+        tactical_label = "2-Hour (Proxy Smooth)"
+        if tactical_raw.empty:
+            tactical_raw, tactical_timeframe, _ = time_compressed_proxy(daily_raw, "2hour_proxy")
+            tactical_label = "2-Hour (Proxy Fallback)"
+
+        hourly_raw = fetch_alpaca_1hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
+        hourly_timeframe = "proxy_smooth_1hour"
+        hourly_label = "1-Hour (Proxy Smooth)"
+        if hourly_raw.empty:
+            hourly_raw, hourly_timeframe, _ = time_compressed_proxy(daily_raw, "hourly_proxy")
+            hourly_label = "1-Hour (Proxy Fallback)"
     weekly_raw = resample_weekly(daily_raw)
     hourly_df = enrich_price_features(hourly_raw, hourly_timeframe, benchmark_daily)
     tactical_df = enrich_price_features(tactical_raw, tactical_timeframe, benchmark_daily)
