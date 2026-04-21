@@ -155,6 +155,38 @@ def centered_pct(series: pd.Series) -> pd.Series:
     return (series.fillna(0.5) - 0.5) * 2
 
 
+RANGE_OPTIONS = {
+    "1h": ["2W", "1M", "3M", "6M", "1Y"],
+    "2h": ["1M", "3M", "6M", "1Y", "2Y"],
+    "daily": ["3M", "6M", "1Y", "2Y", "5Y", "10Y"],
+    "weekly": ["1Y", "2Y", "5Y", "10Y", "MAX"],
+}
+
+
+def trim_to_range(df: pd.DataFrame, range_key: str) -> pd.DataFrame:
+    if df.empty or not range_key or range_key == "MAX":
+        return df.copy()
+    end_ts = pd.Timestamp(df.index.max())
+    mapping = {
+        "2W": pd.DateOffset(weeks=2),
+        "1M": pd.DateOffset(months=1),
+        "3M": pd.DateOffset(months=3),
+        "6M": pd.DateOffset(months=6),
+        "1Y": pd.DateOffset(years=1),
+        "2Y": pd.DateOffset(years=2),
+        "5Y": pd.DateOffset(years=5),
+        "10Y": pd.DateOffset(years=10),
+    }
+    offset = mapping.get(range_key)
+    if offset is None:
+        return df.copy()
+    start_ts = end_ts - offset
+    return df.loc[df.index >= start_ts].copy()
+
+
+def clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -606,6 +638,22 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     ]:
         out[f"{col}_pctile"] = hybrid_normalize(out[col], win)
 
+    # Dual overbought/oversold framework: internal oscillator state + price stretch state.
+    out["ob_internal_score"] = (
+        0.45 * out["rsi_14_pctile"].fillna(0.5)
+        + 0.25 * out["tsi_pctile"].fillna(0.5)
+        + 0.15 * out["cci_20_pctile"].fillna(0.5)
+        + 0.15 * out["pct_b_pctile"].fillna(0.5)
+    ).clip(0, 1)
+    out["os_internal_score"] = 1 - out["ob_internal_score"]
+    out["ob_price_score"] = (
+        0.35 * out["pct_b_pctile"].fillna(0.5)
+        + 0.25 * out["dist_ema20_pct_pctile"].fillna(0.5)
+        + 0.20 * out["dist_vwap_pct_pctile"].fillna(0.5)
+        + 0.20 * out["close_zscore_pctile"].fillna(0.5)
+    ).clip(0, 1)
+    out["os_price_score"] = 1 - out["ob_price_score"]
+
     out = add_ultimate_oscillator(out, timeframe_name)
     return out
 
@@ -660,6 +708,63 @@ def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
         out[f"ret_{n}_p_up"] = float(np.average((vals > 0).astype(float), weights=w))
         out[f"ret_{n}_p_down"] = float(np.average((vals < 0).astype(float), weights=w))
     return out
+
+
+def extreme_state(row: pd.Series) -> Dict[str, float | str]:
+    if row is None or row.empty:
+        return {"label": "No data", "ob_internal": np.nan, "ob_price": np.nan, "os_internal": np.nan, "os_price": np.nan}
+    ob_internal = float(row.get("ob_internal_score", 0.5))
+    os_internal = float(row.get("os_internal_score", 0.5))
+    ob_price = float(row.get("ob_price_score", 0.5))
+    os_price = float(row.get("os_price_score", 0.5))
+    uo_pct = float(row.get("uo_pctile", 0.5))
+    uo_gap = float(row.get("uo_gap", 0.0))
+    uo_slope = float(row.get("uo_slope_3", 0.0))
+    price_slope = float(row.get("price_slope_3", 0.0))
+
+    if ob_internal >= 0.85 and ob_price >= 0.70:
+        label = "Fully overbought"
+    elif ob_internal >= 0.85:
+        label = "Internally overbought"
+    elif os_internal >= 0.85 and os_price >= 0.70:
+        label = "Fully oversold"
+    elif os_internal >= 0.85:
+        label = "Internally oversold"
+    else:
+        label = "Neutral stretch"
+
+    if "overbought" in label.lower() and uo_gap < 0 and uo_slope < 0:
+        label = "Exhausted / rollover risk" if ob_price >= 0.70 else "Exhausted / likely consolidation"
+    if "oversold" in label.lower() and uo_gap > 0 and uo_slope > 0:
+        label = "Washed out / rebound risk" if os_price >= 0.70 else "Washed out / stabilization"
+    if abs(price_slope) < 1e-9 and "Exhausted" in label:
+        label = "Exhausted / likely consolidation"
+    if abs(price_slope) < 1e-9 and "Washed out" in label:
+        label = "Washed out / stabilization"
+
+    return {
+        "label": label,
+        "ob_internal": ob_internal,
+        "ob_price": ob_price,
+        "os_internal": os_internal,
+        "os_price": os_price,
+    }
+
+
+def render_extreme_table(frame_items: List[Tuple[str, pd.Series]]) -> None:
+    rows = []
+    for label, row in frame_items:
+        stt = extreme_state(row)
+        rows.append({
+            "Frame": label,
+            "State": stt["label"],
+            "OB internal": round(float(stt["ob_internal"]) * 100, 1),
+            "OB price": round(float(stt["ob_price"]) * 100, 1),
+            "OS internal": round(float(stt["os_internal"]) * 100, 1),
+            "OS price": round(float(stt["os_price"]) * 100, 1),
+        })
+    st.markdown("### Overbought / oversold diagnostics")
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
@@ -780,22 +885,28 @@ def frame_warning_message(row: pd.Series, timeframe_label: str, structural_bias:
     if row is None or row.empty:
         return f"{timeframe_label}: no data."
     uo_gap = float(row.get("uo_gap", 0.0))
-    uo_pct = float(row.get("uo_pctile", 0.5))
     price_slope = float(row.get("price_slope_3", 0.0))
     tsi_slope = float(row.get("tsi_slope_3", 0.0))
     cci_slope = float(row.get("cci_slope_3", 0.0))
-    pin_up = int(row.get("pinning_up_flag", 0)) == 1
-    pin_dn = int(row.get("pinning_down_flag", 0)) == 1
-    bullish = (uo_pct < 0.20 and uo_gap > 0) or pin_up
-    bearish = (uo_pct > 0.80 and uo_gap < 0) or pin_dn
-    if bullish and price_slope <= 0:
-        return f"{timeframe_label}: oversold and improving, but price has not lifted yet — early bullish divergence only, confirmation pending."
-    if bullish and price_slope > 0:
-        return f"{timeframe_label}: washed-out rebound is starting to confirm with price improvement."
-    if bearish and price_slope >= 0:
-        return f"{timeframe_label}: exhausted/rolling, but price has not broken yet — be careful pressing shorts before confirmation."
-    if bearish and price_slope < 0:
-        return f"{timeframe_label}: exhaustion is starting to confirm with price weakness."
+    stt = extreme_state(row)
+    label = str(stt["label"])
+
+    if label == "Fully overbought":
+        return f"{timeframe_label}: both the ultimate oscillator and price stretch are overbought — reversal risk is meaningful if price starts confirming lower."
+    if label == "Internally overbought":
+        return f"{timeframe_label}: internally overbought on the oscillator, but price stretch is milder — this can resolve by consolidation, not just reversal."
+    if label == "Exhausted / rollover risk":
+        return f"{timeframe_label}: overbought and now rolling with price beginning to confirm — downside risk is rising."
+    if label == "Exhausted / likely consolidation":
+        return f"{timeframe_label}: oscillator-wise exhausted, but price extension is not extreme — expect chop or a shallow pullback more than an automatic collapse."
+    if label == "Fully oversold":
+        return f"{timeframe_label}: both the ultimate oscillator and price stretch are oversold — rebound risk is meaningful if price starts stabilizing."
+    if label == "Internally oversold":
+        return f"{timeframe_label}: internally oversold on the oscillator, but price stretch is milder — this can resolve by sideways stabilization, not just a sharp bounce."
+    if label == "Washed out / rebound risk":
+        return f"{timeframe_label}: oversold and improving with price starting to confirm — upside rebound risk is building."
+    if label == "Washed out / stabilization":
+        return f"{timeframe_label}: oscillator is washed out, but price has not expanded enough yet — stabilization or sideways repair is more likely than an immediate surge."
     if abs(tsi_slope) < 0.05 and cci_slope < 0 and price_slope >= 0:
         return f"{timeframe_label}: momentum is fading under the surface while price still holds — caution, but not a confirmed short yet."
     if abs(tsi_slope) < 0.05 and cci_slope > 0 and price_slope <= 0:
@@ -853,34 +964,40 @@ def _osc_panel_trace(fig, frame: pd.DataFrame, row: int, nm: str) -> None:
     fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row, col=1)
 
 
-def plot_mega_view(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str) -> None:
+def plot_mega_view(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str, mega_ranges: Dict[str, str]) -> None:
     fig = make_subplots(
         rows=5, cols=1, vertical_spacing=0.04,
         subplot_titles=[f"{symbol} Price (as of {pd.Timestamp(asof_date).date()})", "1-Hour Ultimate Oscillator", f"{tactical_label} Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
         row_heights=[0.30, 0.18, 0.18, 0.18, 0.16],
     )
-    base_price = daily_df.tail(260) if not daily_df.empty else hourly_df.tail(260)
+    hourly_plot = trim_to_range(hourly_df, mega_ranges.get("1h", "3M"))
+    tactical_plot = trim_to_range(tactical_df, mega_ranges.get("2h", "6M"))
+    daily_plot = trim_to_range(daily_df, mega_ranges.get("daily", "1Y"))
+    weekly_plot = trim_to_range(weekly_df, mega_ranges.get("weekly", "5Y"))
+    base_price = daily_plot if not daily_plot.empty else hourly_plot
     _price_panel_trace(fig, base_price, 1, symbol)
-    _osc_panel_trace(fig, hourly_df.tail(260), 2, "Hourly")
-    _osc_panel_trace(fig, tactical_df.tail(260), 3, "Tactical")
-    _osc_panel_trace(fig, daily_df.tail(260), 4, "Daily")
-    _osc_panel_trace(fig, weekly_df.tail(160), 5, "Weekly")
+    _osc_panel_trace(fig, hourly_plot, 2, "Hourly")
+    _osc_panel_trace(fig, tactical_plot, 3, "Tactical")
+    _osc_panel_trace(fig, daily_plot, 4, "Daily")
+    _osc_panel_trace(fig, weekly_plot, 5, "Weekly")
     fig.update_layout(height=1380, xaxis_rangeslider_visible=False, legend_orientation="h")
     st.plotly_chart(fig, width="stretch")
 
 
-def plot_single_frame(symbol: str, price_df: pd.DataFrame, osc_df: pd.DataFrame, asof_date: pd.Timestamp, frame_title: str) -> None:
+def plot_single_frame(symbol: str, price_df: pd.DataFrame, osc_df: pd.DataFrame, asof_date: pd.Timestamp, frame_title: str, range_key: str) -> None:
     fig = make_subplots(rows=2, cols=1, vertical_spacing=0.06, subplot_titles=[f"{symbol} Price (as of {pd.Timestamp(asof_date).date()})", frame_title], row_heights=[0.56, 0.44])
-    _price_panel_trace(fig, price_df, 1, symbol)
-    _osc_panel_trace(fig, osc_df, 2, frame_title)
+    price_plot = trim_to_range(price_df, range_key)
+    osc_plot = trim_to_range(osc_df, range_key)
+    _price_panel_trace(fig, price_plot, 1, symbol)
+    _osc_panel_trace(fig, osc_plot, 2, frame_title)
     fig.update_layout(height=760, xaxis_rangeslider_visible=False, legend_orientation="h")
     st.plotly_chart(fig, width="stretch")
 
 # -----------------------------
 # Main App
 # -----------------------------
-st.title("📈 Stable Market Engine v10")
-st.caption("Real Alpaca 1h/2h data | decision-viz split | component + viz smoothing for 1h/2h | mega view + tabs | 1h/2h/daily/weekly stack")
+st.title("📈 Stable Market Engine v11")
+st.caption("Real Alpaca 1h/2h data | decision-viz split | component + viz smoothing for 1h/2h | mega view + range tabs | dual overbought/oversold diagnostics")
 
 with st.sidebar:
     st.header("Credentials")
