@@ -1,17 +1,16 @@
 
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.timeframe import TimeFrame
 
 
 # ----------------------------- Page setup -----------------------------
@@ -23,12 +22,12 @@ st.set_page_config(
 
 st.title("📈 Stable Market Engine · TSI Heat Dashboard")
 st.caption(
-    "Same visual framework, same Alpaca intraday feed. "
-    "TSI-centered heat engine using CCI, RSI, BB%, VWAP stretch, and price behavior."
+    "Alpaca-only feed. Same visual framework, with a TSI-centered heat engine using "
+    "CCI, RSI, BB%, VWAP stretch, and price behavior."
 )
 
 
-# ----------------------------- Helpers -----------------------------
+# ----------------------------- Indicator helpers -----------------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False, min_periods=max(2, span // 2)).mean()
 
@@ -53,7 +52,7 @@ def tsi(close: pd.Series, long: int = 25, short: int = 13, signal: int = 7) -> T
 
 
 def cci(df: pd.DataFrame, n: int = 20) -> pd.Series:
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
     sma = tp.rolling(n, min_periods=max(5, n // 2)).mean()
     mad = (tp - sma).abs().rolling(n, min_periods=max(5, n // 2)).mean()
     return (tp - sma) / (0.015 * mad.replace(0, np.nan))
@@ -81,8 +80,8 @@ def anchored_intraday_vwap(df: pd.DataFrame) -> pd.Series:
     for _, part in df.groupby(day_keys):
         tp = (part["High"] + part["Low"] + part["Close"]) / 3.0
         pv = tp * part["Volume"].fillna(0)
-        vol_cum = part["Volume"].fillna(0).cumsum().replace(0, np.nan)
-        out.loc[part.index] = pv.cumsum() / vol_cum
+        cum_vol = part["Volume"].fillna(0).cumsum().replace(0, np.nan)
+        out.loc[part.index] = pv.cumsum() / cum_vol
     return out
 
 
@@ -111,6 +110,20 @@ def recent_divergence(price: pd.Series, osc: pd.Series, lookback: int = 10) -> p
     out.loc[bear] = "Bearish"
     out.loc[bull] = "Bullish"
     return out
+
+
+def regime_bucket(tsi_heat: float, stretch_heat: float) -> str:
+    if pd.isna(tsi_heat):
+        return "Neutral"
+    if tsi_heat >= 70 and stretch_heat >= 70:
+        return "Strong & Extended"
+    if tsi_heat >= 60:
+        return "Strong"
+    if tsi_heat <= 35 and stretch_heat <= 45:
+        return "Weak"
+    if tsi_heat < 50:
+        return "Fading"
+    return "Neutral"
 
 
 def state_from_row(row: pd.Series) -> str:
@@ -154,70 +167,43 @@ def traffic_emoji(state: str) -> str:
     return "🟡"
 
 
-def regime_bucket(tsi_heat: float, stretch_heat: float) -> str:
-    if pd.isna(tsi_heat):
-        return "Neutral"
-    if tsi_heat >= 70 and stretch_heat >= 70:
-        return "Strong & Extended"
-    if tsi_heat >= 60:
-        return "Strong"
-    if tsi_heat <= 35 and stretch_heat <= 45:
-        return "Weak"
-    if tsi_heat < 50:
-        return "Fading"
-    return "Neutral"
+# ----------------------------- Alpaca loading -----------------------------
+def _normalize_bars_df(bars_df: pd.DataFrame) -> pd.DataFrame:
+    if bars_df is None or len(bars_df) == 0:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    if isinstance(bars_df.index, pd.MultiIndex):
+        bars_df = bars_df.reset_index(level=0, drop=True)
+
+    bars_df = bars_df.rename(columns=str.title)
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in bars_df.columns]
+    bars_df = bars_df[keep].copy()
+
+    idx = pd.to_datetime(bars_df.index, utc=True)
+    bars_df.index = idx.tz_convert("America/New_York")
+    return bars_df.sort_index().dropna(subset=["Close"])
 
 
-# ----------------------------- Data loading -----------------------------
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_alpaca_intraday(symbol: str, timeframe: TimeFrame, days_back: int, api_key: str, secret_key: str, feed: str) -> pd.DataFrame:
+def fetch_alpaca_bars(symbol: str, timeframe_name: str, years_back: int, api_key: str, secret_key: str, feed: str) -> pd.DataFrame:
     client = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days_back)
+    start = end - timedelta(days=int(years_back * 366))
 
+    tf_map = {
+        "1H": TimeFrame.Hour,
+        "1D": TimeFrame.Day,
+    }
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
-        timeframe=timeframe,
+        timeframe=tf_map[timeframe_name],
         start=start,
         end=end,
         feed=feed,
         adjustment="all",
     )
     bars = client.get_stock_bars(req).df
-
-    if bars is None or len(bars) == 0:
-        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-
-    if isinstance(bars.index, pd.MultiIndex):
-        bars = bars.reset_index(level=0, drop=True)
-
-    bars = bars.rename(columns=str.title)
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in bars.columns]
-    bars = bars[keep].copy()
-
-    idx = pd.to_datetime(bars.index, utc=True)
-    bars.index = idx.tz_convert("America/New_York")
-    return bars.sort_index().dropna(subset=["Close"])
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_daily_history(symbol: str, years: int) -> pd.DataFrame:
-    period = f"{max(1, years)}y"
-    df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, threads=True)
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    df = df.rename(columns=str.title)
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-    df = df[keep].dropna(subset=["Close"]).copy()
-    idx = pd.to_datetime(df.index)
-    if idx.tz is None:
-        idx = idx.tz_localize("America/New_York")
-    else:
-        idx = idx.tz_convert("America/New_York")
-    df.index = idx
-    return df
+    return _normalize_bars_df(bars)
 
 
 def to_2h(df_1h: pd.DataFrame) -> pd.DataFrame:
@@ -274,7 +260,6 @@ def compute_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     x["BB_heat"] = (x["BBPct"] * 100).clip(0, 100)
     x["Stretch_heat"] = normalize_rolling(x["Dist_EMA10"] + 0.5 * x["Dist_VWAP"].fillna(0), roll_window)
 
-    # TSI-based heat engine
     x["Heat_osc"] = (
         0.40 * x["TSI_heat"]
         + 0.18 * x["CCI_heat"]
@@ -286,7 +271,6 @@ def compute_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     x["Heat_slope"] = slope(x["Heat_osc"], 3)
     x["TSI_slope"] = slope(x["TSI"], 3)
     x["Divergence"] = recent_divergence(x["Close"], x["Heat_osc"], div_lb)
-
     x["State"] = x.apply(state_from_row, axis=1)
     x["Regime_bucket"] = [regime_bucket(a, b) for a, b in zip(x["TSI_heat"], x["Stretch_heat"])]
 
@@ -319,20 +303,19 @@ FWD_BARS = {"1H": [1, 3, 6, 12], "2H": [1, 2, 4, 8], "Daily": [1, 2, 5, 10], "We
 
 def analog_summary(df: pd.DataFrame, tf: str) -> Tuple[dict, pd.DataFrame]:
     max_fwd = max(FWD_BARS[tf])
+    if len(df) <= max_fwd + 20:
+        return {}, pd.DataFrame()
+
     base = df.iloc[:-max_fwd].copy()
     cur = df.iloc[-1]
 
-    mask = (
-        base["State"].eq(cur["State"])
-        & base["Higher_Regime"].eq(cur["Higher_Regime"])
-    )
+    mask = base["State"].eq(cur["State"]) & base["Higher_Regime"].eq(cur["Higher_Regime"])
     if cur["Divergence"] in ["Bearish", "Bullish"]:
         mask &= base["Divergence"].eq(cur["Divergence"])
 
     matches = base.loc[mask].copy()
     if len(matches) < 15:
-        mask = base["State"].eq(cur["State"]) & base["Higher_Regime"].eq(cur["Higher_Regime"])
-        matches = base.loc[mask].copy()
+        matches = base.loc[base["State"].eq(cur["State"]) & base["Higher_Regime"].eq(cur["Higher_Regime"])].copy()
 
     if matches.empty:
         return {}, pd.DataFrame()
@@ -376,6 +359,7 @@ def analog_summary(df: pd.DataFrame, tf: str) -> Tuple[dict, pd.DataFrame]:
 def prediction_text(tf: str, row: pd.Series, stats: dict) -> str:
     if not stats:
         return f"{tf}: not enough conditioned analogs yet."
+
     horizon = FWD_BARS[tf][min(1, len(FWD_BARS[tf]) - 1)]
     med = stats.get(f"median_{horizon}", np.nan)
     up = stats.get(f"up_pct_{horizon}", np.nan)
@@ -397,7 +381,7 @@ def prediction_text(tf: str, row: pd.Series, stats: dict) -> str:
     )
 
 
-# ----------------------------- Charts -----------------------------
+# ----------------------------- Charts / interpretation -----------------------------
 def make_panel(df: pd.DataFrame, bars: int) -> go.Figure:
     d = df.tail(bars).copy()
 
@@ -417,7 +401,7 @@ def make_panel(df: pd.DataFrame, bars: int) -> go.Figure:
     fig.add_trace(go.Scatter(x=d.index, y=d["SMA50"], name="SMA50", yaxis="y"))
     fig.add_trace(go.Scatter(x=d.index, y=d["Heat_osc"], name="TSI Heat", yaxis="y2"))
     fig.add_trace(go.Scatter(x=d.index, y=d["Heat_signal"], name="Signal", yaxis="y2"))
-    fig.add_trace(go.Scatter(x=d.index, y=d["TSI_heat"], name="TSI core", yaxis="y2", line={"dash": "dot"}, opacity=0.55))
+    fig.add_trace(go.Scatter(x=d.index, y=d["TSI_heat"], name="TSI Core", yaxis="y2", line={"dash": "dot"}, opacity=0.55))
 
     fig.update_layout(
         height=650,
@@ -459,7 +443,8 @@ with st.sidebar:
     symbol = st.text_input("Select symbol", value="QQQ").strip().upper()
 
     st.header("Settings")
-    years = st.slider("Historical years (daily/weekly analogs)", 3, 20, 10)
+    intraday_years = st.slider("Intraday years (1H/2H)", 1, 2, 2)
+    higher_years = st.slider("Daily/Weekly years", 3, 15, 10)
     bars_to_show = st.slider("Bars to show", 100, 400, 180, 20)
     force_refresh = st.checkbox("Force refresh data (clear cache)", value=False)
 
@@ -469,17 +454,18 @@ if force_refresh:
 if not symbol:
     st.stop()
 if not api_key or not secret_key:
-    st.warning("Enter your Alpaca API key and secret to use real-time Alpaca 1H/2H data.")
+    st.warning("Enter your Alpaca API key and secret to use Alpaca bars.")
     st.stop()
 
 # ----------------------------- Load data -----------------------------
-with st.spinner(f"Loading Alpaca intraday data for {symbol}..."):
-    intraday_1h = fetch_alpaca_intraday(symbol, TimeFrame.Hour, 730, api_key, secret_key, feed)
-with st.spinner(f"Loading long-term history for {symbol}..."):
-    daily = fetch_daily_history(symbol, years)
+with st.spinner(f"Loading Alpaca 1H bars for {symbol}..."):
+    intraday_1h = fetch_alpaca_bars(symbol, "1H", intraday_years, api_key, secret_key, feed)
+
+with st.spinner(f"Loading Alpaca daily bars for {symbol}..."):
+    daily = fetch_alpaca_bars(symbol, "1D", higher_years, api_key, secret_key, feed)
 
 if intraday_1h.empty or daily.empty:
-    st.error("No data returned. Check symbol and Alpaca credentials/feed.")
+    st.error("No data returned from Alpaca. Check symbol, credentials, and feed.")
     st.stop()
 
 intraday_2h = to_2h(intraday_1h)
@@ -572,9 +558,9 @@ for tab, tf, label in [
 with st.expander("How this version works"):
     st.markdown(
         """
-- **Same visual framework**: traffic lights, tabs, price chart + oscillator, summary panel, analogs.
-- **Same intraday feed concept**: real-time Alpaca bars for 1H and 2H.
-- **New engine**: TSI is the backbone, then CCI / RSI / Bollinger %B / VWAP stretch add context.
+- **Alpaca-only bars** for 1H, 2H, Daily, and Weekly.
+- **Same style dashboard**: traffic lights, tabs, price + oscillator, summary panel, analogs.
+- **TSI-centered engine** with CCI / RSI / Bollinger %B / VWAP stretch layered in.
 - Exhaustion is determined from:
   - TSI level and slope,
   - price stretch,
