@@ -358,48 +358,67 @@ def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, 
 
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
     spans = {
-        # 25/13/7 compressed by ~3.25 for 2-hour, by ~6.5 for 1-hour, then smoothed modestly.
-        "2hour_proxy": (8, 4, 2),
-        "hourly_proxy": (4, 2, 2),
-        # Slow the daily/weekly structure so crosses are less frequent and more regime-like.
+        # proxies stay faster, daily/weekly remain structural, real 2-hour gets extra smoothing.
+        "2hour_proxy": (9, 21, 6),
+        "hourly_proxy": (5, 13, 4),
         "daily": (16, 42, 10),
         "weekly": (8, 21, 7),
-        # Keep real 2-hour aligned to the underlying intraday TSI family, but smooth the composite first.
-        "real_2hour": (25, 13, 7),
+        "real_2hour": (13, 34, 8),
+    }
+    pre_smooth_map = {
+        "hourly_proxy": 2,
+        "2hour_proxy": 3,
+        "real_2hour": 5,
+        "daily": 5,
+        "weekly": 3,
+    }
+    post_smooth_map = {
+        "hourly_proxy": 1,
+        "2hour_proxy": 2,
+        "real_2hour": 3,
+        "daily": 1,
+        "weekly": 1,
     }
 
-    def pct_col(name: str) -> pd.Series:
-        if name in out.columns:
-            return centered_pct(out[name])
-        return pd.Series(0.0, index=out.index, dtype=float)
-
     fast, slow, sig = spans[timeframe_name]
-    stretch = (
-        0.18 * pct_col("rsi_14_pctile")
-        + 0.18 * pct_col("cci_20_pctile")
-        + 0.14 * pct_col("pct_b_pctile")
-        + 0.12 * pct_col("atr_stretch_pctile")
-        + 0.10 * pct_col("dist_ema20_pctile")
-    )
-    momentum = 0.22 * pct_col("tsi_pctile") + 0.08 * np.tanh(out["price_slope_3"].fillna(0) * 25)
-    rs_part = 0.10 * np.tanh(out["rs_bench_slope_5"].fillna(0) * 25)
-    quality = 1 + 0.12 * pct_col("adx_14_pctile")
-    out["uo_base"] = (stretch + momentum + rs_part) * quality
 
-    # Intraday can stay nimble; daily/weekly need extra smoothing to avoid over-frequent crosses.
-    pre_smooth = 1
-    if timeframe_name == "daily":
-        pre_smooth = 5
-    elif timeframe_name == "weekly":
-        pre_smooth = 3
-    elif timeframe_name == "real_2hour":
-        pre_smooth = 2
-    if pre_smooth > 1:
-        out["uo_base_sm"] = ema(out["uo_base"], pre_smooth)
+    # Raw, bounded component transforms are smoother than percentile churn on sparse 2-hour bars.
+    tsi_n = np.tanh(out["tsi"].fillna(0.0) / 35.0)
+    cci_n = np.tanh(out["cci_20"].fillna(0.0) / 180.0)
+    bb_n = ((out["pct_b"].fillna(0.5) - 0.5) * 2.0).clip(-1.25, 1.25)
+    vwap_n = np.tanh(out["dist_vwap_pct"].fillna(0.0) * 18.0)
+    z_n = np.tanh(out["close_zscore"].fillna(0.0) / 2.5)
+    adx_dir = np.sign(out["tsi_gap"].fillna(0.0) + out["uo_seed_dir"].fillna(0.0))
+    adx_n = (((out["adx_14"].fillna(18.0) - 18.0) / 22.0).clip(-1.0, 1.0)) * adx_dir.replace(0, 1)
+
+    # Slightly de-emphasize VWAP in higher timeframes; keep it meaningful intraday.
+    if timeframe_name in {"real_2hour", "2hour_proxy", "hourly_proxy"}:
+        weights = dict(tsi=0.31, cci=0.22, bb=0.14, vwap=0.15, adx=0.10, z=0.08)
+    elif timeframe_name == "daily":
+        weights = dict(tsi=0.32, cci=0.20, bb=0.16, vwap=0.08, adx=0.12, z=0.12)
     else:
-        out["uo_base_sm"] = out["uo_base"]
+        weights = dict(tsi=0.34, cci=0.18, bb=0.16, vwap=0.06, adx=0.14, z=0.12)
 
-    out["uo"] = ema(out["uo_base_sm"], fast) - ema(out["uo_base_sm"], slow)
+    out["uo_base"] = (
+        weights["tsi"] * tsi_n
+        + weights["cci"] * cci_n
+        + weights["bb"] * bb_n
+        + weights["vwap"] * vwap_n
+        + weights["adx"] * adx_n
+        + weights["z"] * z_n
+    )
+
+    # Mild pinning penalty on tactical frames only: if price rises while TSI is flat and CCI fades,
+    # keep the oscillator from spuriously re-accelerating.
+    if timeframe_name in {"real_2hour", "2hour_proxy", "hourly_proxy"}:
+        pin_penalty = 0.12 * out["pinning_up_flag"].fillna(0.0) - 0.12 * out["pinning_down_flag"].fillna(0.0)
+        out["uo_base"] = out["uo_base"] - pin_penalty
+
+    pre_smooth = pre_smooth_map[timeframe_name]
+    out["uo_base_sm"] = ema(out["uo_base"], pre_smooth) if pre_smooth > 1 else out["uo_base"]
+    out["uo_raw"] = ema(out["uo_base_sm"], fast) - ema(out["uo_base_sm"], slow)
+    post_smooth = post_smooth_map[timeframe_name]
+    out["uo"] = ema(out["uo_raw"], post_smooth) if post_smooth > 1 else out["uo_raw"]
     out["uo_signal"] = ema(out["uo"], sig)
     out["uo_gap"] = out["uo"] - out["uo_signal"]
     out["uo_slope_1"] = out["uo"].diff(1)
@@ -407,7 +426,6 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     lookback = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_2hour"} else 252
     out["uo_pctile"] = true_percentile(out["uo"], lookback)
 
-    # Cross confirmation features: require more than a one-bar wiggle for daily/weekly.
     out["uo_above_signal"] = (out["uo"] > out["uo_signal"]).astype(int)
     out["uo_below_signal"] = (out["uo"] < out["uo_signal"]).astype(int)
     out["uo_above_signal_2"] = (out["uo_above_signal"].rolling(2, min_periods=2).sum() == 2).astype(int)
@@ -443,8 +461,13 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     out["price_slope_3"] = slope(out["Close"], 3)
     out["dist_ema20_pct"] = (out["Close"] / out["ema_20"]) - 1
 
-    if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_2hour"}:
+    if timeframe_name == "hourly_proxy":
         out["vwap"] = session_vwap(out)
+    elif timeframe_name == "real_2hour":
+        # Session VWAP resets create step-changes on sparse 2-hour bars; rolling VWAP is smoother.
+        out["vwap"] = rolling_vwap(out, 12)
+    elif timeframe_name == "2hour_proxy":
+        out["vwap"] = rolling_vwap(out, 10)
     else:
         out["vwap"] = rolling_vwap(out, 20)
     out["dist_vwap_pct"] = (out["Close"] / out["vwap"]) - 1
@@ -457,11 +480,23 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     out["upper_wick_pct"] = (out["High"] - out[["Close", "Open"]].max(axis=1)) / (out["High"] - out["Low"]).replace(0, np.nan)
     out["candle_score"] = 50 + out["upper_wick_pct"].fillna(0) * 30 - (out["close_in_range"].fillna(0.5) - 0.5) * 20
 
+    tsi_flat_thresh = out["tsi_slope_3"].abs().rolling(50, min_periods=10).median().fillna(0.02)
     out["price_change_while_tsi_flat"] = np.where(
-        out["tsi_slope_3"].abs() <= out["tsi_slope_3"].abs().rolling(50, min_periods=10).median().fillna(0.02),
+        out["tsi_slope_3"].abs() <= tsi_flat_thresh,
         out["Close"].pct_change(3),
         0.0,
     )
+    out["pinning_up_flag"] = (
+        (out["price_change_while_tsi_flat"] > 0.012)
+        & (out["cci_slope_3"] < 0)
+        & (out["pct_b"] > 0.75)
+    ).astype(float)
+    out["pinning_down_flag"] = (
+        (out["price_change_while_tsi_flat"] < -0.012)
+        & (out["cci_slope_3"] > 0)
+        & (out["pct_b"] < 0.25)
+    ).astype(float)
+    out["uo_seed_dir"] = np.tanh(out["price_slope_3"].fillna(0.0) * 20.0)
 
     if benchmark_df is not None and not benchmark_df.empty:
         aligned = benchmark_df["Close"].reindex(out.index).ffill()
@@ -548,9 +583,9 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     is_structural = timeframe in {"daily", "weekly"}
 
     # Fast tactical layer can respond quickly, but do not invert the heat structure.
-    if is_tactical and uo_pct > 0.88 and uo_gap < 0 and uo_slope3 < 0 and rsi_val > 68:
+    if is_tactical and uo_pct > 0.90 and uo_gap < 0 and uo_slope3 < 0 and rsi_val > 68:
         return "PUT", "Tactical momentum rolling from elevated zone"
-    if is_tactical and uo_pct > 0.80 and uo_gap > 0 and uo_slope3 >= 0:
+    if is_tactical and uo_pct > 0.78 and uo_gap > 0 and uo_slope3 >= 0:
         return "CALL", "Composite rising above signal"
     if is_tactical and uo_pct < 0.20 and uo_gap > 0 and uo_slope3 > 0 and rsi_val < 38:
         return "CALL", "Turning up from washed-out zone"
