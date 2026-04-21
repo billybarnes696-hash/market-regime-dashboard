@@ -207,7 +207,7 @@ def cache_path(symbol: str, kind: str) -> Path:
 
 def clear_symbol_cache(symbols: List[str]) -> None:
     for s in symbols:
-        for kind in ["daily", "2hour", "hourly_proxy", "2hour_proxy"]:
+        for kind in ["daily", "1hour", "2hour", "hourly_proxy", "2hour_proxy"]:
             p = cache_path(s, kind)
             if p.exists():
                 p.unlink(missing_ok=True)
@@ -338,6 +338,33 @@ def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: st
     return out
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_alpaca_1hour(symbol: str, months: int, key: str, secret: str, feed: str) -> pd.DataFrame:
+    p = cache_path(symbol, "1hour")
+    if is_fresh(p, max_hours=6):
+        try:
+            return pd.read_parquet(p)
+        except Exception:
+            pass
+    client = alpaca_client(key, secret)
+    start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
+    end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
+    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Hour, start=start, end=end, adjustment="raw", feed=feed)
+    raw = client.get_stock_bars(req).df
+    sub = _bars_df_for_symbol(raw, symbol)
+    if sub.empty:
+        return pd.DataFrame()
+    idx = pd.DatetimeIndex(sub.index)
+    if idx.tz is not None:
+        idx = idx.tz_convert(NY_TZ).tz_localize(None)
+    sub.index = idx
+    sub = sub.between_time("09:30", "16:00")
+    sub = normalize_ohlcv(sub)
+    if not sub.empty:
+        sub.to_parquet(p)
+    return sub
+
+
 def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
     return df.resample("W-FRI").agg(agg).dropna(how="any")
@@ -423,7 +450,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     out["uo_gap"] = out["uo"] - out["uo_signal"]
     out["uo_slope_1"] = out["uo"].diff(1)
     out["uo_slope_3"] = out["uo"].diff(3)
-    lookback = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_2hour"} else 252
+    lookback = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"} else 252
     out["uo_pctile"] = true_percentile(out["uo"], lookback)
 
     out["uo_above_signal"] = (out["uo"] > out["uo_signal"]).astype(int)
@@ -472,7 +499,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
         out["vwap"] = rolling_vwap(out, 20)
     out["dist_vwap_pct"] = (out["Close"] / out["vwap"]) - 1
 
-    z_win = 120 if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_2hour"} else 252
+    z_win = 120 if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_1hour", "real_2hour"} else 252
     out["close_zscore"] = rolling_zscore(out["Close"], z_win)
     out["close_zscore_slope_3"] = slope(out["close_zscore"], 3)
 
@@ -504,7 +531,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     else:
         out["rs_bench_slope_5"] = 0.0
 
-    win = 120 if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_2hour"} else 252
+    win = 120 if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_1hour", "real_2hour"} else 252
     for col in [
         "rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14",
         "dist_ema20_pct", "dist_vwap_pct", "close_zscore"
@@ -579,7 +606,7 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     pct_b = float(row.get("pct_b", 0.5))
     gap_strength = float(row.get("uo_gap_strength", 0.0))
 
-    is_tactical = timeframe in {"2hour_proxy", "hourly_proxy", "real_2hour"}
+    is_tactical = timeframe in {"2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"}
     is_structural = timeframe in {"daily", "weekly"}
 
     # Fast tactical layer can respond quickly, but do not invert the heat structure.
@@ -685,24 +712,53 @@ def distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, float]:
     return {"gap": gap, "abs_gap": abs(gap) if pd.notna(gap) else np.nan, "range_pct": abs(gap) / denom * 100 if pd.notna(gap) and pd.notna(denom) else np.nan}
 
 
-def plot_dashboard(symbol: str, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str) -> None:
+def frame_warning_message(row: pd.Series, timeframe_label: str, structural_bias: str = "") -> str:
+    if row is None or row.empty:
+        return f"{timeframe_label}: no data."
+    uo_gap = float(row.get("uo_gap", 0.0))
+    uo_pct = float(row.get("uo_pctile", 0.5))
+    price_slope = float(row.get("price_slope_3", 0.0))
+    tsi_slope = float(row.get("tsi_slope_3", 0.0))
+    cci_slope = float(row.get("cci_slope_3", 0.0))
+    pin_up = int(row.get("pinning_up_flag", 0)) == 1
+    pin_dn = int(row.get("pinning_down_flag", 0)) == 1
+    bullish = (uo_pct < 0.20 and uo_gap > 0) or pin_up
+    bearish = (uo_pct > 0.80 and uo_gap < 0) or pin_dn
+    if bullish and price_slope <= 0:
+        return f"{timeframe_label}: oversold and improving, but price has not lifted yet — early bullish divergence only, confirmation pending."
+    if bullish and price_slope > 0:
+        return f"{timeframe_label}: washed-out rebound is starting to confirm with price improvement."
+    if bearish and price_slope >= 0:
+        return f"{timeframe_label}: exhausted/rolling, but price has not broken yet — be careful pressing shorts before confirmation."
+    if bearish and price_slope < 0:
+        return f"{timeframe_label}: exhaustion is starting to confirm with price weakness."
+    if abs(tsi_slope) < 0.05 and cci_slope < 0 and price_slope >= 0:
+        return f"{timeframe_label}: momentum is fading under the surface while price still holds — caution, but not a confirmed short yet."
+    if abs(tsi_slope) < 0.05 and cci_slope > 0 and price_slope <= 0:
+        return f"{timeframe_label}: internal momentum is improving while price still lags — watch for upside confirmation."
+    if structural_bias:
+        return f"{timeframe_label}: aligned with the broader {structural_bias.lower()} bias, with no special exhaustion warning right now."
+    return f"{timeframe_label}: mixed state, no clear exhaustion or washout warning."
+
+
+def plot_dashboard(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str) -> None:
     fig = make_subplots(
-        rows=4, cols=1, vertical_spacing=0.05,
-        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", f"{tactical_label} Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
-        row_heights=[0.36, 0.22, 0.22, 0.20],
+        rows=5, cols=1, vertical_spacing=0.04,
+        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", "Hourly Ultimate Oscillator", f"{tactical_label} Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
+        row_heights=[0.30, 0.18, 0.18, 0.18, 0.16],
     )
     if not daily_df.empty:
         d = daily_df.tail(260)
         fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Daily"), row=1, col=1)
         fig.add_trace(go.Scatter(x=d.index, y=d["ema_20"], name="EMA20", line=dict(color="orange")), row=1, col=1)
         fig.add_trace(go.Scatter(x=d.index, y=d["sma_50"], name="SMA50", line=dict(color="blue")), row=1, col=1)
-    for row_num, frame in zip([2, 3, 4], [tactical_df.tail(260), daily_df.tail(260), weekly_df.tail(160)]):
+    for row_num, frame, nm in zip([2,3,4,5], [hourly_df.tail(260), tactical_df.tail(260), daily_df.tail(260), weekly_df.tail(160)], ["Hourly","Tactical","Daily","Weekly"]):
         if frame.empty:
             continue
-        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo"], name=f"UO {row_num}", line=dict(color="red", width=2.5)), row=row_num, col=1)
-        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"Signal {row_num}", line=dict(color="black", width=1.4)), row=row_num, col=1)
+        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo"], name=f"{nm} UO", line=dict(color="red", width=2.3)), row=row_num, col=1)
+        fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"{nm} Signal", line=dict(color="black", width=1.3)), row=row_num, col=1)
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row_num, col=1)
-    fig.update_layout(height=1150, xaxis_rangeslider_visible=False, legend_orientation="h")
+    fig.update_layout(height=1380, xaxis_rangeslider_visible=False, legend_orientation="h")
     st.plotly_chart(fig, width="stretch")
 
 
@@ -778,12 +834,19 @@ for i, sym in enumerate(symbols):
     else:
         tactical_raw, tactical_timeframe, tactical_label = time_compressed_proxy(daily_raw, "hourly_proxy")
 
+    hourly_raw = fetch_alpaca_1hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
+    if hourly_raw.empty:
+        hourly_raw, hourly_timeframe, hourly_label = time_compressed_proxy(daily_raw, "hourly_proxy")
+    else:
+        hourly_timeframe, hourly_label = "real_1hour", "Real 1-Hour"
     weekly_raw = resample_weekly(daily_raw)
+    hourly_df = enrich_price_features(hourly_raw, hourly_timeframe, benchmark_daily)
     tactical_df = enrich_price_features(tactical_raw, tactical_timeframe, benchmark_daily)
     daily_df = enrich_price_features(daily_raw, "daily", benchmark_daily)
     weekly_df = enrich_price_features(weekly_raw, "weekly", benchmark_daily)
 
     asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date)
+    hourly_view = slice_asof(hourly_df, asof)
     tactical_view = slice_asof(tactical_df, asof)
     daily_view = slice_asof(daily_df, asof)
     weekly_view = slice_asof(weekly_df, asof)
@@ -791,10 +854,12 @@ for i, sym in enumerate(symbols):
         rows.append({"Symbol": sym, "Status": "No data on date"})
         continue
 
+    hourly_row = hourly_view.iloc[-1] if not hourly_view.empty else pd.Series(dtype=float)
     tactical_row = tactical_view.iloc[-1] if not tactical_view.empty else pd.Series(dtype=float)
     daily_row = daily_view.iloc[-1]
     weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
 
+    hourly_call, hourly_reason = classify_timeframe_call(hourly_row, hourly_timeframe)
     tactical_call, tactical_reason = classify_timeframe_call(tactical_row, tactical_timeframe)
     daily_call, daily_reason = classify_timeframe_call(daily_row, "daily")
     weekly_call, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
@@ -815,6 +880,7 @@ for i, sym in enumerate(symbols):
         "Symbol": sym,
         "Status": "OK",
         "As Of": str(daily_row.name.date()),
+        "Hourly": hourly_call,
         "Tactical": tactical_call,
         "Daily": daily_call,
         "Weekly": weekly_call,
@@ -831,6 +897,8 @@ for i, sym in enumerate(symbols):
         "Analog 2d Up %": round(float(analog_summary.get("ret_2_p_up", np.nan)) * 100, 1) if analog_summary else np.nan,
     })
     detail[sym] = {
+        "hourly": hourly_view,
+        "hourly_call": (hourly_call, hourly_reason),
         "tactical": tactical_view,
         "daily": daily_view,
         "weekly": weekly_view,
@@ -867,20 +935,30 @@ st.session_state.selected_symbol = selected
 item = detail[selected]
 
 st.subheader("Detailed Analysis")
+hourly_call, hourly_reason = item["hourly_call"]
 tactical_call, tactical_reason = item["tactical_call"]
 daily_call, daily_reason = item["daily_call"]
 weekly_call, weekly_reason = item["weekly_call"]
 tactical_label = item["tactical_label"]
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric(tactical_label, tactical_call)
-c2.metric("Daily", daily_call)
-c3.metric("Weekly", weekly_call)
-c4.metric("Combined", item["combined"])
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Hourly", hourly_call)
+c2.metric(tactical_label, tactical_call)
+c3.metric("Daily", daily_call)
+c4.metric("Weekly", weekly_call)
+c5.metric("Combined", item["combined"])
+st.markdown(f"**Hourly reason:** {hourly_reason}")
 st.markdown(f"**{tactical_label} reason:** {tactical_reason}")
 st.markdown(f"**Daily reason:** {daily_reason}")
 st.markdown(f"**Weekly reason:** {weekly_reason}")
 st.markdown(f"**Recommendation:** {item['recommendation']}")
+
+structural_bias = item["combined"] if item["combined"] != "NEUTRAL" else daily_call
+st.markdown("### Frame warnings")
+st.write(frame_warning_message(item["hourly"].iloc[-1] if not item["hourly"].empty else pd.Series(dtype=float), "Hourly", structural_bias))
+st.write(frame_warning_message(item["tactical"].iloc[-1] if not item["tactical"].empty else pd.Series(dtype=float), tactical_label, structural_bias))
+st.write(frame_warning_message(item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float), "Daily", structural_bias))
+st.write(frame_warning_message(item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float), "Weekly", structural_bias))
 
 cross = item["cross"]
 cd1, cd2, cd3 = st.columns(3)
@@ -896,10 +974,12 @@ sv2.metric("Bars < 10", str(sev.get("bars_below_10", 0)))
 sv3.metric("Late-cycle", "Yes" if sev.get("late_cycle_flag", 0) else "No")
 
 # As-of table
+last_h = item["hourly"].iloc[-1] if not item["hourly"].empty else pd.Series(dtype=float)
 last_t = item["tactical"].iloc[-1] if not item["tactical"].empty else pd.Series(dtype=float)
 last_d = item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)
 last_w = item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float)
 asof_table = pd.DataFrame([
+    {"Frame": "Hourly", "Date": str(last_h.name.date()) if not last_h.empty else "n/a", "Price": round(float(last_h.get("Close", np.nan)), 2) if not last_h.empty else np.nan, "UO": round(float(last_h.get("uo", np.nan)), 4) if not last_h.empty else np.nan, "Signal": round(float(last_h.get("uo_signal", np.nan)), 4) if not last_h.empty else np.nan, "Percentile": round(float(last_h.get("uo_pctile", np.nan))*100, 1) if not last_h.empty else np.nan, "Candle Score": round(float(last_h.get("candle_score", np.nan)), 1) if not last_h.empty else np.nan},
     {"Frame": tactical_label, "Date": str(last_t.name.date()) if not last_t.empty else "n/a", "Price": round(float(last_t.get("Close", np.nan)), 2) if not last_t.empty else np.nan, "UO": round(float(last_t.get("uo", np.nan)), 4) if not last_t.empty else np.nan, "Signal": round(float(last_t.get("uo_signal", np.nan)), 4) if not last_t.empty else np.nan, "Percentile": round(float(last_t.get("uo_pctile", np.nan))*100, 1) if not last_t.empty else np.nan, "Candle Score": round(float(last_t.get("candle_score", np.nan)), 1) if not last_t.empty else np.nan},
     {"Frame": "Daily", "Date": str(last_d.name.date()) if not last_d.empty else "n/a", "Price": round(float(last_d.get("Close", np.nan)), 2) if not last_d.empty else np.nan, "UO": round(float(last_d.get("uo", np.nan)), 4) if not last_d.empty else np.nan, "Signal": round(float(last_d.get("uo_signal", np.nan)), 4) if not last_d.empty else np.nan, "Percentile": round(float(last_d.get("uo_pctile", np.nan))*100, 1) if not last_d.empty else np.nan, "Candle Score": round(float(last_d.get("candle_score", np.nan)), 1) if not last_d.empty else np.nan},
     {"Frame": "Weekly", "Date": str(last_w.name.date()) if not last_w.empty else "n/a", "Price": round(float(last_w.get("Close", np.nan)), 2) if not last_w.empty else np.nan, "UO": round(float(last_w.get("uo", np.nan)), 4) if not last_w.empty else np.nan, "Signal": round(float(last_w.get("uo_signal", np.nan)), 4) if not last_w.empty else np.nan, "Percentile": round(float(last_w.get("uo_pctile", np.nan))*100, 1) if not last_w.empty else np.nan, "Candle Score": round(float(last_w.get("candle_score", np.nan)), 1) if not last_w.empty else np.nan},
@@ -927,4 +1007,4 @@ if analog_summary:
 else:
     st.caption("No analog set available for this as-of date.")
 
-plot_dashboard(selected, item["tactical"], item["daily"], item["weekly"], item["asof"], tactical_label)
+plot_dashboard(selected, item["hourly"], item["tactical"], item["daily"], item["weekly"], item["asof"], tactical_label)
