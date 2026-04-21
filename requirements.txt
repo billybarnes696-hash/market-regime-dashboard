@@ -7,3 +7,4 @@ alpaca-py>=0.21.0
 python-dateutil>=2.9
 pytz>=2024.1
 scipy>=1.11
+pyarrow>=15.0
