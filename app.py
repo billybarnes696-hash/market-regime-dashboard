@@ -114,6 +114,28 @@ def rolling_zscore(series: pd.Series, window: int = 252) -> pd.Series:
     return (series - mean) / std.replace(0, np.nan)
 
 
+def rolling_vwap(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    vol = df["Volume"].fillna(0.0)
+    pv = typical * vol
+    pv_sum = pv.rolling(window, min_periods=max(5, window // 4)).sum()
+    v_sum = vol.rolling(window, min_periods=max(5, window // 4)).sum()
+    return pv_sum / v_sum.replace(0, np.nan)
+
+
+def session_vwap(df: pd.DataFrame) -> pd.Series:
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    vol = df["Volume"].fillna(0.0)
+    if isinstance(df.index, pd.DatetimeIndex):
+        groups = df.index.date
+    else:
+        groups = np.arange(len(df))
+    cum_pv = (typical * vol).groupby(groups).cumsum()
+    cum_v = vol.groupby(groups).cumsum()
+    return cum_pv / cum_v.replace(0, np.nan)
+
+
+
 def hybrid_normalize(series: pd.Series, window: int) -> pd.Series:
     pct = true_percentile(series, window)
     z = rolling_zscore(series, window).clip(-3, 3)
@@ -395,6 +417,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     return out
 
 
+
 def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     if df.empty:
         return df.copy()
@@ -404,28 +427,55 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     out["sma_50"] = sma(out["Close"], 50)
     out["atr_14"] = atr(out, 14)
     out["atr_stretch"] = (out["Close"] - out["ema_20"]) / out["atr_14"].replace(0, np.nan)
+
     out["rsi_14"] = rsi(out["Close"], 14)
     out["rsi_slope_3"] = slope(out["rsi_14"], 3)
+
     out["cci_20"] = cci(out, 20)
     out["cci_slope_3"] = slope(out["cci_20"], 3)
+
     out["tsi"], out["tsi_signal"] = tsi(out["Close"], 25, 13, 7)
     out["tsi_gap"] = out["tsi"] - out["tsi_signal"]
     out["tsi_slope_3"] = slope(out["tsi"], 3)
+
     out["pct_b"] = bollinger_pct_b(out["Close"], 20, 2)
     out["adx_14"] = adx(out, 14)
     out["price_slope_3"] = slope(out["Close"], 3)
     out["dist_ema20_pct"] = (out["Close"] / out["ema_20"]) - 1
+
+    if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_2hour"}:
+        out["vwap"] = session_vwap(out)
+    else:
+        out["vwap"] = rolling_vwap(out, 20)
+    out["dist_vwap_pct"] = (out["Close"] / out["vwap"]) - 1
+
+    z_win = 120 if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_2hour"} else 252
+    out["close_zscore"] = rolling_zscore(out["Close"], z_win)
+    out["close_zscore_slope_3"] = slope(out["close_zscore"], 3)
+
     out["close_in_range"] = (out["Close"] - out["Low"]) / (out["High"] - out["Low"]).replace(0, np.nan)
     out["upper_wick_pct"] = (out["High"] - out[["Close", "Open"]].max(axis=1)) / (out["High"] - out["Low"]).replace(0, np.nan)
     out["candle_score"] = 50 + out["upper_wick_pct"].fillna(0) * 30 - (out["close_in_range"].fillna(0.5) - 0.5) * 20
+
+    out["price_change_while_tsi_flat"] = np.where(
+        out["tsi_slope_3"].abs() <= out["tsi_slope_3"].abs().rolling(50, min_periods=10).median().fillna(0.02),
+        out["Close"].pct_change(3),
+        0.0,
+    )
+
     if benchmark_df is not None and not benchmark_df.empty:
         aligned = benchmark_df["Close"].reindex(out.index).ffill()
         out["rs_bench_slope_5"] = slope(out["Close"] / aligned, 5)
     else:
         out["rs_bench_slope_5"] = 0.0
-    win = 120 if timeframe_name in {"2hour_proxy", "hourly_proxy", "real_2hour"} else 252
-    for col in ["rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14", "dist_ema20_pct"]:
+
+    win = 120 if timeframe_name in {"hourly_proxy", "2hour_proxy", "real_2hour"} else 252
+    for col in [
+        "rsi_14", "cci_20", "tsi", "pct_b", "atr_stretch", "adx_14",
+        "dist_ema20_pct", "dist_vwap_pct", "close_zscore"
+    ]:
         out[f"{col}_pctile"] = hybrid_normalize(out[col], win)
+
     out = add_ultimate_oscillator(out, timeframe_name)
     return out
 
@@ -438,10 +488,15 @@ def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 ANALOG_FEATURES = [
-    "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3", "rsi_14_pctile", "rsi_14",
-    "cci_20_pctile", "cci_20", "tsi_pctile", "tsi", "tsi_gap", "pct_b_pctile", "pct_b",
-    "atr_stretch_pctile", "atr_stretch", "dist_ema20_pctile", "dist_ema20_pct", "rs_bench_slope_5",
-    "adx_14_pctile", "adx_14", "candle_score",
+    "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3",
+    "tsi", "tsi_gap", "tsi_slope_3", "tsi_pctile",
+    "cci_20", "cci_slope_3", "cci_20_pctile",
+    "pct_b", "pct_b_pctile",
+    "dist_vwap_pct", "dist_vwap_pctile",
+    "close_zscore", "close_zscore_slope_3", "close_zscore_pctile",
+    "adx_14", "adx_14_pctile",
+    "price_change_while_tsi_flat", "pinning_up_flag", "pinning_down_flag",
+    "rs_bench_slope_5", "candle_score",
 ]
 
 
@@ -620,7 +675,7 @@ def plot_dashboard(symbol: str, tactical_df: pd.DataFrame, daily_df: pd.DataFram
 # Sidebar
 # -----------------------------
 st.title("📈 Stable Market Engine Clean")
-st.caption("Alpaca-only | raw prices | cleaner date loader | real 2-hour option")
+st.caption("Alpaca-only | raw prices | smooth ultimate oscillator (TSI/CCI/%B/VWAP/ADX/ZScore) | real 2-hour option")
 
 with st.sidebar:
     st.header("Credentials")
