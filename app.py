@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -266,7 +267,10 @@ def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: s
     start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(years=max(years, 5))).normalize().tz_localize(None)
     end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
     req = StockBarsRequest(symbol_or_symbols=missing, timeframe=TimeFrame.Day, start=start, end=end, adjustment="raw", feed=feed)
-    raw = client.get_stock_bars(req).df
+    try:
+        raw = client.get_stock_bars(req).df
+    except Exception:
+        return data_map
     for s in missing:
         sub = _bars_df_for_symbol(raw, s)
         if not sub.empty:
@@ -287,7 +291,15 @@ def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: st
     start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
     end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
     req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(30, TimeFrameUnit.Minute), start=start, end=end, adjustment="raw", feed=feed)
-    raw = client.get_stock_bars(req).df
+    raw = None
+    for attempt in range(3):
+        try:
+            raw = client.get_stock_bars(req).df
+            break
+        except Exception:
+            if attempt == 2:
+                return pd.DataFrame()
+            time.sleep(1.5 * (attempt + 1))
     sub = _bars_df_for_symbol(raw, symbol)
     if sub.empty:
         return pd.DataFrame()
@@ -350,7 +362,15 @@ def fetch_alpaca_1hour(symbol: str, months: int, key: str, secret: str, feed: st
     start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
     end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
     req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Hour, start=start, end=end, adjustment="raw", feed=feed)
-    raw = client.get_stock_bars(req).df
+    raw = None
+    for attempt in range(3):
+        try:
+            raw = client.get_stock_bars(req).df
+            break
+        except Exception:
+            if attempt == 2:
+                return pd.DataFrame()
+            time.sleep(1.5 * (attempt + 1))
     sub = _bars_df_for_symbol(raw, symbol)
     if sub.empty:
         return pd.DataFrame()
@@ -385,22 +405,25 @@ def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, 
 
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
     spans = {
-        # proxies stay faster, daily/weekly remain structural, real 2-hour gets extra smoothing.
-        "2hour_proxy": (9, 21, 6),
-        "hourly_proxy": (5, 13, 4),
+        # lower frames are intentionally slowed to reduce noise and align with the trend stack.
+        "hourly_proxy": (8, 21, 7),
+        "real_1hour": (8, 21, 7),
+        "2hour_proxy": (10, 26, 8),
+        "real_2hour": (10, 26, 8),
         "daily": (16, 42, 10),
         "weekly": (8, 21, 7),
-        "real_2hour": (13, 34, 8),
     }
     pre_smooth_map = {
-        "hourly_proxy": 2,
+        "hourly_proxy": 3,
+        "real_1hour": 4,
         "2hour_proxy": 3,
         "real_2hour": 5,
         "daily": 5,
         "weekly": 3,
     }
     post_smooth_map = {
-        "hourly_proxy": 1,
+        "hourly_proxy": 2,
+        "real_1hour": 2,
         "2hour_proxy": 2,
         "real_2hour": 3,
         "daily": 1,
@@ -741,10 +764,39 @@ def frame_warning_message(row: pd.Series, timeframe_label: str, structural_bias:
     return f"{timeframe_label}: mixed state, no clear exhaustion or washout warning."
 
 
+def traffic_state(call: str, row: pd.Series) -> Tuple[str, str]:
+    if row is None or row.empty:
+        return "⚪", "No data"
+    pct = float(row.get("uo_pctile", 0.5))
+    gap = float(row.get("uo_gap", 0.0))
+    slope3 = float(row.get("uo_slope_3", 0.0))
+    if call == "CALL":
+        if pct < 0.20 and gap > 0 and slope3 > 0:
+            return "🟢", "Bull turn"
+        return "🟢", "Bullish"
+    if call == "PUT":
+        if pct > 0.80 and gap < 0 and slope3 < 0:
+            return "🔴", "Bear roll"
+        return "🔴", "Bearish"
+    if pct > 0.80 or pct < 0.20:
+        return "🟡", "Extreme"
+    return "🟡", "Neutral"
+
+
+def render_traffic_lights(frame_items: List[Tuple[str, str, pd.Series]]) -> None:
+    st.markdown("### Traffic lights")
+    cols = st.columns(len(frame_items))
+    for col, (label, call, row) in zip(cols, frame_items):
+        emoji, sub = traffic_state(call, row)
+        col.markdown(f"<div style='text-align:center;font-size:40px;line-height:1.1'>{emoji}</div>", unsafe_allow_html=True)
+        col.markdown(f"**{label}**")
+        col.caption(f"{call} · {sub}")
+
+
 def plot_dashboard(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str) -> None:
     fig = make_subplots(
         rows=5, cols=1, vertical_spacing=0.04,
-        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", "Hourly Ultimate Oscillator", f"{tactical_label} Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
+        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", "1-Hour Ultimate Oscillator", f"{tactical_label} Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
         row_heights=[0.30, 0.18, 0.18, 0.18, 0.16],
     )
     if not daily_df.empty:
@@ -766,7 +818,7 @@ def plot_dashboard(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFra
 # Sidebar
 # -----------------------------
 st.title("📈 Stable Market Engine Clean")
-st.caption("Alpaca-only | raw prices | smooth ultimate oscillator (TSI/CCI/%B/VWAP/ADX/ZScore) | real 2-hour option")
+st.caption("Alpaca-only | raw prices | smooth ultimate oscillator (TSI/CCI/%B/VWAP/ADX/ZScore) | proxy default | 1h/2h/daily/weekly stack")
 
 with st.sidebar:
     st.header("Credentials")
@@ -783,7 +835,7 @@ with st.sidebar:
     history_years = st.selectbox("Historical years", [3, 5, 10], index=1)
     analysis_mode = st.radio("Analysis mode", ["Current", "Historical"], index=0)
     analysis_date = st.date_input("Calendar lookback", value=pd.Timestamp.today().date(), disabled=(analysis_mode == "Current"))
-    tactical_mode = st.radio("Tactical mode", ["2hour_real", "2hour_proxy", "hourly_proxy"], index=0, format_func=lambda x: {"2hour_real": "Real Alpaca 2-Hour", "2hour_proxy": "2-Hour Proxy", "hourly_proxy": "Hourly Proxy"}[x])
+    intraday_source = st.radio("Intraday source", ["proxy", "real"], index=0, format_func=lambda x: {"proxy": "Proxy (default)", "real": "Real Alpaca"}[x])
     force_refresh = st.checkbox("Force refresh data (clear cache)", value=False)
     run_analysis = st.button("Run Analysis", type="primary", width="stretch")
 
@@ -805,6 +857,7 @@ if force_refresh:
     clear_symbol_cache(all_syms)
     fetch_alpaca_daily_batch.clear()
     fetch_alpaca_2hour.clear()
+    fetch_alpaca_1hour.clear()
 
 st.info("Loading Alpaca daily data...")
 daily_map = fetch_alpaca_daily_batch(all_syms, history_years, alpaca_key, alpaca_secret, feed)
@@ -823,22 +876,25 @@ for i, sym in enumerate(symbols):
         rows.append({"Symbol": sym, "Status": "No data"})
         continue
 
-    if tactical_mode == "2hour_real":
+    if intraday_source == "real":
         tactical_raw = fetch_alpaca_2hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
         tactical_timeframe = "real_2hour"
-        tactical_label = "Real 2-Hour"
+        tactical_label = "2-Hour (Real)"
         if tactical_raw.empty:
-            tactical_raw, tactical_timeframe, tactical_label = time_compressed_proxy(daily_raw, "2hour_proxy")
-    elif tactical_mode == "2hour_proxy":
-        tactical_raw, tactical_timeframe, tactical_label = time_compressed_proxy(daily_raw, "2hour_proxy")
-    else:
-        tactical_raw, tactical_timeframe, tactical_label = time_compressed_proxy(daily_raw, "hourly_proxy")
+            tactical_raw, tactical_timeframe, _ = time_compressed_proxy(daily_raw, "2hour_proxy")
+            tactical_label = "2-Hour (Proxy Fallback)"
 
-    hourly_raw = fetch_alpaca_1hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
-    if hourly_raw.empty:
-        hourly_raw, hourly_timeframe, hourly_label = time_compressed_proxy(daily_raw, "hourly_proxy")
+        hourly_raw = fetch_alpaca_1hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
+        if hourly_raw.empty:
+            hourly_raw, hourly_timeframe, _ = time_compressed_proxy(daily_raw, "hourly_proxy")
+            hourly_label = "1-Hour (Proxy Fallback)"
+        else:
+            hourly_timeframe, hourly_label = "real_1hour", "1-Hour (Real)"
     else:
-        hourly_timeframe, hourly_label = "real_1hour", "Real 1-Hour"
+        tactical_raw, tactical_timeframe, _ = time_compressed_proxy(daily_raw, "2hour_proxy")
+        tactical_label = "2-Hour (Proxy)"
+        hourly_raw, hourly_timeframe, _ = time_compressed_proxy(daily_raw, "hourly_proxy")
+        hourly_label = "1-Hour (Proxy)"
     weekly_raw = resample_weekly(daily_raw)
     hourly_df = enrich_price_features(hourly_raw, hourly_timeframe, benchmark_daily)
     tactical_df = enrich_price_features(tactical_raw, tactical_timeframe, benchmark_daily)
@@ -898,6 +954,7 @@ for i, sym in enumerate(symbols):
     })
     detail[sym] = {
         "hourly": hourly_view,
+        "hourly_label": hourly_label,
         "hourly_call": (hourly_call, hourly_reason),
         "tactical": tactical_view,
         "daily": daily_view,
@@ -940,14 +997,22 @@ tactical_call, tactical_reason = item["tactical_call"]
 daily_call, daily_reason = item["daily_call"]
 weekly_call, weekly_reason = item["weekly_call"]
 tactical_label = item["tactical_label"]
+hourly_label = item["hourly_label"]
+
+render_traffic_lights([
+    (hourly_label, hourly_call, item["hourly"].iloc[-1] if not item["hourly"].empty else pd.Series(dtype=float)),
+    (tactical_label, tactical_call, item["tactical"].iloc[-1] if not item["tactical"].empty else pd.Series(dtype=float)),
+    ("Daily", daily_call, item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)),
+    ("Weekly", weekly_call, item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float)),
+])
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Hourly", hourly_call)
+c1.metric(hourly_label, hourly_call)
 c2.metric(tactical_label, tactical_call)
 c3.metric("Daily", daily_call)
 c4.metric("Weekly", weekly_call)
 c5.metric("Combined", item["combined"])
-st.markdown(f"**Hourly reason:** {hourly_reason}")
+st.markdown(f"**{hourly_label} reason:** {hourly_reason}")
 st.markdown(f"**{tactical_label} reason:** {tactical_reason}")
 st.markdown(f"**Daily reason:** {daily_reason}")
 st.markdown(f"**Weekly reason:** {weekly_reason}")
@@ -955,7 +1020,7 @@ st.markdown(f"**Recommendation:** {item['recommendation']}")
 
 structural_bias = item["combined"] if item["combined"] != "NEUTRAL" else daily_call
 st.markdown("### Frame warnings")
-st.write(frame_warning_message(item["hourly"].iloc[-1] if not item["hourly"].empty else pd.Series(dtype=float), "Hourly", structural_bias))
+st.write(frame_warning_message(item["hourly"].iloc[-1] if not item["hourly"].empty else pd.Series(dtype=float), hourly_label, structural_bias))
 st.write(frame_warning_message(item["tactical"].iloc[-1] if not item["tactical"].empty else pd.Series(dtype=float), tactical_label, structural_bias))
 st.write(frame_warning_message(item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float), "Daily", structural_bias))
 st.write(frame_warning_message(item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float), "Weekly", structural_bias))
@@ -979,7 +1044,7 @@ last_t = item["tactical"].iloc[-1] if not item["tactical"].empty else pd.Series(
 last_d = item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)
 last_w = item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float)
 asof_table = pd.DataFrame([
-    {"Frame": "Hourly", "Date": str(last_h.name.date()) if not last_h.empty else "n/a", "Price": round(float(last_h.get("Close", np.nan)), 2) if not last_h.empty else np.nan, "UO": round(float(last_h.get("uo", np.nan)), 4) if not last_h.empty else np.nan, "Signal": round(float(last_h.get("uo_signal", np.nan)), 4) if not last_h.empty else np.nan, "Percentile": round(float(last_h.get("uo_pctile", np.nan))*100, 1) if not last_h.empty else np.nan, "Candle Score": round(float(last_h.get("candle_score", np.nan)), 1) if not last_h.empty else np.nan},
+    {"Frame": hourly_label, "Date": str(last_h.name.date()) if not last_h.empty else "n/a", "Price": round(float(last_h.get("Close", np.nan)), 2) if not last_h.empty else np.nan, "UO": round(float(last_h.get("uo", np.nan)), 4) if not last_h.empty else np.nan, "Signal": round(float(last_h.get("uo_signal", np.nan)), 4) if not last_h.empty else np.nan, "Percentile": round(float(last_h.get("uo_pctile", np.nan))*100, 1) if not last_h.empty else np.nan, "Candle Score": round(float(last_h.get("candle_score", np.nan)), 1) if not last_h.empty else np.nan},
     {"Frame": tactical_label, "Date": str(last_t.name.date()) if not last_t.empty else "n/a", "Price": round(float(last_t.get("Close", np.nan)), 2) if not last_t.empty else np.nan, "UO": round(float(last_t.get("uo", np.nan)), 4) if not last_t.empty else np.nan, "Signal": round(float(last_t.get("uo_signal", np.nan)), 4) if not last_t.empty else np.nan, "Percentile": round(float(last_t.get("uo_pctile", np.nan))*100, 1) if not last_t.empty else np.nan, "Candle Score": round(float(last_t.get("candle_score", np.nan)), 1) if not last_t.empty else np.nan},
     {"Frame": "Daily", "Date": str(last_d.name.date()) if not last_d.empty else "n/a", "Price": round(float(last_d.get("Close", np.nan)), 2) if not last_d.empty else np.nan, "UO": round(float(last_d.get("uo", np.nan)), 4) if not last_d.empty else np.nan, "Signal": round(float(last_d.get("uo_signal", np.nan)), 4) if not last_d.empty else np.nan, "Percentile": round(float(last_d.get("uo_pctile", np.nan))*100, 1) if not last_d.empty else np.nan, "Candle Score": round(float(last_d.get("candle_score", np.nan)), 1) if not last_d.empty else np.nan},
     {"Frame": "Weekly", "Date": str(last_w.name.date()) if not last_w.empty else "n/a", "Price": round(float(last_w.get("Close", np.nan)), 2) if not last_w.empty else np.nan, "UO": round(float(last_w.get("uo", np.nan)), 4) if not last_w.empty else np.nan, "Signal": round(float(last_w.get("uo_signal", np.nan)), 4) if not last_w.empty else np.nan, "Percentile": round(float(last_w.get("uo_pctile", np.nan))*100, 1) if not last_w.empty else np.nan, "Candle Score": round(float(last_w.get("candle_score", np.nan)), 1) if not last_w.empty else np.nan},
