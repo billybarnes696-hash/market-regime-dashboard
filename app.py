@@ -917,17 +917,16 @@ def process_symbol_task(sym: str, data_map: Dict[str, pd.DataFrame], bench_df: p
 # APP MAIN
 # -----------------------------
 st.title("📈 Stable Market Engine Pro")
-st.caption("Batch Fetching | Disk Cache | Parallel Processing | Hybrid rank+severity normalization")
+st.caption("Alpaca-only | Disk Cache | Parallel Processing | Hybrid rank+severity normalization")
 
 with st.sidebar:
     st.header("Inputs")
     manual_symbols = st.text_area("Paste tickers (comma or line separated)", value="SMH, QQQ, INTC, NVDA, AMD, TSLA, META", height=110)
     st.markdown("---")
-    data_provider = st.radio("Market data source", ["yahoo", "alpaca"], index=0)
-    alpaca_key = st.text_input("Alpaca API key", type="password", disabled=(data_provider != "alpaca"))
-    alpaca_secret = st.text_input("Alpaca API secret", type="password", disabled=(data_provider != "alpaca"))
-    alpaca_feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0, disabled=(data_provider != "alpaca"))
-    true_intraday = st.checkbox("Use true Alpaca 2-hour bars", value=True, disabled=(data_provider != "alpaca"))
+    alpaca_key = st.text_input("Alpaca API key", type="password")
+    alpaca_secret = st.text_input("Alpaca API secret", type="password")
+    alpaca_feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0)
+    true_intraday = st.checkbox("Use true Alpaca 2-hour bars", value=True)
 
     st.header("Settings")
     benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "RSP", "IWM"], index=0)
@@ -936,6 +935,7 @@ with st.sidebar:
     default_date = pd.Timestamp.today().date()
     analysis_date = st.date_input("Calendar lookback", value=default_date, disabled=(analysis_mode == "Current"))
     proxy_mode = st.radio("Tactical proxy", ["hourly", "2hour"], index=0)
+    force_refresh = st.checkbox("Force refresh Alpaca cache", value=False)
     run_analysis = st.button("Run Analysis", type="primary", width='stretch')
 
 if not run_analysis:
@@ -950,18 +950,18 @@ if not symbols:
 # 1. Bulk Fetch Data
 # Combine symbols + benchmark to ensure we have everything in one go
 all_fetch_symbols = list(set(symbols + [benchmark]))
-if run_analysis and force_refresh:
+if force_refresh:
     clear_symbol_cache(all_fetch_symbols)
-    fetch_yahoo_batch.clear()
     fetch_alpaca_daily_batch.clear()
     fetch_alpaca_intraday.clear()
 
-if data_provider == "alpaca":
-    all_data_map = fetch_alpaca_daily_batch(all_fetch_symbols, history_years, alpaca_key, alpaca_secret, alpaca_feed)
-    if (not all_data_map) and alpaca_feed == "sip":
-        st.warning("Alpaca SIP feed may require a paid plan. Falling back to IEX may help.")
-else:
-    all_data_map = fetch_yahoo_batch(all_fetch_symbols, history_years)
+if not (alpaca_key or '').strip() or not (alpaca_secret or '').strip():
+    st.error("Enter both Alpaca API key and Alpaca API secret.")
+    st.stop()
+
+all_data_map = fetch_alpaca_daily_batch(all_fetch_symbols, history_years, alpaca_key, alpaca_secret, alpaca_feed)
+if (not all_data_map) and alpaca_feed == "sip":
+    st.warning("Alpaca SIP feed may require a paid plan. Try IEX if SIP returns no data.")
 
 if benchmark not in all_data_map or all_data_map[benchmark].empty:
     st.error(f"Could not fetch benchmark {benchmark}. Check credentials, cache, or network.")
@@ -979,7 +979,7 @@ status_text = st.empty()
 # max_workers=4 is safe; indicator calculation is CPU bound but Pandas releases GIL
 with ThreadPoolExecutor(max_workers=4) as executor:
     futures = {
-        executor.submit(process_symbol_task, s, all_data_map, benchmark_df, proxy_mode, analysis_mode, analysis_date, data_provider, alpaca_key, alpaca_secret, alpaca_feed, true_intraday): s 
+        executor.submit(process_symbol_task, s, all_data_map, benchmark_df, proxy_mode, analysis_mode, analysis_date, "alpaca", alpaca_key, alpaca_secret, alpaca_feed, true_intraday): s 
         for s in symbols
     }
     
