@@ -20,7 +20,7 @@ CACHE_DIR = APP_DIR / "cache_store_alpaca"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NY_TZ = "America/New_York"
 
-st.set_page_config(page_title="Stable Market Engine v9", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stable Market Engine v10", layout="wide", initial_sidebar_state="expanded")
 
 # -----------------------------
 # Utility helpers
@@ -28,6 +28,10 @@ st.set_page_config(page_title="Stable Market Engine v9", layout="wide", initial_
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
+
+
+def smooth_component(series: pd.Series, span: int) -> pd.Series:
+    return ema(series, span) if span and span > 1 else series
 
 
 def sma(series: pd.Series, window: int) -> pd.Series:
@@ -441,7 +445,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
         "proxy_smooth_1hour": 21,
         "real_1hour": 13,
         "proxy_smooth_2hour": 13,
-        "real_2hour": 8,
+        "real_2hour": 10,
         "hourly_proxy": 21,
         "2hour_proxy": 13,
         "daily": 5,
@@ -524,18 +528,32 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     out["atr_14"] = atr(out, 14)
     out["atr_stretch"] = (out["Close"] - out["ema_20"]) / out["atr_14"].replace(0, np.nan)
 
-    out["rsi_14"] = rsi(out["Close"], 14)
+    comp_smooth_map = {
+        "proxy_smooth_1hour": 5,
+        "real_1hour": 4,
+        "proxy_smooth_2hour": 4,
+        "real_2hour": 3,
+        "hourly_proxy": 5,
+        "2hour_proxy": 4,
+        "daily": 2,
+        "weekly": 1,
+    }
+    comp_sm = comp_smooth_map.get(timeframe_name, 3)
+
+    out["rsi_14"] = smooth_component(rsi(out["Close"], 14), comp_sm)
     out["rsi_slope_3"] = slope(out["rsi_14"], 3)
 
-    out["cci_20"] = cci(out, 20)
+    out["cci_20"] = smooth_component(cci(out, 20), comp_sm)
     out["cci_slope_3"] = slope(out["cci_20"], 3)
 
-    out["tsi"], out["tsi_signal"] = tsi(out["Close"], 25, 13, 7)
+    tsi_raw, tsi_sig_raw = tsi(out["Close"], 25, 13, 7)
+    out["tsi"] = smooth_component(tsi_raw, comp_sm)
+    out["tsi_signal"] = smooth_component(tsi_sig_raw, max(2, comp_sm-1))
     out["tsi_gap"] = out["tsi"] - out["tsi_signal"]
     out["tsi_slope_3"] = slope(out["tsi"], 3)
 
-    out["pct_b"] = bollinger_pct_b(out["Close"], 20, 2)
-    out["adx_14"] = adx(out, 14)
+    out["pct_b"] = smooth_component(bollinger_pct_b(out["Close"], 20, 2), comp_sm)
+    out["adx_14"] = smooth_component(adx(out, 14), max(2, comp_sm-1))
     out["price_slope_3"] = slope(out["Close"], 3)
     out["dist_ema20_pct"] = (out["Close"] / out["ema_20"]) - 1
 
@@ -816,32 +834,53 @@ def render_traffic_lights(frame_items: List[Tuple[str, str, pd.Series]]) -> None
         col.caption(f"{call} · {sub}")
 
 
-def plot_dashboard(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str) -> None:
+def _price_panel_trace(fig, frame: pd.DataFrame, row: int, title: str) -> None:
+    if frame.empty:
+        return
+    d = frame.copy()
+    fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=title), row=row, col=1)
+    if "ema_20" in d.columns:
+        fig.add_trace(go.Scatter(x=d.index, y=d["ema_20"], name=f"{title} EMA20", line=dict(color="orange")), row=row, col=1)
+    if "sma_50" in d.columns:
+        fig.add_trace(go.Scatter(x=d.index, y=d["sma_50"], name=f"{title} SMA50", line=dict(color="blue")), row=row, col=1)
+
+
+def _osc_panel_trace(fig, frame: pd.DataFrame, row: int, nm: str) -> None:
+    if frame.empty:
+        return
+    fig.add_trace(go.Scatter(x=frame.index, y=frame.get("uo_viz", frame["uo"]), name=f"{nm} UO", line=dict(color="red", width=2.3)), row=row, col=1)
+    fig.add_trace(go.Scatter(x=frame.index, y=frame.get("uo_signal_viz", frame["uo_signal"]), name=f"{nm} Signal", line=dict(color="black", width=1.3)), row=row, col=1)
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row, col=1)
+
+
+def plot_mega_view(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str) -> None:
     fig = make_subplots(
         rows=5, cols=1, vertical_spacing=0.04,
-        subplot_titles=[f"{symbol} Daily Price (as of {pd.Timestamp(asof_date).date()})", "1-Hour Ultimate Oscillator", f"{tactical_label} Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
+        subplot_titles=[f"{symbol} Price (as of {pd.Timestamp(asof_date).date()})", "1-Hour Ultimate Oscillator", f"{tactical_label} Ultimate Oscillator", "Daily Ultimate Oscillator", "Weekly Ultimate Oscillator"],
         row_heights=[0.30, 0.18, 0.18, 0.18, 0.16],
     )
-    if not daily_df.empty:
-        d = daily_df.tail(260)
-        fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Daily"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=d.index, y=d["ema_20"], name="EMA20", line=dict(color="orange")), row=1, col=1)
-        fig.add_trace(go.Scatter(x=d.index, y=d["sma_50"], name="SMA50", line=dict(color="blue")), row=1, col=1)
-    for row_num, frame, nm in zip([2,3,4,5], [hourly_df.tail(260), tactical_df.tail(260), daily_df.tail(260), weekly_df.tail(160)], ["Hourly","Tactical","Daily","Weekly"]):
-        if frame.empty:
-            continue
-        fig.add_trace(go.Scatter(x=frame.index, y=frame.get("uo_viz", frame["uo"]), name=f"{nm} UO", line=dict(color="red", width=2.3)), row=row_num, col=1)
-        fig.add_trace(go.Scatter(x=frame.index, y=frame.get("uo_signal_viz", frame["uo_signal"]), name=f"{nm} Signal", line=dict(color="black", width=1.3)), row=row_num, col=1)
-        fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row_num, col=1)
+    base_price = daily_df.tail(260) if not daily_df.empty else hourly_df.tail(260)
+    _price_panel_trace(fig, base_price, 1, symbol)
+    _osc_panel_trace(fig, hourly_df.tail(260), 2, "Hourly")
+    _osc_panel_trace(fig, tactical_df.tail(260), 3, "Tactical")
+    _osc_panel_trace(fig, daily_df.tail(260), 4, "Daily")
+    _osc_panel_trace(fig, weekly_df.tail(160), 5, "Weekly")
     fig.update_layout(height=1380, xaxis_rangeslider_visible=False, legend_orientation="h")
     st.plotly_chart(fig, width="stretch")
 
 
+def plot_single_frame(symbol: str, price_df: pd.DataFrame, osc_df: pd.DataFrame, asof_date: pd.Timestamp, frame_title: str) -> None:
+    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.06, subplot_titles=[f"{symbol} Price (as of {pd.Timestamp(asof_date).date()})", frame_title], row_heights=[0.56, 0.44])
+    _price_panel_trace(fig, price_df, 1, symbol)
+    _osc_panel_trace(fig, osc_df, 2, frame_title)
+    fig.update_layout(height=760, xaxis_rangeslider_visible=False, legend_orientation="h")
+    st.plotly_chart(fig, width="stretch")
+
 # -----------------------------
 # Main App
 # -----------------------------
-st.title("📈 Stable Market Engine v9")
-st.caption("Real Alpaca 1h/2h data | decision-viz split | stronger viz-base smoothing for 1h/2h | 1h/2h/daily/weekly stack")
+st.title("📈 Stable Market Engine v10")
+st.caption("Real Alpaca 1h/2h data | decision-viz split | component + viz smoothing for 1h/2h | mega view + tabs | 1h/2h/daily/weekly stack")
 
 with st.sidebar:
     st.header("Credentials")
@@ -943,6 +982,17 @@ for i, sym in enumerate(symbols):
         rows.append({"Symbol": sym, "Status": "No data on date"})
         continue
 
+    intraday_stale = False
+    if analysis_mode == "Current" and not daily_view.empty:
+        daily_dt = pd.Timestamp(daily_view.index[-1]).date()
+        intraday_dates = []
+        if not hourly_view.empty:
+            intraday_dates.append(pd.Timestamp(hourly_view.index[-1]).date())
+        if not tactical_view.empty:
+            intraday_dates.append(pd.Timestamp(tactical_view.index[-1]).date())
+        if intraday_dates and min(intraday_dates) < daily_dt:
+            intraday_stale = True
+
     hourly_row = hourly_view.iloc[-1] if not hourly_view.empty else pd.Series(dtype=float)
     tactical_row = tactical_view.iloc[-1] if not tactical_view.empty else pd.Series(dtype=float)
     daily_row = daily_view.iloc[-1]
@@ -1003,6 +1053,7 @@ for i, sym in enumerate(symbols):
         "cross": cross,
         "asof": asof,
         "tactical_label": tactical_label,
+        "intraday_stale": intraday_stale,
     }
 progress.empty()
 
@@ -1025,6 +1076,8 @@ st.session_state.selected_symbol = selected
 item = detail[selected]
 
 st.subheader("Detailed Analysis")
+if item.get("intraday_stale"):
+    st.warning("Intraday 1h/2h bars appear stale relative to the daily frame. The latest completed intraday bars may still be from the prior session.")
 hourly_call, hourly_reason = item["hourly_call"]
 tactical_call, tactical_reason = item["tactical_call"]
 daily_call, daily_reason = item["daily_call"]
@@ -1104,4 +1157,16 @@ if analog_summary:
 else:
     st.caption("No analog set available for this as-of date.")
 
-plot_dashboard(selected, item["hourly"], item["tactical"], item["daily"], item["weekly"], item["asof"], tactical_label)
+st.markdown("### Mega view")
+plot_mega_view(selected, item["hourly"], item["tactical"], item["daily"], item["weekly"], item["asof"], tactical_label)
+
+st.markdown("### Frame tabs")
+tab1, tab2, tab3, tab4 = st.tabs([hourly_label, tactical_label, "Daily", "Weekly"])
+with tab1:
+    plot_single_frame(selected, item["hourly"].tail(260) if not item["hourly"].empty else item["daily"].tail(260), item["hourly"].tail(260), item["asof"], hourly_label)
+with tab2:
+    plot_single_frame(selected, item["tactical"].tail(260) if not item["tactical"].empty else item["daily"].tail(260), item["tactical"].tail(260), item["asof"], tactical_label)
+with tab3:
+    plot_single_frame(selected, item["daily"].tail(260), item["daily"].tail(260), item["asof"], "Daily Ultimate Oscillator")
+with tab4:
+    plot_single_frame(selected, item["weekly"].tail(160), item["weekly"].tail(160), item["asof"], "Weekly Ultimate Oscillator")
