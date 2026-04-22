@@ -79,6 +79,14 @@ def _to_ny_index(idx) -> pd.DatetimeIndex:
     return idx.tz_convert("America/New_York")
 
 
+def normalize_frame_index(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.index = _to_ny_index(out.index)
+    out = out.sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    return out
+
+
 def anchored_intraday_vwap(df: pd.DataFrame) -> pd.Series:
     out = pd.Series(index=df.index, dtype=float)
     local_idx = _to_ny_index(df.index)
@@ -301,8 +309,16 @@ def compute_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
 
 def merge_higher_state(lower_df: pd.DataFrame, higher_df: pd.DataFrame) -> pd.DataFrame:
     cols = ["State", "Regime_bucket", "TSI", "TSI_signal", "TSI_gap", "TSI_slope"]
-    tmp = higher_df[cols].copy().sort_index()
-    out = pd.merge_asof(lower_df.sort_index(), tmp, left_index=True, right_index=True, direction="backward", suffixes=("", "_higher"))
+    lower = normalize_frame_index(lower_df)
+    tmp = normalize_frame_index(higher_df[cols].copy())
+    out = pd.merge_asof(
+        lower,
+        tmp,
+        left_index=True,
+        right_index=True,
+        direction="backward",
+        suffixes=("", "_higher"),
+    )
     return out.rename(columns={
         "State_higher": "Higher_State",
         "Regime_bucket_higher": "Higher_Regime",
@@ -409,11 +425,12 @@ if intraday_1h_real.empty or daily.empty:
     st.error("No data returned from Alpaca. Check symbol, credentials, and feed.")
     st.stop()
 
-intraday_1h_real = filter_regular_hours(intraday_1h_real)
-intraday_2h_real = to_2h_session(intraday_1h_real)
-intraday_1h_proxy = build_proxy_intraday_from_daily(daily, "1H")
-intraday_2h_proxy = build_proxy_intraday_from_daily(daily, "2H")
-weekly = to_weekly(daily)
+intraday_1h_real = normalize_frame_index(filter_regular_hours(intraday_1h_real))
+intraday_2h_real = normalize_frame_index(to_2h_session(intraday_1h_real))
+intraday_1h_proxy = normalize_frame_index(build_proxy_intraday_from_daily(daily, "1H"))
+intraday_2h_proxy = normalize_frame_index(build_proxy_intraday_from_daily(daily, "2H"))
+daily = normalize_frame_index(daily)
+weekly = normalize_frame_index(to_weekly(daily))
 
 feat_1h_real = compute_features(intraday_1h_real, "1H")
 feat_2h_real = compute_features(intraday_2h_real, "2H")
