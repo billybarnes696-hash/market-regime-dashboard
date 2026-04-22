@@ -148,6 +148,18 @@ def traffic_emoji(state: str) -> str:
     return "🟡"
 
 
+def ensure_nonempty_frame(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df.copy()
+
+
+def safe_last_row(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+    return df.iloc[-1]
+
+
 def _normalize_bars_df(bars_df: pd.DataFrame) -> pd.DataFrame:
     if bars_df is None or len(bars_df) == 0:
         return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -458,8 +470,17 @@ feat_daily = merge_higher_state(feat_daily, feat_weekly)
 feat_weekly["Higher_State"] = feat_weekly["State"]
 feat_weekly["Higher_Regime"] = feat_weekly["Regime_bucket"]
 
-frames = {"1H": feat_1h, "2H": feat_2h, "Daily": feat_daily, "Weekly": feat_weekly}
-latest = {k: v.iloc[-1] for k, v in frames.items()}
+frames = {
+    "1H": ensure_nonempty_frame(feat_1h, "1H"),
+    "2H": ensure_nonempty_frame(feat_2h, "2H"),
+    "Daily": ensure_nonempty_frame(feat_daily, "Daily"),
+    "Weekly": ensure_nonempty_frame(feat_weekly, "Weekly"),
+}
+latest = {k: safe_last_row(v) for k, v in frames.items()}
+
+missing = [k for k, v in frames.items() if v.empty]
+if missing:
+    st.warning("Missing or empty frame(s): " + ", ".join(missing) + ". The dashboard will show available frames only.")
 
 st.subheader("Traffic lights")
 c1, c2, c3, c4 = st.columns(4)
@@ -467,57 +488,79 @@ for col, tf in zip([c1, c2, c3, c4], ["1H", "2H", "Daily", "Weekly"]):
     row = latest[tf]
     with col:
         label_prefix = "Proxy " if (tf in ["1H","2H"] and intraday_source == "Proxy from Daily") else ""
-        st.metric(f"{label_prefix}{tf}", f"{traffic_emoji(row['State'])} {row['State']}")
-        st.caption(f"Regime: {row['Regime_bucket']}")
-        st.caption(f"Divergence: {row['Divergence']}")
+        if row is None:
+            st.metric(f"{label_prefix}{tf}", "⚪ No data")
+            st.caption("Regime: n/a")
+            st.caption("Divergence: n/a")
+        else:
+            st.metric(f"{label_prefix}{tf}", f"{traffic_emoji(row['State'])} {row['State']}")
+            st.caption(f"Regime: {row['Regime_bucket']}")
+            st.caption(f"Divergence: {row['Divergence']}")
 
 st.subheader("Combined")
-st.info(stacked_message(latest))
+if all(latest[k] is not None for k in ["1H", "2H", "Daily", "Weekly"]):
+    st.info(stacked_message(latest))
+else:
+    st.info("Combined interpretation unavailable until all required frames have data.")
 
 if intraday_source == "Both (overlay)":
     st.markdown("#### Real vs Proxy quick compare")
     c1, c2 = st.columns(2)
     with c1:
-        r, p = feat_1h_real.iloc[-1], feat_1h_proxy.iloc[-1]
-        st.write(f"**1H Real:** {r['State']}")
-        st.write(f"**1H Proxy:** {p['State']}")
-        st.write(f"TSI gap Real / Proxy: **{r['TSI_gap']:.2f} / {p['TSI_gap']:.2f}**")
+        r, p = safe_last_row(feat_1h_real), safe_last_row(feat_1h_proxy)
+        if r is not None and p is not None:
+            st.write(f"**1H Real:** {r['State']}")
+            st.write(f"**1H Proxy:** {p['State']}")
+            st.write(f"TSI gap Real / Proxy: **{r['TSI_gap']:.2f} / {p['TSI_gap']:.2f}**")
+        else:
+            st.write("1H compare unavailable.")
     with c2:
-        r, p = feat_2h_real.iloc[-1], feat_2h_proxy.iloc[-1]
-        st.write(f"**2H Real:** {r['State']}")
-        st.write(f"**2H Proxy:** {p['State']}")
-        st.write(f"TSI gap Real / Proxy: **{r['TSI_gap']:.2f} / {p['TSI_gap']:.2f}**")
+        r, p = safe_last_row(feat_2h_real), safe_last_row(feat_2h_proxy)
+        if r is not None and p is not None:
+            st.write(f"**2H Real:** {r['State']}")
+            st.write(f"**2H Proxy:** {p['State']}")
+            st.write(f"TSI gap Real / Proxy: **{r['TSI_gap']:.2f} / {p['TSI_gap']:.2f}**")
+        else:
+            st.write("2H compare unavailable.")
 
 tab1, tab2, tab3, tab4 = st.tabs(["1-Hour", "2-Hour", "Daily", "Weekly"])
 for tab, tf, label, tf_key in [(tab1,"1H",active_1h_label,"1H"),(tab2,"2H",active_2h_label,"2H"),(tab3,"Daily","Daily","Daily"),(tab4,"Weekly","Weekly","Weekly")]:
     with tab:
         df = frames[tf]
-        row = df.iloc[-1]
-        stats, paths = analog_summary(df, tf_key)
+        row = safe_last_row(df)
         left, right = st.columns([2.2,1.2], vertical_alignment="top")
-        with left:
-            overlay_df = overlay_1h if (intraday_source=="Both (overlay)" and tf=="1H") else overlay_2h if (intraday_source=="Both (overlay)" and tf=="2H") else None
-            overlay_label = "Proxy 1H" if (intraday_source=="Both (overlay)" and tf=="1H") else "Proxy 2H" if (intraday_source=="Both (overlay)" and tf=="2H") else None
-            st.plotly_chart(make_panel(df, bars_to_show, label, overlay_df, overlay_label), use_container_width=True)
-        with right:
-            st.markdown(f"### {label}")
-            st.write(f"State: **{row['State']}**")
-            st.write(f"Higher timeframe regime: **{row['Higher_Regime']}**")
-            st.write(f"TSI(25,13,7): **{row['TSI']:.1f}**")
-            st.write(f"TSI Signal: **{row['TSI_signal']:.1f}**")
-            st.write(f"TSI Gap: **{row['TSI_gap']:.2f}**")
-            st.write(f"Exhaustion score: **{row['Exhaustion_score']:.1f}**")
-            if intraday_source == "Both (overlay)" and tf in ["1H","2H"]:
-                comp = overlay_1h.iloc[-1] if tf=="1H" else overlay_2h.iloc[-1]
-                st.markdown("### Proxy compare")
-                st.write(f"Proxy state: **{comp['State']}**")
-                st.write(f"Proxy TSI gap: **{comp['TSI_gap']:.2f}**")
-            st.markdown("### Historical analogs")
-            if stats:
-                st.write(f"Sample size: **{stats['sample']}**")
-                st.success(prediction_text(tf_key, row, stats))
-            else:
-                st.warning("Not enough conditioned analogs for the current state bucket yet.")
+        if row is None:
+            with left:
+                st.info(f"{label}: no data available.")
+            with right:
+                st.markdown(f"### {label}")
+                st.write("No data available for this frame.")
+        else:
+            stats, paths = analog_summary(df, tf_key)
+            with left:
+                overlay_df = overlay_1h if (intraday_source=="Both (overlay)" and tf=="1H") else overlay_2h if (intraday_source=="Both (overlay)" and tf=="2H") else None
+                overlay_label = "Proxy 1H" if (intraday_source=="Both (overlay)" and tf=="1H") else "Proxy 2H" if (intraday_source=="Both (overlay)" and tf=="2H") else None
+                st.plotly_chart(make_panel(df, bars_to_show, label, overlay_df, overlay_label), use_container_width=True)
+            with right:
+                st.markdown(f"### {label}")
+                st.write(f"State: **{row['State']}**")
+                st.write(f"Higher timeframe regime: **{row['Higher_Regime']}**")
+                st.write(f"TSI(25,13,7): **{row['TSI']:.1f}**")
+                st.write(f"TSI Signal: **{row['TSI_signal']:.1f}**")
+                st.write(f"TSI Gap: **{row['TSI_gap']:.2f}**")
+                st.write(f"Exhaustion score: **{row['Exhaustion_score']:.1f}**")
+                if intraday_source == "Both (overlay)" and tf in ["1H","2H"]:
+                    comp = safe_last_row(overlay_1h if tf=="1H" else overlay_2h)
+                    if comp is not None:
+                        st.markdown("### Proxy compare")
+                        st.write(f"Proxy state: **{comp['State']}**")
+                        st.write(f"Proxy TSI gap: **{comp['TSI_gap']:.2f}**")
+                st.markdown("### Historical analogs")
+                if stats:
+                    st.write(f"Sample size: **{stats['sample']}**")
+                    st.success(prediction_text(tf_key, row, stats))
+                else:
+                    st.warning("Not enough conditioned analogs for the current state bucket yet.")
 
 with st.expander("How this version works"):
     st.markdown("""
