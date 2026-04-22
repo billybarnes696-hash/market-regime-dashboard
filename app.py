@@ -14,7 +14,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 import pytz
 
 APP_DIR = Path(__file__).resolve().parent
@@ -174,10 +174,20 @@ def clean_symbols(text: str, uploaded_symbols: List[str]) -> List[str]:
     if text.strip():
         symbols.extend([s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()])
     symbols.extend(uploaded_symbols)
+
     out = []
+    skipped = []
     for s in symbols:
-        if s and s not in out:
+        if not s:
+            continue
+        # Alpaca stock bars do not support ratio / spread strings like SPXS:SVOL
+        if ":" in s or "/" in s:
+            skipped.append(s)
+            continue
+        if s not in out:
             out.append(s)
+
+    st.session_state["skipped_invalid_symbols"] = skipped
     return out
 
 
@@ -302,7 +312,7 @@ def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: st
     client = alpaca_client(key, secret)
     start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
     end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
-    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(30, "Min"), start=start, end=end, adjustment="all", feed=feed)
+    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(30, TimeFrameUnit.Minute), start=start, end=end, adjustment="all", feed=feed)
     raw = None
     for attempt in range(3):
         try:
@@ -505,9 +515,9 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     return out
 
 
-def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
+def add_forward_returns(df: pd.DataFrame, horizons: List[int]) -> pd.DataFrame:
     out = df.copy()
-    for n in [1, 2, 5]:
+    for n in sorted(set(int(h) for h in horizons)):
         out[f"fwd_ret_{n}"] = out["Close"].shift(-n) / out["Close"] - 1
     return out
 
@@ -515,7 +525,7 @@ def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
 def summarize_analogs(frame: pd.DataFrame, row: pd.Series, horizons: List[int], structural: bool = False) -> Dict[str, float]:
     if frame.empty or row is None or row.empty:
         return {}
-    enriched = add_forward_returns(frame.copy())
+    enriched = add_forward_returns(frame.copy(), horizons)
     calls = [classify_state(r, structural)[0] for _, r in enriched.iterrows()]
     enriched["call"] = calls
     current_state = row.get("call", "NEUTRAL")
@@ -668,6 +678,8 @@ if not alpaca_key or not alpaca_secret:
 
 uploaded_symbols = parse_symbol_csv(upload_watchlist)
 symbols = clean_symbols(symbols_text, uploaded_symbols)
+if st.session_state.get("skipped_invalid_symbols"):
+    st.warning("Skipped unsupported Alpaca symbols: " + ", ".join(st.session_state["skipped_invalid_symbols"]))
 if not symbols:
     st.error("Provide at least one symbol.")
     st.stop()
