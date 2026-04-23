@@ -1,7 +1,5 @@
-numpy>=1.24.0,<2.0.0
-pandas>=2.0.0,<2.3.0
-scipy>=1.10.0
-plotly>=5.18.0
-streamlit>=1.28.0
-alpaca-py>=0.30.0
-pytz>=2023.0
+numpy
+pandas==2.0.3
+streamlit
+alpaca-py
+plotly
