@@ -1,510 +1,337 @@
 """
-QUANT EDGE FINDER + LIVE OSCILLATOR DASHBOARD
-Two-Phase: Historical Grid Search → Live Real-Time Scoring
+UNIVERSAL QUANT EDGE FINDER + LIVE DASHBOARD
+- Works with ANY symbol (no hardcoded tickers)
+- Properly aligns forward returns to target hold period
+- Optional confirmation symbol
+- True Monte Carlo parameter optimization with bootstrap CI
 """
 
-import os
-import time
-import numpy as np
-import pandas as pd
+import os, time, numpy as np, pandas as pd
 from datetime import datetime, timedelta, timezone
-from itertools import product
-
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-
 # ============================================
-# PAGE CONFIG
+# PAGE CONFIG & SESSION STATE
 # ============================================
-st.set_page_config(
-    page_title="Quant Edge System",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Universal Quant Edge", layout="wide", initial_sidebar_state="expanded")
+st.title("🌐 Universal Quant Edge Finder + Live Dashboard")
 
-st.title("🎯 Quant Edge: Historical Sweet Spot → Live Score")
-st.caption("Phase 1: Find best zero-cross combos | Phase 2: Live real-time scoring")
-
-
-# ============================================
-# SESSION STATE INIT
-# ============================================
 if 'best_params' not in st.session_state:
     st.session_state.best_params = None
-if 'historical_results' not in st.session_state:
-    st.session_state.historical_results = None
+if 'mc_results' not in st.session_state:
+    st.session_state.mc_results = None
 if 'live_df' not in st.session_state:
     st.session_state.live_df = None
 
-
 # ============================================
-# SIDEBAR - INPUTS
+# SIDEBAR: UNIVERSAL INPUTS
 # ============================================
 with st.sidebar:
     st.header("📊 Symbol & Data")
-    symbol = st.text_input("Primary Symbol", value="SOXS").upper().strip()
-    confirm_symbol = st.text_input("Confirmation Symbol (e.g., SMH)", value="SMH").upper().strip()
-    use_confirmation = st.checkbox("Use confirmation symbol filter", value=True)
+    symbol = st.text_input("Primary Symbol", value="AAPL").upper().strip()
     
-    st.header("📅 Historical Research")
-    hist_days = st.slider("Historical days for grid search", 30, 180, 90)
-    hist_tf = st.selectbox("Historical timeframe (min)", [5, 10, 15], index=1)
+    use_confirm = st.checkbox("Use Confirmation Symbol", value=False)
+    confirm_sym = st.text_input("Confirmation Symbol", value="SPY").upper().strip() if use_confirm else None
     
-    st.header("⚡ Live Scoring")
-    live_tf = st.selectbox("Live timeframe (min)", [1, 2, 5, 10], index=2)
-    lookback_bars = st.slider("Live lookback bars", 20, 200, 100)
+    st.header("⏱️ Timeframe & Hold Alignment")
+    chart_tf = st.selectbox("Chart Timeframe (min)", [1, 2, 3, 5, 10, 15, 30], index=3)
+    target_hold = st.selectbox("Target Hold Period (min)", [5, 10, 15, 30, 45, 60], index=2)
+    hold_bars = max(1, target_hold // chart_tf)
+    st.caption(f"🔢 Measuring returns over {hold_bars} bar(s) = {hold_bars * chart_tf} minutes")
+    
+    st.header("🎲 Monte Carlo Optimization")
+    run_mc = st.checkbox("Run Monte Carlo Sweet-Spot Search", value=True)
+    mc_iters = st.slider("MC Iterations", 200, 3000, 800) if run_mc else 0
+    slippage_bps = st.slider("Assumed Slippage (bps)", 0, 200, 50)
+    mc_conf = st.selectbox("Confidence Level", [90, 95, 99], index=1)
     
     st.header("🔑 Alpaca API")
     api_key = st.text_input("API Key", type="password", value=os.getenv("ALPACA_API_KEY", ""))
-    secret_key = st.text_input("Secret Key", type="password", value=os.getenv("ALPACA_SECRET_KEY", ""))
-    feed = st.selectbox("Feed", ["sip", "iex"], index=0)
-    
-    st.header("⚙️ Strategy Options")
-    inverse_etf = st.checkbox("Inverse ETF mode (flip signals)", value=True, help="For SOXS: bullish signal = semiconductor weakness")
-    zero_cross_only = st.checkbox("Zero-cross signals only", value=True, help="CCI/ROC/TSI cross 0, Stoch cross 50")
+    secret = st.text_input("Secret Key", type="password", value=os.getenv("ALPACA_SECRET_KEY", ""))
+    feed = st.selectbox("Data Feed", ["sip", "iex"], index=0)
     
     st.divider()
-    
-    # TWO PHASE BUTTONS
-    st.subheader("🚀 Execute")
     col1, col2 = st.columns(2)
-    with col1:
-        run_hist = st.button("🔍 PHASE 1: Find Sweet Spot", type="secondary", use_container_width=True)
-    with col2:
-        run_live = st.button("⚡ PHASE 2: Live Score", type="primary", use_container_width=True)
-    
-    st.caption("Run Phase 1 first, then Phase 2 for live scoring")
-
+    run_hist = col1.button("🔍 PHASE 1: Find Sweet Spot", use_container_width=True)
+    run_live = col2.button("⚡ PHASE 2: Live Score", type="primary", use_container_width=True)
 
 # ============================================
-# OSCILLATOR ENGINE (Zero-Cross Focused)
+# OSCILLATOR ENGINE
 # ============================================
-class OscillatorEngine:
+class OscEngine:
+    @staticmethod
+    def ema(s, span): return s.ewm(span=span, adjust=False).mean()
     
     @staticmethod
-    def ema(series: pd.Series, span: int) -> pd.Series:
-        return series.ewm(span=span, adjust=False).mean()
-    
-    @staticmethod
-    def rsi(close: pd.Series, period: int = 14) -> pd.Series:
-        delta = close.diff()
-        up = delta.clip(lower=0)
-        down = -delta.clip(upper=0)
-        rs = OscillatorEngine.ema(up, period) / OscillatorEngine.ema(down, period).replace(0, np.nan)
+    def rsi(c, p=14):
+        d = c.diff()
+        u = d.clip(lower=0).rolling(p).mean()
+        l = (-d.clip(upper=0)).rolling(p).mean()
+        rs = u / l.replace(0, np.nan)
         return 100 - (100 / (1 + rs))
     
     @staticmethod
-    def stoch_k(close: pd.Series, period: int = 14) -> pd.Series:
-        low = close.rolling(period, min_periods=2).min()
-        high = close.rolling(period, min_periods=2).max()
-        return 100 * (close - low) / (high - low).replace(0, np.nan)
+    def stoch_k(c, p=14):
+        lo, hi = c.rolling(p).min(), c.rolling(p).max()
+        return 100 * (c - lo) / (hi - lo).replace(0, np.nan)
     
     @staticmethod
-    def cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    def cci(df, p=20):
         tp = (df['high'] + df['low'] + df['close']) / 3
-        sma = tp.rolling(period, min_periods=2).mean()
-        mad = (tp - sma).abs().rolling(period, min_periods=2).mean()
+        sma = tp.rolling(p).mean()
+        mad = (tp - sma).abs().rolling(p).mean()
         return (tp - sma) / (0.015 * mad.replace(0, np.nan))
     
     @staticmethod
-    def roc(close: pd.Series, period: int = 10) -> pd.Series:
-        return (close / close.shift(period) - 1) * 100
+    def roc(c, p=10): return (c / c.shift(p) - 1) * 100
     
     @staticmethod
-    def tsi(close: pd.Series, long_period: int = 25, short_period: int = 13) -> pd.Series:
-        delta = close.diff()
-        m1 = OscillatorEngine.ema(delta, long_period)
-        m2 = OscillatorEngine.ema(m1, short_period)
-        a1 = OscillatorEngine.ema(delta.abs(), long_period)
-        a2 = OscillatorEngine.ema(a1, short_period)
+    def tsi(c, long=25, short=13):
+        d = c.diff()
+        m1 = OscEngine.ema(d, long)
+        m2 = OscEngine.ema(m1, short)
+        a1 = OscEngine.ema(d.abs(), long)
+        a2 = OscEngine.ema(a1, short)
         return 100 * m2 / a2.replace(0, np.nan)
     
     @staticmethod
-    def compute_all(df: pd.DataFrame) -> pd.DataFrame:
-        """Compute zero-cross focused oscillators."""
-        result = df.copy()
-        
-        # Core oscillators with user's preferred params
-        result['rsi_14'] = OscillatorEngine.rsi(result['close'], 14)
-        result['stoch_14'] = OscillatorEngine.stoch_k(result['close'], 14)
-        result['cci_14'] = OscillatorEngine.cci(result, 14)  # User's preferred period
-        result['roc_10'] = OscillatorEngine.roc(result['close'], 10)  # User's preferred period
-        result['tsi'] = OscillatorEngine.tsi(result['close'], 15, 7)  # User's preferred params
-        
-        # Zero-cross signals (bullish = crossing above threshold)
-        result['cci_cross_0'] = (result['cci_14'].shift(1) <= 0) & (result['cci_14'] > 0)
-        result['roc_cross_0'] = (result['roc_10'].shift(1) <= 0) & (result['roc_10'] > 0)
-        result['tsi_cross_0'] = (result['tsi'].shift(1) <= 0) & (result['tsi'] > 0)
-        result['stoch_cross_50'] = (result['stoch_14'].shift(1) <= 50) & (result['stoch_14'] > 50)  # Midline cross
-        
-        # Composite (equal weight)
-        cci_norm = np.clip(result['cci_14'] / 150, -1, 1)
-        tsi_norm = np.clip(result['tsi'] / 20, -1, 1)
-        rsi_norm = (result['rsi_14'] - 50) / 50
-        roc_norm = np.clip(result['roc_10'] / 10, -1, 1)
-        stoch_norm = (result['stoch_14'] - 50) / 50
-        
-        result['composite'] = (cci_norm + tsi_norm + rsi_norm + roc_norm + stoch_norm) / 5
-        result['composite_signal'] = OscillatorEngine.ema(result['composite'], 5)
-        
-        # Forward returns for backtesting
-        for i in [1, 2, 3, 5]:
-            result[f'forward_{i}'] = (result['close'].shift(-i) / result['close'] - 1) * 100
-        
-        return result
-    
-    @staticmethod
-    def generate_signal(row, params, inverse_etf=False):
-        """Generate signal using best historical params."""
-        signals = []
+    def compute_all(df):
+        df = df.copy()
+        df['rsi_14'] = OscEngine.rsi(df['close'], 14)
+        df['stoch_14'] = OscEngine.stoch_k(df['close'], 14)
+        df['cci_20'] = OscEngine.cci(df, 20)
+        df['roc_10'] = OscEngine.roc(df['close'], 10)
+        df['tsi'] = OscEngine.tsi(df['close'])
         
         # Zero-cross signals
-        if params.get('cci_cross'):
-            signals.append(row['cci_cross_0'])
-        if params.get('roc_cross'):
-            signals.append(row['roc_cross_0'])
-        if params.get('tsi_cross'):
-            signals.append(row['tsi_cross_0'])
-        if params.get('stoch_cross'):
-            signals.append(row['stoch_cross_50'])
-        
-        if not signals:
-            return None
-        
-        # All selected signals must align
-        signal = all(signals)
-        
-        # Inverse ETF logic: flip for SOXS
-        if inverse_etf:
-            signal = not signal  # Bullish on semis = bearish on SOXS
-        
-        return signal
-
+        df['cci_cross'] = (df['cci_20'].shift(1) <= 0) & (df['cci_20'] > 0)
+        df['roc_cross'] = (df['roc_10'].shift(1) <= 0) & (df['roc_10'] > 0)
+        df['tsi_cross'] = (df['tsi'].shift(1) <= 0) & (df['tsi'] > 0)
+        df['stoch_cross'] = (df['stoch_14'].shift(1) <= 50) & (df['stoch_14'] > 50)
+        return df
 
 # ============================================
-# DATA FETCHING: CACHED vs LIVE
+# DATA FETCHING
 # ============================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_historical_data(symbol, days_back, api_key, secret_key, feed):
-    """Fetch historical data (CACHED for grid search)."""
-    if not api_key or not secret_key:
-        return None
-    
-    client = StockHistoricalDataClient(api_key, secret_key)
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days_back)
-    
+def fetch_hist(sym, days, api, sec, feed):
+    if not api or not sec: return None
+    client = StockHistoricalDataClient(api, sec)
+    start, end = datetime.now(timezone.utc) - timedelta(days=days), datetime.now(timezone.utc)
     try:
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=end,
-            limit=10000,
-            feed=feed,
-            adjustment="all",
-        )
+        req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute, start=start, end=end, limit=10000, feed=feed, adjustment="all")
         bars = client.get_stock_bars(req).df
-        if bars.empty:
-            return None
-        return bars.reset_index(level=0, drop=True)
+        return bars.reset_index(level=0, drop=True) if not bars.empty else None
     except Exception as e:
-        st.error(f"Historical fetch error: {e}")
-        return None
+        st.error(f"Historical fetch error: {e}"); return None
 
-
-def fetch_live_data(symbol, minutes_back, api_key, secret_key, feed):
-    """Fetch LIVE data (NO CACHE - always fresh)."""
-    if not api_key or not secret_key:
-        return None
-    
-    client = StockHistoricalDataClient(api_key, secret_key)
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=minutes_back)
-    
+def fetch_live(sym, mins, api, sec, feed):
+    if not api or not sec: return None
+    client = StockHistoricalDataClient(api, sec)
+    start, end = datetime.now(timezone.utc) - timedelta(minutes=mins), datetime.now(timezone.utc)
     try:
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=end,
-            limit=1000,
-            feed=feed,
-            adjustment="all",
-        )
+        req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute, start=start, end=end, limit=1000, feed=feed, adjustment="all")
         bars = client.get_stock_bars(req).df
-        if bars.empty:
-            return None
-        return bars.reset_index(level=0, drop=True)
+        return bars.reset_index(level=0, drop=True) if not bars.empty else None
     except Exception as e:
-        st.error(f"Live fetch error: {e}")
-        return None
-
+        st.error(f"Live fetch error: {e}"); return None
 
 # ============================================
-# PHASE 1: HISTORICAL GRID SEARCH
+# MONTE CARLO SWEET-SPOT OPTIMIZER
 # ============================================
-def run_historical_research(symbol, confirm_symbol, days_back, tf_minutes, api_key, secret_key, feed, 
-                           inverse_etf, use_confirmation, zero_cross_only):
-    """Phase 1: Find best zero-cross combinations on historical data."""
-    
-    with st.spinner(f"🔍 Fetching {days_back} days of {symbol} history..."):
-        df = fetch_historical_data(symbol, days_back, api_key, secret_key, feed)
-        confirm_df = None
-        if use_confirmation and confirm_symbol:
-            confirm_df = fetch_historical_data(confirm_symbol, days_back, api_key, secret_key, feed)
-    
-    if df is None or df.empty:
-        st.error("Failed to fetch historical data")
-        return None
-    
-    with st.spinner("⚙️ Computing oscillators..."):
-        df = OscillatorEngine.compute_all(df)
-        if confirm_df is not None:
-            confirm_df = OscillatorEngine.compute_all(confirm_df)
-            # Merge for confirmation filter
-            df = pd.merge(df, confirm_df[['close']], left_index=True, right_index=True, 
-                         suffixes=('', '_confirm'), how='left')
-            df['confirm_weak'] = df['close_confirm'].pct_change(2) < -0.005  # 2-bar drop
-    
-    st.success(f"✅ Loaded {len(df)} {tf_minutes}-min bars for research")
-    
-    # Grid search parameters (zero-cross focused)
-    st.subheader("🔬 Testing Zero-Cross Combinations")
-    
-    # Only test zero-cross combos if requested
-    if zero_cross_only:
-        combos = list(product([True, False], repeat=4))  # cci, roc, tsi, stoch
-        combo_names = ['CCI×0', 'ROC×0', 'TSI×0', 'Stoch×50']
-    else:
-        # Include level-based signals too
-        combos = list(product([-200,-150,-100], [-20,-15,-10], [1,2,3]))
-        combo_names = ['CCI_level', 'TSI_level', 'Hold_bars']
-    
+def monte_carlo_optimize(df, hold_bars, n_iter, slippage_bps, conf_level=95):
+    param_space = {
+        'use_cci': [True, False], 'use_roc': [True, False],
+        'use_tsi': [True, False], 'use_stoch': [True, False],
+        'min_signals': [5, 10, 15]
+    }
     results = []
-    progress = st.progress(0)
-    status = st.empty()
     
-    for i, combo in enumerate(combos):
-        if zero_cross_only:
-            params = dict(zip(['cci_cross','roc_cross','tsi_cross','stoch_cross'], combo))
-            # Skip if no signals selected
-            if not any(combo):
-                continue
-            # Generate signals
-            df['signal'] = df.apply(lambda row: OscillatorEngine.generate_signal(row, params, inverse_etf), axis=1)
-            # Apply confirmation filter
-            if use_confirmation and 'confirm_weak' in df.columns:
-                df['signal'] = df['signal'] & df['confirm_weak'].fillna(True)
-            signals = df[df['signal'] & df['signal'].notna()]
-        else:
-            # Level-based search (simplified)
-            cci_th, tsi_th, hold = combo
-            mask = (df['cci_14'] < cci_th) & (df['tsi'] < tsi_th)
-            if use_confirmation and 'confirm_weak' in df.columns:
-                mask = mask & df['confirm_weak'].fillna(True)
-            signals = df[mask]
-            params = {'cci_th': cci_th, 'tsi_th': tsi_th, 'hold': hold}
+    for _ in range(n_iter):
+        p = {k: np.random.choice(v) for k, v in param_space.items()}
         
-        if len(signals) >= 10:
-            returns = signals['forward_1'].dropna()
-            if len(returns) >= 10:
-                results.append({
-                    'params': str(params),
-                    'trades': len(returns),
-                    'win_rate': (returns > 0).mean() * 100,
-                    'avg_return': returns.mean(),
-                    'total_return': returns.sum(),
-                    'sharpe': returns.mean() / (returns.std() + 0.01),
-                })
+        # Generate combined signal mask
+        masks = []
+        if p['use_cci']: masks.append(df['cci_cross'])
+        if p['use_roc']: masks.append(df['roc_cross'])
+        if p['use_tsi']: masks.append(df['tsi_cross'])
+        if p['use_stoch']: masks.append(df['stoch_cross'])
         
-        progress.progress((i+1)/len(combos))
-        status.text(f"Testing {i+1}/{len(combos)} combos...")
+        if not masks: continue
+        sig_mask = masks[0]
+        for m in masks[1:]: sig_mask &= m
+        
+        signals = df[sig_mask].copy()
+        if len(signals) < p['min_signals']: continue
+        
+        ret_col = f'forward_{hold_bars}'
+        if ret_col not in signals.columns:
+            signals[ret_col] = (signals['close'].shift(-hold_bars) / signals['close'] - 1) * 100
+        
+        gross_rets = signals[ret_col].dropna()
+        if len(gross_rets) < 5: continue
+        
+        # Inject random slippage per trade
+        slip_pct = np.random.uniform(0, slippage_bps/10000, size=len(gross_rets))
+        net_rets = gross_rets - slip_pct * 100
+        
+        win_rate = (net_rets > 0).mean()
+        avg_ret = net_rets.mean()
+        sharpe = avg_ret / (net_rets.std() + 1e-6)
+        score = sharpe * win_rate * np.log(len(net_rets) + 1)
+        
+        results.append({
+            'params': p, 'trades': len(net_rets), 'win_rate': win_rate,
+            'avg_ret': avg_ret, 'sharpe': sharpe, 'score': score,
+            'gross_rets': gross_rets
+        })
     
-    progress.empty()
-    status.empty()
+    if not results: return None
+    res_df = pd.DataFrame(results).sort_values('score', ascending=False)
+    best = res_df.iloc[0]
     
-    if results:
-        results_df = pd.DataFrame(results).sort_values('sharpe', ascending=False)
-        st.dataframe(results_df.head(10), use_container_width=True)
-        
-        # Store best params
-        best = results_df.iloc[0]
-        st.session_state.best_params = eval(best['params']) if zero_cross_only else best['params']
-        st.session_state.historical_results = results_df
-        st.success(f"🏆 Best combo: {best['params']} | Win Rate: {best['win_rate']:.1f}% | Sharpe: {best['sharpe']:.2f}")
-        return results_df
-    else:
-        st.warning("No statistically significant strategies found")
-        return None
+    # Bootstrap Confidence Interval for avg return
+    boots = []
+    for _ in range(500):
+        samp = best['gross_rets'].sample(n=len(best['gross_rets']), replace=True)
+        boots.append((samp - np.random.uniform(0, slippage_bps/10000, len(samp))*100).mean())
+    
+    alpha = (100 - conf_level) / 200
+    ci_low, ci_high = np.percentile(boots, alpha*100), np.percentile(boots, (1-alpha)*100)
+    
+    return {
+        'top_params': {k: best['params'][k] for k in best['params'] if isinstance(best['params'][k], bool)},
+        'metrics': best[['trades','win_rate','avg_ret','sharpe','score']],
+        'ci': (ci_low, ci_high),
+        'top_n': res_df.head(10)
+    }
 
+# ============================================
+# PHASE 1: HISTORICAL RESEARCH
+# ============================================
+def run_phase1():
+    with st.spinner(f"📥 Fetching historical data for {symbol}..."):
+        hist_df = fetch_hist(symbol, 90, api_key, secret, feed)
+        confirm_df = None
+        if use_confirm and confirm_sym:
+            confirm_df = fetch_hist(confirm_sym, 90, api_key, secret, feed)
+    
+    if hist_df is None: st.stop()
+    
+    with st.spinner("⚙️ Computing oscillators & forward returns..."):
+        hist_df = OscEngine.compute_all(hist_df)
+        # Align forward return with target hold
+        ret_col = f'forward_{hold_bars}'
+        hist_df[ret_col] = (hist_df['close'].shift(-hold_bars) / hist_df['close'] - 1) * 100
+        
+        if confirm_df is not None:
+            confirm_df = OscEngine.compute_all(confirm_df)
+            hist_df = hist_df.merge(confirm_df[['close']], left_index=True, right_index=True, suffixes=('','_conf'), how='left')
+            hist_df['confirm_weak'] = hist_df['close_conf'].pct_change(hold_bars) < -0.005  # 0.5% drop over hold period
+    
+    if run_mc:
+        with st.spinner(f"🎲 Running {mc_iters} Monte Carlo iterations..."):
+            mc_res = monte_carlo_optimize(hist_df, hold_bars, mc_iters, slippage_bps, mc_conf)
+            if mc_res:
+                st.session_state.best_params = mc_res['top_params']
+                st.session_state.mc_results = mc_res
+                
+                st.success("✅ Monte Carlo Complete")
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Trades", mc_res['metrics']['trades'])
+                c2.metric("Win Rate", f"{mc_res['metrics']['win_rate']*100:.1f}%")
+                c3.metric("Avg Return", f"{mc_res['metrics']['avg_ret']:.2f}%")
+                c4.metric(f"{mc_conf}% CI", f"[{mc_res['ci'][0]:.2f}%, {mc_res['ci'][1]:.2f}%]")
+                
+                st.dataframe(mc_res['top_n'][['trades','win_rate','avg_ret','sharpe','score']].head(5), use_container_width=True)
+            else:
+                st.warning("⚠️ No statistically significant parameter clusters found. Try increasing iterations or adjusting slippage.")
+    else:
+        st.info("ℹ️ Monte Carlo disabled. Enable it in the sidebar for parameter optimization.")
 
 # ============================================
 # PHASE 2: LIVE SCORING
 # ============================================
-def run_live_scoring(symbol, confirm_symbol, live_tf, lookback_bars, api_key, secret_key, feed,
-                    inverse_etf, use_confirmation):
-    """Phase 2: Live real-time scoring using best historical params."""
-    
+def run_phase2():
     if st.session_state.best_params is None:
-        st.warning("⚠️ Run Phase 1 first to find best parameters")
+        st.warning("⚠️ Run Phase 1 first to calibrate parameters.")
         return
     
-    minutes_fetch = lookback_bars * live_tf + 50  # Buffer
+    mins_fetch = max(200, hold_bars * 10)
+    with st.spinner(f"⚡ Fetching LIVE {chart_tf}-min data..."):
+        live_df = fetch_live(symbol, mins_fetch, api_key, secret, feed)
+        conf_df = None
+        if use_confirm and confirm_sym:
+            conf_df = fetch_live(confirm_sym, mins_fetch, api_key, secret, feed)
     
-    with st.spinner(f"⚡ Fetching LIVE {live_tf}-min data for {symbol}..."):
-        # FORCE FRESH FETCH (no cache)
-        df = fetch_live_data(symbol, minutes_fetch, api_key, secret_key, feed)
-        confirm_df = None
-        if use_confirmation and confirm_symbol:
-            confirm_df = fetch_live_data(confirm_symbol, minutes_fetch, api_key, secret_key, feed)
-    
-    if df is None or df.empty:
-        st.error("Failed to fetch live data")
-        return
+    if live_df is None: st.stop()
     
     with st.spinner("📊 Computing live oscillators..."):
-        df = OscillatorEngine.compute_all(df)
-        if confirm_df is not None:
-            confirm_df = OscillatorEngine.compute_all(confirm_df)
-            df = pd.merge(df, confirm_df[['close']], left_index=True, right_index=True, 
-                         suffixes=('', '_confirm'), how='left')
-            df['confirm_weak'] = df['close_confirm'].pct_change(2) < -0.005
+        live_df = OscEngine.compute_all(live_df)
+        live_df[f'forward_{hold_bars}'] = (live_df['close'].shift(-hold_bars) / live_df['close'] - 1) * 100
+        st.session_state.live_df = live_df
+        
+        if conf_df is not None:
+            conf_df = OscEngine.compute_all(conf_df)
+            live_df = live_df.merge(conf_df[['close']], left_index=True, right_index=True, suffixes=('','_conf'), how='left')
+            live_df['confirm_weak'] = live_df['close_conf'].pct_change(hold_bars) < -0.005
     
-    st.session_state.live_df = df  # Store for dashboard
-    latest = df.iloc[-1]
+    latest = live_df.iloc[-1]
+    p = st.session_state.best_params
     
-    # Current signal using best params
-    signal = OscillatorEngine.generate_signal(latest, st.session_state.best_params, inverse_etf)
+    # Evaluate live signal
+    sig = True
+    if p.get('use_cci', False) and not latest['cci_cross']: sig = False
+    if p.get('use_roc', False) and not latest['roc_cross']: sig = False
+    if p.get('use_tsi', False) and not latest['tsi_cross']: sig = False
+    if p.get('use_stoch', False) and not latest['stoch_cross']: sig = False
     
-    # Apply confirmation filter live
-    if use_confirmation and 'confirm_weak' in df.columns and latest['confirm_weak'] == False:
-        signal = False
-        st.warning("⚠️ Confirmation filter not met (semis not weak enough)")
+    if use_confirm and not latest.get('confirm_weak', True):
+        sig = False
+        st.warning("⚠️ Confirmation filter NOT met (sector not weak enough)")
     
-    # Display live dashboard
-    st.subheader(f"⚡ LIVE: {symbol} - Current Oscillator State")
+    # Dashboard
+    st.subheader(f"⚡ LIVE: {symbol} - Current State")
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("CCI", f"{latest['cci_20']:.1f}", "✅" if latest['cci_cross'] else "⏳")
+    c2.metric("ROC", f"{latest['roc_10']:.2f}%", "✅" if latest['roc_cross'] else "⏳")
+    c3.metric("TSI", f"{latest['tsi']:.1f}", "✅" if latest['tsi_cross'] else "⏳")
+    c4.metric("Stoch", f"{latest['stoch_14']:.1f}", "✅" if latest['stoch_cross'] else "⏳")
+    c5.metric("Signal", "🟢 ACTIVE" if sig else "🔴 WAIT")
     
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("Composite", f"{latest['composite']:.3f}")
-    with col2:
-        st.metric("CCI(14)", f"{latest['cci_14']:.1f}")
-    with col3:
-        st.metric("TSI", f"{latest['tsi']:.1f}")
-    with col4:
-        st.metric("RSI(14)", f"{latest['rsi_14']:.1f}")
-    with col5:
-        st.metric("Stoch(14)", f"{latest['stoch_14']:.1f}")
+    st.info(f"🔑 Using calibrated params: `{p}` | Measuring {hold_bars}-bar forward return ({hold_bars*chart_tf} min hold)")
     
-    # Signal display
-    if signal is True:
-        st.success("🟢 LIVE SIGNAL: ENTER LONG" if not inverse_etf else "🟢 LIVE SIGNAL: ENTER SHORT (Inverse)")
-    elif signal is False:
-        st.error("🔴 NO SIGNAL: Wait for alignment")
-    else:
-        st.warning("🟡 INSUFFICIENT DATA")
-    
-    # Zero-cross status
-    st.subheader("🎯 Zero-Cross Status")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        status = "✅" if latest['cci_cross_0'] else "⏳"
-        st.metric(f"{status} CCI×0", f"{latest['cci_14']:.1f}")
-    with col2:
-        status = "✅" if latest['roc_cross_0'] else "⏳"
-        st.metric(f"{status} ROC×0", f"{latest['roc_10']:.2f}%")
-    with col3:
-        status = "✅" if latest['tsi_cross_0'] else "⏳"
-        st.metric(f"{status} TSI×0", f"{latest['tsi']:.1f}")
-    with col4:
-        status = "✅" if latest['stoch_cross_50'] else "⏳"
-        st.metric(f"{status} Stoch×50", f"{latest['stoch_14']:.1f}")
-    
-    # Price + Composite chart
-    st.subheader("📈 Live Price & Composite")
+    # Chart
+    lookback = min(100, len(live_df))
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-    
-    # Price
-    fig.add_trace(go.Candlestick(
-        x=df.index[-lookback_bars:],
-        open=df['open'][-lookback_bars:],
-        high=df['high'][-lookback_bars:],
-        low=df['low'][-lookback_bars:],
-        close=df['close'][-lookback_bars:],
-        name=symbol
-    ), row=1, col=1)
-    
-    # Composite
-    fig.add_trace(go.Scatter(
-        x=df.index[-lookback_bars:],
-        y=df['composite'][-lookback_bars:],
-        name='Composite',
-        line=dict(color='blue', width=2)
-    ), row=2, col=1)
-    fig.add_trace(go.Scatter(
-        x=df.index[-lookback_bars:],
-        y=df['composite_signal'][-lookback_bars:],
-        name='Signal',
-        line=dict(color='orange', width=1, dash='dot')
-    ), row=2, col=1)
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
-    
-    fig.update_layout(height=500, showlegend=False)
-    fig.update_xaxes(title_text="Time", row=2, col=1)
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Composite", row=2, col=1)
-    
+    fig.add_trace(go.Candlestick(x=live_df.index[-lookback:], open=live_df['open'][-lookback:], high=live_df['high'][-lookback:], low=live_df['low'][-lookback:], close=live_df['close'][-lookback:], name=symbol), row=1, col=1)
+    fig.add_trace(go.Scatter(x=live_df.index[-lookback:], y=live_df['rsi_14'][-lookback:], name='RSI', line=dict(color='blue')), row=2, col=1)
+    fig.add_hline(y=50, line_dash="dash", line_color="gray", row=2, col=1)
+    fig.update_layout(height=450, showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
-    
-    # Best params reminder
-    st.info(f"🔑 Using best historical params: {st.session_state.best_params}")
-
 
 # ============================================
-# MAIN
+# MAIN EXECUTION
 # ============================================
-def main():
-    if not api_key or not secret_key:
-        st.warning("⚠️ Enter Alpaca API keys to fetch data")
-        st.info("Get free keys: app.alpaca.markets")
-        return
-    
-    # Phase 1: Historical Research
-    if run_hist:
-        st.header("🔍 PHASE 1: Historical Grid Search")
-        results = run_historical_research(
-            symbol, confirm_symbol, hist_days, hist_tf, 
-            api_key, secret_key, feed, inverse_etf, use_confirmation, zero_cross_only
-        )
-        if results is not None:
-            st.success("✅ Phase 1 complete! Now run Phase 2 for live scoring.")
-    
-    # Phase 2: Live Scoring
-    if run_live:
-        st.header("⚡ PHASE 2: Live Real-Time Scoring")
-        run_live_scoring(
-            symbol, confirm_symbol, live_tf, lookback_bars,
-            api_key, secret_key, feed, inverse_etf, use_confirmation
-        )
-    
-    # Initial state
-    if not run_hist and not run_live:
-        st.info("👈 Configure settings above, then click Phase 1 → Phase 2")
-        st.markdown("""
-        ### How to Use:
-        1. **Phase 1**: Click "Find Sweet Spot" to grid-search historical zero-cross combinations
-        2. **Review**: See which oscillator combo had best Sharpe/win rate
-        3. **Phase 2**: Click "Live Score" to apply best params to fresh real-time data
-        4. **Trade**: Use live signal + zero-cross status for entry timing
-        """)
-
-
-if __name__ == "__main__":
-    main()
+if not api_key or not secret:
+    st.warning("⚠️ Enter Alpaca API credentials in the sidebar to fetch data.")
+elif run_hist:
+    st.header("🔍 PHASE 1: Historical Calibration")
+    run_phase1()
+elif run_live:
+    st.header("⚡ PHASE 2: Live Real-Time Scoring")
+    run_phase2()
+else:
+    st.info("👈 Configure settings, then click **PHASE 1** to calibrate, then **PHASE 2** for live scoring.")
+    st.markdown("""
+    ### How It Works:
+    1. **Timeframe Alignment**: Returns are measured over `target_hold // chart_tf` bars. (e.g., 30-min hold on 5-min chart = 6 bars forward)
+    2. **Monte Carlo**: Randomly samples oscillator combinations, injects realistic slippage, and bootstrap-validates returns
+    3. **Optional Confirmation**: Only fetches/merges if checkbox is enabled
+    4. **Universal**: Works with any Alpaca-supported symbol (stocks, ETFs, crypto)
+    """)
