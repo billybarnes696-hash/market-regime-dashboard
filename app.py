@@ -1,292 +1,384 @@
 """
-QUANT EDGE SYSTEM v2.0 - INSTITUTIONAL ARCHITECTURE
-- Weighted score engine (replaces binary AND)
-- VWAP + volatility regime filters
-- Proper t-stat & stability-optimized Monte Carlo
-- SIP/IEX feed awareness + Alpaca paper trading reality
-- Forward-return aligned, no lookahead, session-aware bootstrapping
+UNIVERSAL SWEET SPOT BACKTEST - WITH DEBUG LOGS
+Run this script directly (python script.py)
+Will save results to CSV and print debug info
 """
 
-import os, time, numpy as np, pandas as pd
+import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta, timezone
-import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from scipy import stats
+from itertools import product
+import sys
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 # ============================================
-# PAGE CONFIG & STATE
+# CONFIGURATION - EDIT THESE
 # ============================================
-st.set_page_config(page_title="Quant Edge v2.0", layout="wide")
-st.title("📊 Quant Edge System v2.0")
-st.caption("Weighted Score Engine | Regime-Aware | Stability-Optimized MC")
+API_KEY = "YOUR_ALPACA_API_KEY"
+SECRET_KEY = "YOUR_ALPACA_SECRET"
+FEED = "sip"  # sip = full market, iex = limited
 
-for key in ['best_params', 'mc_results', 'live_df']:
-    st.session_state.setdefault(key, None)
+SYMBOL = "SOXS"  # Change this to test different symbols
+DAYS_BACK = 180
+TIMEFRAME_MIN = 10  # 5, 10, or 15
+HOLD_BARS = 2  # 1, 2, 3, or 5
 
-# ============================================
-# SIDEBAR: CONFIGURATION
-# ============================================
-with st.sidebar:
-    st.header("📊 Symbol & Data")
-    symbol = st.text_input("Primary Symbol", value="SOXS").upper().strip()
-    
-    st.header("⏱️ Timeframe & Hold")
-    chart_tf = st.selectbox("Chart Timeframe (min)", [1, 2, 5, 10, 15], index=2)
-    target_hold = st.selectbox("Target Hold (min)", [15, 30, 45, 60], index=1)
-    hold_bars = max(1, target_hold // chart_tf)
-    st.info(f"🔢 Measuring returns over `{hold_bars}` bars ({target_hold} min)")
-    
-    st.header("🌐 Market Data Feed")
-    feed = st.selectbox("Data Feed", ["sip", "iex"], index=0)
-    if feed == "iex":
-        st.warning("⚠️ IEX = ~2-5% US volume. VWAP & cross-feed oscillators may drift. Use SIP for institutional calibration.")
-    
-    st.header("⚙️ Signal Engine")
-    cci_w = st.slider("CCI Weight", 0.0, 1.0, 0.3)
-    tsi_w = st.slider("TSI Weight", 0.0, 1.0, 0.2)
-    roc_w = st.slider("ROC Weight", 0.0, 1.0, 0.3)
-    stoch_w = st.slider("Stoch Weight", 0.0, 1.0, 0.2)
-    score_thresh = st.slider("Score Threshold", 0.3, 0.9, 0.55)
-    
-    st.header("📉 Regime Filters")
-    use_vwap_filter = st.checkbox("VWAP Regime Filter", value=True)
-    use_vol_filter = st.checkbox("Volatility Filter (ATR)", value=True)
-    vol_min = st.slider("Min ATR (bps)", 5, 50, 15) if use_vol_filter else 0
-    
-    st.header("🎲 Monte Carlo")
-    mc_iters = st.slider("MC Iterations", 200, 2000, 800)
-    
-    st.header("🔑 Alpaca API")
-    api_key = st.text_input("API Key", type="password", value=os.getenv("ALPACA_API_KEY", ""))
-    secret = st.text_input("Secret Key", type="password", value=os.getenv("ALPACA_SECRET_KEY", ""))
-    
-    col1, col2 = st.columns(2)
-    run_hist = col1.button("🔍 PHASE 1: Calibrate", use_container_width=True)
-    run_live = col2.button("⚡ PHASE 2: Live Score", type="primary", use_container_width=True)
+# Signal type: "cross" or "level"
+SIGNAL_TYPE = "cross"  # cross = when oscillator crosses threshold (RECOMMENDED)
+# SIGNAL_TYPE = "level"  # level = when oscillator is above threshold
+
+# Thresholds to test
+TSI_THRESHOLDS = [0]
+CCI_THRESHOLDS = [0]
+ROC_THRESHOLDS = [0]
+RSI_THRESHOLDS = [50]
 
 # ============================================
-# DATA FETCHING
+# DEBUG LOGGING
 # ============================================
-def fetch_data(sym, days, api, sec, feed_type, tf="1Min"):
-    if not api or not sec: return None
-    client = StockHistoricalDataClient(api, sec)
+def log(msg, level="INFO"):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {level}: {msg}")
+    sys.stdout.flush()
+
+log(f"Starting backtest for {SYMBOL}")
+log(f"Timeframe: {TIMEFRAME_MIN}min | Hold: {HOLD_BARS} bars ({TIMEFRAME_MIN * HOLD_BARS} min)")
+log(f"Signal type: {SIGNAL_TYPE}")
+
+# ============================================
+# FETCH DATA
+# ============================================
+log(f"Fetching {DAYS_BACK} days of data from Alpaca...")
+
+try:
+    client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-    try:
-        req = StockBarsRequest(
-            symbol_or_symbols=sym, timeframe=TimeFrame.Minute if tf=="1Min" else TimeFrame.Day,
-            start=start, end=end, limit=10000, feed=feed_type, adjustment="all"
-        )
-        bars = client.get_stock_bars(req).df
-        return bars.reset_index(level=0, drop=True) if not bars.empty else None
-    except Exception as e:
-        st.error(f"Data fetch failed: {e}"); return None
+    start = end - timedelta(days=DAYS_BACK)
+    
+    req = StockBarsRequest(
+        symbol_or_symbols=SYMBOL,
+        timeframe=TimeFrame.Minute,
+        start=start,
+        end=end,
+        limit=50000,
+        feed=FEED,
+        adjustment="all",
+    )
+    
+    bars = client.get_stock_bars(req).df
+    log(f"Raw bars fetched: {len(bars)}")
+    
+    if bars.empty:
+        log("No data returned! Check API keys and symbol.", "ERROR")
+        sys.exit(1)
+        
+except Exception as e:
+    log(f"API Error: {e}", "ERROR")
+    sys.exit(1)
+
+# Clean data
+bars = bars.reset_index(level=0, drop=True)
+bars.index = pd.to_datetime(bars.index)
+bars = bars.tz_localize(None)
+
+log(f"Data range: {bars.index[0]} to {bars.index[-1]}")
+log(f"Total minute bars: {len(bars)}")
 
 # ============================================
-# INDICATOR ENGINE (v2.0)
+# RESAMPLE TO TIMEFRAME
 # ============================================
-def compute_features(df):
-    df = df.copy()
-    c = df['close']
-    h, l, v = df['high'], df['low'], df['volume']
-    
-    # VWAP (session/intraday)
-    df['vwap'] = (cum_tp := ((h + l + c) / 3 * v).cumsum() / v.cumsum())
-    
-    # Volatility (ATR proxy)
-    tr = np.maximum(h - l, np.maximum((c - h.shift(1)).abs(), (c - l.shift(1)).abs()))
-    df['atr'] = tr.rolling(14).mean()
-    
-    # Oscillators
-    df['cci'] = (c - c.rolling(14).mean()) / (0.015 * (c - c.rolling(14).mean()).rolling(14).mean().replace(0, np.nan))
-    df['roc'] = (c / c.shift(10) - 1) * 100
-    mom = c.diff()
-    ds = mom.ewm(span=13).mean().ewm(span=7).mean()
-    ads = mom.abs().ewm(span=13).mean().ewm(span=7).mean()
-    df['tsi'] = 100 * ds / ads.replace(0, np.nan)
-    lo, hi = c.rolling(14).min(), c.rolling(14).max()
-    df['stoch'] = 100 * (c - lo) / (hi - lo).replace(0, np.nan)
-    
-    # Normalize signals to 0-1 range for scoring
-    df['cci_sig'] = np.clip((df['cci'].shift(1) <= 0) & (df['cci'] > 0), 0, 1)
-    df['tsi_sig'] = np.clip((df['tsi'].shift(1) <= 0) & (df['tsi'] > 0), 0, 1)
-    df['roc_sig'] = np.clip((df['roc'].shift(1) <= 0) & (df['roc'] > 0), 0, 1)
-    df['stoch_sig'] = np.clip((df['stoch'].shift(1) <= 50) & (df['stoch'] > 50), 0, 1)
-    
-    # Forward returns
-    df[f'forward_{hold_bars}'] = (c.shift(-hold_bars) / c - 1) * 100
-    
-    return df
+freq = f'{TIMEFRAME_MIN}min'
+df = bars.resample(freq).agg({
+    'open': 'first',
+    'high': 'max',
+    'low': 'min',
+    'close': 'last',
+    'volume': 'sum'
+}).dropna()
+
+log(f"Resampled to {len(df)} {TIMEFRAME_MIN}-min bars")
+
+if len(df) < 100:
+    log(f"Only {len(df)} bars - need at least 100 for valid backtest", "WARNING")
 
 # ============================================
-# SCORE ENGINE & REGIME FILTERS
+# OSCILLATOR FUNCTIONS
 # ============================================
-def generate_signals(df, w_cci, w_tsi, w_roc, w_stoch, thresh, vwap_on, vol_on, vol_min_bps):
-    df = df.copy()
-    # Weighted composite score
-    df['score'] = (w_cci * df['cci_sig'] + w_tsi * df['tsi_sig'] + 
-                   w_roc * df['roc_sig'] + w_stoch * df['stoch_sig'])
-    df['signal'] = df['score'] >= thresh
-    
-    # Regime filters
-    if vwap_on:
-        df['signal'] &= df['close'] > df['vwap']  # Only longs above VWAP (flip for inverse if needed)
-    if vol_on:
-        vol_pct = df['atr'] / df['close'] * 10000
-        df['signal'] &= vol_pct >= vol_min_bps
-        
-    return df
+def ema(s, span):
+    return s.ewm(span=span, adjust=False).mean()
+
+def tsi(close, long_p=25, short_p=13):
+    delta = close.diff()
+    m1 = ema(delta, long_p)
+    m2 = ema(m1, short_p)
+    a1 = ema(delta.abs(), long_p)
+    a2 = ema(a1, short_p)
+    return 100 * m2 / a2.replace(0, np.nan)
+
+def cci(df, period=20):
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    sma = tp.rolling(period, min_periods=2).mean()
+    mad = (tp - sma).abs().rolling(period, min_periods=2).mean()
+    return (tp - sma) / (0.015 * mad.replace(0, np.nan))
+
+def roc(close, period=10):
+    return (close / close.shift(period) - 1) * 100
+
+def rsi(close, period=14):
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    avg_up = up.ewm(alpha=1/period, adjust=False).mean()
+    avg_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_up / avg_down.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 # ============================================
-# MONTE CARLO v2.0 (t-stat + stability optimized)
+# CALCULATE OSCILLATORS
 # ============================================
-def monte_carlo_v2(df, n_iter=800):
-    results = []
-    # Randomize parameter space
-    param_grid = {
-        'w_cci': np.random.uniform(0, 1, n_iter), 'w_tsi': np.random.uniform(0, 1, n_iter),
-        'w_roc': np.random.uniform(0, 1, n_iter), 'w_stoch': np.random.uniform(0, 1, n_iter),
-        'thresh': np.random.uniform(0.4, 0.8, n_iter),
-        'vwap_on': np.random.choice([True, False], n_iter),
-        'vol_on': np.random.choice([True, False], n_iter),
-        'vol_min': np.random.randint(5, 30, n_iter)
-    }
-    
-    for i in range(n_iter):
-        # Normalize weights to sum=1
-        ws = np.array([param_grid['w_cci'][i], param_grid['w_tsi'][i], 
-                       param_grid['w_roc'][i], param_grid['w_stoch'][i]])
-        ws = ws / ws.sum() if ws.sum() > 0 else np.array([0.25]*4)
-        
-        params = {
-            'w_cci': ws[0], 'w_tsi': ws[1], 'w_roc': ws[2], 'w_stoch': ws[3],
-            'thresh': param_grid['thresh'][i], 'vwap_on': param_grid['vwap_on'][i],
-            'vol_on': param_grid['vol_on'][i], 'vol_min': param_grid['vol_min'][i]
-        }
-        
-        sig_df = generate_signals(df, *ws, params['thresh'], params['vwap_on'], params['vol_on'], params['vol_min'])
-        signals = sig_df[sig_df['signal']]
-        if len(signals) < 15: continue
-        
-        ret_col = f'forward_{hold_bars}'
-        gross = signals[ret_col].dropna()
-        if len(gross) < 10: continue
-        
-        # Bootstrap stability check
-        boots = [gross.sample(frac=1, replace=True).mean() for _ in range(200)]
-        boot_mean, boot_std = np.mean(boots), np.std(boots)
-        t_stat = boot_mean / (boot_std + 1e-6) if boot_std > 0 else 0
-        
-        # Slippage injection (realistic for SOXS)
-        slip = np.random.uniform(0, 0.012, len(gross))
-        net = gross - slip * 100
-        win_rate = (net > 0).mean()
-        expectancy = net.mean()
-        stability_penalty = 1 / (1 + np.std(boots))
-        
-        # Institutional score: t-stat * stability * log(trades)
-        score = t_stat * stability_penalty * np.log(len(net) + 1)
-        
-        results.append({'params': params, 'trades': len(net), 'win_rate': win_rate,
-                        'expectancy': expectancy, 't_stat': t_stat, 'stability': stability_penalty,
-                        'score': score, 'boot_ci': (np.percentile(boots, 5), np.percentile(boots, 95))})
-    
-    if not results: return None
-    res_df = pd.DataFrame(results).sort_values('score', ascending=False)
-    return res_df.head(50), res_df.iloc[0]  # Top 50 + best
+log("Calculating oscillators...")
+
+df['tsi'] = tsi(df['close'])
+df['cci'] = cci(df)
+df['roc'] = roc(df['close'])
+df['rsi'] = rsi(df['close'])
+
+# Forward returns
+df[f'forward_{HOLD_BARS}'] = (df['close'].shift(-HOLD_BARS) / df['close'] - 1) * 100
+
+log(f"Oscillator stats:")
+log(f"  TSI: min={df['tsi'].min():.1f}, max={df['tsi'].max():.1f}, mean={df['tsi'].mean():.1f}")
+log(f"  CCI: min={df['cci'].min():.1f}, max={df['cci'].max():.1f}, mean={df['cci'].mean():.1f}")
+log(f"  ROC: min={df['roc'].min():.1f}, max={df['roc'].max():.1f}, mean={df['roc'].mean():.1f}")
+log(f"  RSI: min={df['rsi'].min():.1f}, max={df['rsi'].max():.1f}, mean={df['rsi'].mean():.1f}")
 
 # ============================================
-# PHASE 1: HISTORICAL CALIBRATION
+# GENERATE SIGNALS (CROSS vs LEVEL)
 # ============================================
-def run_phase1():
-    with st.spinner("📥 Fetching historical data..."):
-        df = fetch_data(symbol, 120, api_key, secret, feed)
-    if df is None: st.stop()
-    
-    with st.spinner("⚙️ Computing features & running MC..."):
-        df = compute_features(df)
-        top_df, best = monte_carlo_v2(df, mc_iters)
-    
-    if top_df is None:
-        st.warning("❌ No statistically valid combinations found. Increase data days or relax filters.")
-        return
-    
-    st.session_state.best_params = best['params']
-    st.session_state.mc_results = top_df
-    
-    st.success("✅ Calibration Complete")
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Trades", int(best['trades']))
-    c2.metric("Expectancy", f"{best['expectancy']:.2f}%")
-    c3.metric("t-Stat", f"{best['t_stat']:.2f}")
-    c4.metric("95% CI", f"[{best['boot_ci'][0]:.2f}, {best['boot_ci'][1]:.2f}]")
-    
-    st.dataframe(top_df[['trades','expectancy','t_stat','stability','score']].head(10), use_container_width=True)
-    st.info("💡 Score = t-stat × bootstrap stability × log(trades). Optimizes for expectancy + robustness, not raw win-rate.")
+log(f"Generating {SIGNAL_TYPE} signals...")
 
-# ============================================
-# PHASE 2: LIVE SCORING
-# ============================================
-def run_phase2():
-    if st.session_state.best_params is None:
-        st.warning("⚠️ Run Phase 1 first to calibrate parameters.")
-        return
-    
-    with st.spinner("⚡ Fetching LIVE data..."):
-        df = fetch_data(symbol, 2, api_key, secret, feed)
-    if df is None: st.stop()
-    
-    df = compute_features(df)
-    p = st.session_state.best_params
-    sig_df = generate_signals(df, p['w_cci'], p['w_tsi'], p['w_roc'], p['w_stoch'], 
-                              p['thresh'], p['vwap_on'], p['vol_on'], p['vol_min'])
-    latest = sig_df.iloc[-1]
-    
-    st.subheader(f"📡 LIVE: {symbol} | Score: {latest['score']:.3f} | Threshold: {p['thresh']:.2f}")
-    
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("CCI Sig", "✅" if latest['cci_sig'] else "⏳", f"{latest['cci']:.1f}")
-    c2.metric("TSI Sig", "✅" if latest['tsi_sig'] else "⏳", f"{latest['tsi']:.1f}")
-    c3.metric("ROC Sig", "✅" if latest['roc_sig'] else "⏳", f"{latest['roc']:.2f}%")
-    c4.metric("Stoch Sig", "✅" if latest['stoch_sig'] else "⏳", f"{latest['stoch']:.1f}")
-    
-    if latest['score'] >= p['thresh']:
-        st.success("🟢 SIGNAL ACTIVE | All regime filters passed")
-    else:
-        st.info("⏳ WAITING | Score below threshold or regime filter active")
-        
-    # Quick chart
-    lookback = min(100, len(sig_df))
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=sig_df.index[-lookback:], open=sig_df['open'][-lookback:], 
-                                 high=sig_df['high'][-lookback:], low=sig_df['low'][-lookback:], 
-                                 close=sig_df['close'][-lookback:], name=symbol))
-    fig.add_trace(go.Scatter(x=sig_df.index[-lookback:], y=sig_df['vwap'][-lookback:], name='VWAP', line=dict(color='cyan', width=1, dash='dot')))
-    fig.update_layout(height=450, xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-# ============================================
-# MAIN
-# ============================================
-if not api_key or not secret:
-    st.warning("🔑 Enter Alpaca credentials to fetch data.")
-elif run_hist:
-    st.header("🔍 PHASE 1: Institutional Calibration")
-    run_phase1()
-elif run_live:
-    st.header("⚡ PHASE 2: Live Scoring Engine")
-    run_phase2()
+if SIGNAL_TYPE == "cross":
+    # CROSS signal - enters when oscillator crosses threshold
+    df['tsi_signal'] = (df['tsi'].shift(1) <= 0) & (df['tsi'] > 0)
+    df['cci_signal'] = (df['cci'].shift(1) <= 0) & (df['cci'] > 0)
+    df['roc_signal'] = (df['roc'].shift(1) <= 0) & (df['roc'] > 0)
+    df['rsi_signal'] = (df['rsi'].shift(1) <= 50) & (df['rsi'] > 50)
 else:
-    st.info("👈 Configure weights/filters → Click **PHASE 1** → Review → **PHASE 2**")
-    st.markdown("""
-    ### 📐 Quant Upgrades in v2.0
-    - **Score Engine**: Replaces brittle `AND` logic with weighted composite + threshold
-    - **Regime Filters**: VWAP alignment + ATR volatility floor removes chop destruction
-    - **MC Scoring**: Optimizes `t-stat × bootstrap stability × log(trades)` → rewards expectancy + consistency
-    - **Feed Awareness**: SIP recommended for VWAP/BB accuracy; IEX noted for volume drift
-    - **No Lookahead**: Forward returns only used for labeling, never signal generation
-    """)
+    # LEVEL signal - enters when oscillator is above threshold (ALREADY MOVED)
+    df['tsi_signal'] = df['tsi'] > 0
+    df['cci_signal'] = df['cci'] > 0
+    df['roc_signal'] = df['roc'] > 0
+    df['rsi_signal'] = df['rsi'] > 50
+
+# Combine signals (ALL must be true)
+df['signal'] = (
+    df['tsi_signal'] & 
+    df['cci_signal'] & 
+    df['roc_signal'] & 
+    df['rsi_signal']
+)
+
+signal_count = df['signal'].sum()
+signal_pct = signal_count / len(df) * 100
+
+log(f"Total signals: {signal_count} ({signal_pct:.2f}% of bars)")
+
+if signal_count < 20:
+    log(f"Only {signal_count} signals - need at least 20 for valid backtest", "WARNING")
+    log("Try: lower thresholds, longer timeframe, or more days of data")
+
+# ============================================
+# BACKTEST
+# ============================================
+signals = df[df['signal']].copy()
+returns = signals[f'forward_{HOLD_BARS}'].dropna()
+
+if len(returns) < 10:
+    log(f"Only {len(returns)} trades with valid returns - cannot backtest", "ERROR")
+    sys.exit(1)
+
+win_rate = (returns > 0).mean() * 100
+avg_return = returns.mean()
+median_return = returns.median()
+std_return = returns.std()
+sharpe = avg_return / std_return if std_return > 0 else 0
+t_stat = avg_return / (std_return / np.sqrt(len(returns))) if std_return > 0 else 0
+
+# Percentiles
+p5 = np.percentile(returns, 5)
+p25 = np.percentile(returns, 25)
+p75 = np.percentile(returns, 75)
+p95 = np.percentile(returns, 95)
+
+# ============================================
+# MONTE CARLO SIMULATION
+# ============================================
+log(f"Running Monte Carlo ({min(500, len(returns))} iterations)...")
+
+n_sims = min(500, len(returns) * 10)
+sim_means = []
+sim_wins = []
+
+np.random.seed(42)
+for _ in range(n_sims):
+    sample = np.random.choice(returns, len(returns), replace=True)
+    sim_means.append(sample.mean())
+    sim_wins.append((sample > 0).mean() * 100)
+
+mc_mean = np.mean(sim_means)
+mc_std = np.std(sim_means)
+mc_p5 = np.percentile(sim_means, 5)
+mc_p95 = np.percentile(sim_means, 95)
+mc_win_mean = np.mean(sim_wins)
+mc_win_p5 = np.percentile(sim_wins, 5)
+mc_win_p95 = np.percentile(sim_wins, 95)
+
+# ============================================
+# PRINT RESULTS
+# ============================================
+print("\n" + "="*70)
+print(f"RESULTS FOR {SYMBOL}")
+print("="*70)
+print(f"""
+Configuration:
+  Timeframe:        {TIMEFRAME_MIN} minutes
+  Hold time:        {TIMEFRAME_MIN * HOLD_BARS} minutes ({HOLD_BARS} bars)
+  Signal type:      {SIGNAL_TYPE}
+  Data period:      {df.index[0].date()} to {df.index[-1].date()}
+  Total bars:       {len(df)}
+
+Signal Statistics:
+  Total signals:    {signal_count}
+  Signal frequency: {signal_pct:.2f}% of bars
+  Valid trades:     {len(returns)}
+
+Performance:
+  Win Rate:         {win_rate:.1f}%
+  Avg Return:       {avg_return:.2f}%
+  Median Return:    {median_return:.2f}%
+  Std Deviation:    {std_return:.2f}%
+  Sharpe Ratio:     {sharpe:.2f}
+  t-statistic:      {t_stat:.2f}
+
+Return Distribution:
+  5th percentile:   {p5:.2f}%
+  25th percentile:  {p25:.2f}%
+  75th percentile:  {p75:.2f}%
+  95th percentile:  {p95:.2f}%
+  Best trade:       {returns.max():.2f}%
+  Worst trade:      {returns.min():.2f}%
+
+Monte Carlo (95% confidence):
+  Return range:     [{mc_p5:.2f}%, {mc_p95:.2f}%]
+  Win rate range:   [{mc_win_p5:.1f}%, {mc_win_p95:.1f}%]
+""")
+
+# ============================================
+# INTERPRETATION
+# ============================================
+print("="*70)
+print("INTERPRETATION")
+print("="*70)
+
+if t_stat > 2.0:
+    print("✅ t-stat > 2.0 - Statistically significant")
+else:
+    print("❌ t-stat < 2.0 - Not statistically significant (may be random)")
+
+if win_rate > 60:
+    print(f"✅ Win rate {win_rate:.1f}% - Better than coin flip")
+elif win_rate > 55:
+    print(f"🟡 Win rate {win_rate:.1f}% - Modest edge")
+else:
+    print(f"❌ Win rate {win_rate:.1f}% - Worse than coin flip")
+
+if avg_return > 0:
+    print(f"✅ Positive expectancy: {avg_return:.2f}% per trade")
+else:
+    print(f"❌ Negative expectancy: {avg_return:.2f}% per trade")
+
+if signal_count < 50:
+    print(f"⚠️ Only {signal_count} signals - may not be enough for reliable strategy")
+
+# ============================================
+# CHECK SIGNAL DIRECTION
+# ============================================
+print("\n" + "="*70)
+print("SIGNAL DIRECTION CHECK")
+print("="*70)
+
+# Check what happens AFTER signal
+signal_returns = returns
+no_signal_returns = df[~df['signal']][f'forward_{HOLD_BARS}'].dropna()
+
+print(f"With signal:    avg return = {signal_returns.mean():.3f}%")
+print(f"Without signal: avg return = {no_signal_returns.mean():.3f}%")
+print(f"Difference:     {signal_returns.mean() - no_signal_returns.mean():.3f}%")
+
+if signal_returns.mean() > no_signal_returns.mean():
+    print("✅ Signal is better than random (positive edge)")
+else:
+    print("❌ Signal is WORSE than random (try OPPOSITE signal)")
+
+# ============================================
+# SAVE RESULTS
+# ============================================
+results = {
+    'symbol': SYMBOL,
+    'timeframe_min': TIMEFRAME_MIN,
+    'hold_minutes': TIMEFRAME_MIN * HOLD_BARS,
+    'signal_type': SIGNAL_TYPE,
+    'days_back': DAYS_BACK,
+    'total_bars': len(df),
+    'total_signals': signal_count,
+    'signal_pct': round(signal_pct, 2),
+    'valid_trades': len(returns),
+    'win_rate': round(win_rate, 1),
+    'avg_return': round(avg_return, 2),
+    'median_return': round(median_return, 2),
+    'sharpe': round(sharpe, 2),
+    't_stat': round(t_stat, 2),
+    'p5': round(p5, 2),
+    'p95': round(p95, 2),
+    'mc_return_p5': round(mc_p5, 2),
+    'mc_return_p95': round(mc_p95, 2),
+    'mc_win_p5': round(mc_win_p5, 1),
+    'mc_win_p95': round(mc_win_p95, 1),
+}
+
+# Save to CSV
+output_file = f"{SYMBOL}_backtest_{TIMEFRAME_MIN}min_{SIGNAL_TYPE}.csv"
+
+# Also save full trade list
+trades_df = pd.DataFrame({
+    'timestamp': signals.index[:len(returns)],
+    'return_pct': returns.values
+})
+trades_file = f"{SYMBOL}_trades_{TIMEFRAME_MIN}min_{SIGNAL_TYPE}.csv"
+trades_df.to_csv(trades_file, index=False)
+
+print(f"\n📁 Results saved to: {output_file}")
+print(f"📁 Trade list saved to: {trades_file}")
+
+# ============================================
+# RECOMMENDATION
+# ============================================
+print("\n" + "="*70)
+print("RECOMMENDATION")
+print("="*70)
+
+if avg_return > 0 and t_stat > 2.0 and win_rate > 55:
+    print(f"✅ This strategy works for {SYMBOL}!")
+    print(f"   Entry: When TSI, CCI, ROC cross above 0 AND RSI > 50")
+    print(f"   Exit: After {TIMEFRAME_MIN * HOLD_BARS} minutes")
+elif avg_return < 0 and t_stat > 2.0:
+    print(f"🔄 Try the OPPOSITE signal for {SYMBOL}")
+    print(f"   Entry: When TSI, CCI, ROC cross BELOW 0 AND RSI < 50")
+elif t_stat < 2.0:
+    print(f"❌ No statistically significant edge found for {SYMBOL}")
+    print(f"   Try: Different timeframe, hold time, or thresholds")
+else:
+    print(f"❌ Strategy does not work for {SYMBOL} with current settings")
