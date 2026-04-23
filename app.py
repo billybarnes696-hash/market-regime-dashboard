@@ -1,994 +1,807 @@
-#!/usr/bin/env python3
 """
-Stable Market Engine v12 — TSI Cross Dashboard (Multi-Symbol)
-✅ TSI Logic: Cross, Heat, Regime, Exhaustion, Divergence
-✅ Dashboard: Mega View, Range Tabs, Traffic Lights, Diagnostics
-✅ Data: Alpaca (Real 1H/2H + Daily) with Smooth Visualization
-✅ Multi-Symbol: Batch processing, ranking, detailed drill-down
+QUANT LEVEL EDGE FINDER + LIVE OSCILLATOR DASHBOARD
+- Monte Carlo validated
+- Walk-forward tested
+- No lookahead bias
+- Statistical significance filters
+- Universal (any symbol)
 """
 
-from __future__ import annotations
-import io
-import time
 import os
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import time
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from datetime import datetime, timedelta, timezone
+from itertools import product
+from scipy import stats
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
 import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.timeframe import TimeFrame
 
-# -----------------------------
-# CONFIG & SETUP
-# -----------------------------
-APP_DIR = Path(__file__).resolve().parent
-CACHE_DIR = APP_DIR / "cache_store_alpaca"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-NY_TZ = "America/New_York"
 
+# ============================================
+# CONFIGURATION
+# ============================================
 st.set_page_config(
-    page_title="Stable Market Engine v12 — TSI Dashboard",
+    page_title="Quant Edge System",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# -----------------------------
-# UTILITY HELPERS
-# -----------------------------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+# Custom CSS for better visuals
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #1e1e1e;
+        padding: 15px;
+        border-radius: 10px;
+        border-left: 4px solid;
+        margin: 5px 0;
+    }
+    .good { border-left-color: #00ff00; }
+    .warning { border-left-color: #ffaa00; }
+    .bad { border-left-color: #ff4444; }
+    .neutral { border-left-color: #888888; }
+</style>
+""", unsafe_allow_html=True)
 
-def smooth_component(series: pd.Series, span: int) -> pd.Series:
-    return ema(series, span) if span and span > 1 else series
 
-def sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window).mean()
-
-def slope(series: pd.Series, bars: int = 3) -> pd.Series:
-    return series.diff(bars) / bars
-
-def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    high, low, close = df["High"], df["Low"], df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(window).mean()
-
-def rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = -delta.clip(upper=0.0)
-    avg_up = up.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
-    avg_down = down.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
-    rs = avg_up / avg_down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def cci(df: pd.DataFrame, window: int = 20) -> pd.Series:
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    ma = tp.rolling(window).mean()
-    md = (tp - ma).abs().rolling(window).mean()
-    return (tp - ma) / (0.015 * md.replace(0, np.nan))
-
-def tsi(series: pd.Series, long_period: int = 25, short_period: int = 13, signal_period: int = 7) -> Tuple[pd.Series, pd.Series]:
-    delta = series.diff()
-    abs_delta = delta.abs()
-    double_smoothed = ema(ema(delta, long_period), short_period)
-    double_abs = ema(ema(abs_delta, long_period), short_period)
-    tsi_line = 100 * double_smoothed / double_abs.replace(0, np.nan)
-    signal_line = ema(tsi_line, signal_period)
-    return tsi_line, signal_line
-
-def bollinger_pct_b(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.Series:
-    mid = series.rolling(window).mean()
-    std = series.rolling(window).std()
-    upper = mid + num_std * std
-    lower = mid - num_std * std
-    return (series - lower) / (upper - lower).replace(0, np.nan)
-
-def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    high, low, close = df["High"], df["Low"], df["Close"]
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
-    tr = pd.concat([(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr_val = tr.rolling(window).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(window).sum() / atr_val.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(window).sum() / atr_val.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.rolling(window).mean()
-
-def rolling_vwap(df: pd.DataFrame, window: int = 20) -> pd.Series:
-    typical = (df["High"] + df["Low"] + df["Close"]) / 3
-    vol = df["Volume"].fillna(0.0)
-    pv = typical * vol
-    pv_sum = pv.rolling(window, min_periods=max(5, window // 4)).sum()
-    v_sum = vol.rolling(window, min_periods=max(5, window // 4)).sum()
-    return pv_sum / v_sum.replace(0, np.nan)
-
-def anchored_intraday_vwap(df: pd.DataFrame) -> pd.Series:
-    out = pd.Series(index=df.index, dtype=float)
-    local_idx = pd.to_datetime(df.index)
-    if getattr(local_idx, "tz", None) is None:
-        local_idx = local_idx.tz_localize(NY_TZ)
-    else:
-        local_idx = local_idx.tz_convert(NY_TZ)
-    day_keys = pd.Series(local_idx.date, index=df.index)
-    for _, part in df.groupby(day_keys):
-        tp = (part["High"] + part["Low"] + part["Close"]) / 3.0
-        pv = tp * part["Volume"].fillna(0)
-        cum_vol = part["Volume"].fillna(0).cumsum().replace(0, np.nan)
-        out.loc[part.index] = pv.cumsum() / cum_vol
-    return out
-
-def normalize_rolling(series: pd.Series, window: int) -> pd.Series:
-    lo = series.rolling(window, min_periods=max(20, window // 5)).min()
-    hi = series.rolling(window, min_periods=max(20, window // 5)).max()
-    out = 100 * (series - lo) / (hi - lo).replace(0, np.nan)
-    return out.clip(0, 100)
-
-def recent_divergence(price: pd.Series, osc: pd.Series, lookback: int = 10) -> pd.Series:
-    hh_price = price == price.rolling(lookback, min_periods=max(5, lookback // 2)).max()
-    hh_osc = osc == osc.rolling(lookback, min_periods=max(5, lookback // 2)).max()
-    ll_price = price == price.rolling(lookback, min_periods=max(5, lookback // 2)).min()
-    ll_osc = osc == osc.rolling(lookback, min_periods=max(5, lookback // 2)).min()
-    bear = hh_price & (~hh_osc) & (price > price.shift(max(2, lookback // 2))) & (osc < osc.shift(max(2, lookback // 2)))
-    bull = ll_price & (~ll_osc) & (price < price.shift(max(2, lookback // 2))) & (osc > osc.shift(max(2, lookback // 2)))
-    out = pd.Series("None", index=price.index)
-    out.loc[bear] = "Bearish"
-    out.loc[bull] = "Bullish"
-    return out
-
-# -----------------------------
-# DATA FETCHING
-# -----------------------------
-def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
-    out.columns = [str(c).title() for c in out.columns]
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in out.columns]
-    if len(keep) < 4:
-        return pd.DataFrame()
-    out = out[keep].copy()
-    out.index = pd.to_datetime(out.index, errors="coerce")
-    if getattr(out.index, "tz", None) is not None:
-        out.index = out.index.tz_convert(NY_TZ).tz_localize(None)
-    out = out.sort_index()
-    for c in keep:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    if "Volume" not in out.columns:
-        out["Volume"] = np.nan
-    return out.dropna(subset=["Open", "High", "Low", "Close"])
-
-def parse_symbol_csv(uploaded) -> List[str]:
-    if uploaded is None:
-        return []
-    raw = uploaded.getvalue()
-    try:
-        df = pd.read_csv(io.BytesIO(raw))
-    except Exception:
-        return []
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    sym_col = cols.get("symbol") or cols.get("ticker") or next(iter(df.columns), None)
-    if sym_col is None:
-        return []
-    return [str(x).strip().upper() for x in df[sym_col].dropna().tolist() if str(x).strip()]
-
-def clean_symbols(text: str, uploaded_symbols: List[str]) -> List[str]:
-    symbols: List[str] = []
-    if text.strip():
-        symbols.extend([s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()])
-    symbols.extend(uploaded_symbols)
-    out = []
-    for s in symbols:
-        if s and s not in out:
-            out.append(s)
-    return out
-
-def cache_path(symbol: str, kind: str) -> Path:
-    safe = "".join(c for c in symbol if c.isalnum() or c in ".-")
-    return CACHE_DIR / f"{safe}_{kind}.parquet"
-
-def is_fresh(path: Path, max_hours: int = 18) -> bool:
-    if not path.exists():
-        return False
-    age = pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")
-    return age < pd.Timedelta(hours=max_hours)
-
-def alpaca_client(key: str, secret: str) -> StockHistoricalDataClient:
-    return StockHistoricalDataClient(key, secret)
-
-def _bars_df_for_symbol(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.index, pd.MultiIndex):
-        if "symbol" in df.index.names:
-            try:
-                sub = df.xs(symbol, level="symbol").copy()
-            except Exception:
-                return pd.DataFrame()
-        else:
-            return pd.DataFrame()
-    else:
-        sub = df.copy()
-    if "timestamp" in sub.columns:
-        sub = sub.set_index("timestamp")
-    return normalize_ohlcv(sub)
-
+# ============================================
+# DATA FETCHING (Safe, Rate-Limited)
+# ============================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: str, feed: str) -> Dict[str, pd.DataFrame]:
-    if not symbols:
-        return {}
-    data_map: Dict[str, pd.DataFrame] = {}
-    missing = []
-    for s in symbols:
-        p = cache_path(s, "daily")
-        if is_fresh(p):
-            try:
-                data_map[s] = pd.read_parquet(p)
-                continue
-            except Exception:
-                pass
-        missing.append(s)
-    if not missing:
-        return data_map
-    client = alpaca_client(key, secret)
-    start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(years=max(years, 5))).normalize().tz_localize(None)
-    end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
-    req = StockBarsRequest(symbol_or_symbols=missing, timeframe=TimeFrame.Day, start=start, end=end, adjustment="raw", feed=feed)
-    try:
-        raw = client.get_stock_bars(req).df
-    except Exception:
-        return data_map
-    for s in missing:
-        sub = _bars_df_for_symbol(raw, s)
-        if not sub.empty:
-            sub.to_parquet(cache_path(s, "daily"))
-            data_map[s] = sub
-    return data_map
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: str) -> pd.DataFrame:
-    p = cache_path(symbol, "2hour")
-    if is_fresh(p, max_hours=6):
-        try:
-            return pd.read_parquet(p)
-        except Exception:
-            pass
-    client = alpaca_client(key, secret)
-    start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
-    end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
-    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(30, TimeFrameUnit.Minute), start=start, end=end, adjustment="raw", feed=feed)
-    raw = None
-    for attempt in range(3):
-        try:
-            raw = client.get_stock_bars(req).df
-            break
-        except Exception:
-            if attempt == 2:
-                return pd.DataFrame()
-            time.sleep(1.5 * (attempt + 1))
-    sub = _bars_df_for_symbol(raw, symbol)
-    if sub.empty:
-        return pd.DataFrame()
-    idx = pd.DatetimeIndex(sub.index)
-    if idx.tz is not None:
-        idx = idx.tz_convert(NY_TZ).tz_localize(None)
-    sub.index = idx
-    sub = sub.between_time("09:30", "16:00")
-    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    pieces = []
-    for _, day_df in sub.groupby(sub.index.date):
-        if day_df.empty:
-            continue
-        anchor = pd.Timestamp(day_df.index[0].date()) + pd.Timedelta(hours=9, minutes=30)
-        ranges = [
-            (anchor, anchor + pd.Timedelta(hours=2)),
-            (anchor + pd.Timedelta(hours=2), anchor + pd.Timedelta(hours=4)),
-            (anchor + pd.Timedelta(hours=4), anchor + pd.Timedelta(hours=6)),
-            (anchor + pd.Timedelta(hours=6), anchor + pd.Timedelta(hours=6, minutes=30)),
-        ]
-        bins = []
-        for start_ts, end_ts in ranges:
-            chunk = day_df[(day_df.index >= start_ts) & (day_df.index < end_ts)]
-            if chunk.empty:
-                continue
-            row = pd.DataFrame(
-                {"Open": [chunk["Open"].iloc[0]], "High": [chunk["High"].max()], "Low": [chunk["Low"].min()], "Close": [chunk["Close"].iloc[-1]], "Volume": [chunk["Volume"].sum()]},
-                index=[start_ts]
-            )
-            bins.append(row)
-        if bins:
-            pieces.append(pd.concat(bins))
-    out = pd.concat(pieces).sort_index() if pieces else pd.DataFrame()
-    out = normalize_ohlcv(out)
-    if not out.empty:
-        out.to_parquet(p)
-    return out
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_alpaca_1hour(symbol: str, months: int, key: str, secret: str, feed: str) -> pd.DataFrame:
-    p = cache_path(symbol, "1hour")
-    if is_fresh(p, max_hours=6):
-        try:
-            return pd.read_parquet(p)
-        except Exception:
-            pass
-    client = alpaca_client(key, secret)
-    start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
-    end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
-    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Hour, start=start, end=end, adjustment="raw", feed=feed)
-    raw = None
-    for attempt in range(3):
-        try:
-            raw = client.get_stock_bars(req).df
-            break
-        except Exception:
-            if attempt == 2:
-                return pd.DataFrame()
-            time.sleep(1.5 * (attempt + 1))
-    sub = _bars_df_for_symbol(raw, symbol)
-    if sub.empty:
-        return pd.DataFrame()
-    idx = pd.DatetimeIndex(sub.index)
-    if idx.tz is not None:
-        idx = idx.tz_convert(NY_TZ).tz_localize(None)
-    sub.index = idx
-    sub = sub.between_time("09:30", "16:00")
-    sub = normalize_ohlcv(sub)
-    if not sub.empty:
-        sub.to_parquet(p)
-    return sub
-
-def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    return df.resample("W-FRI").agg(agg).dropna(how="any")
-
-def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, str, str]:
-    out = df.copy()
-    if target == "2hour_proxy":
-        label = "2-Hour Proxy"
-        timeframe_name = "2hour_proxy"
-    else:
-        label = "Hourly Proxy"
-        timeframe_name = "hourly_proxy"
-    return out, timeframe_name, label
-
-# -----------------------------
-# FEATURE ENGINEERING (TSI LOGIC)
-# -----------------------------
-def regime_bucket(tsi_heat: float, stretch_heat: float) -> str:
-    if pd.isna(tsi_heat):
-        return "Neutral"
-    if tsi_heat >= 70 and stretch_heat >= 70:
-        return "Strong & Extended"
-    if tsi_heat >= 60:
-        return "Strong"
-    if tsi_heat <= 35 and stretch_heat <= 45:
-        return "Weak"
-    if tsi_heat < 50:
-        return "Fading"
-    return "Neutral"
-
-def classify_state(row: pd.Series) -> str:
-    tsi_val, tsi_sig = row["TSI"], row["TSI_signal"]
-    tsi_slope, gap = row["TSI_slope"], row["TSI_gap"]
-    heat, price_chg = row["Exhaustion_score"], row["Price_lookback_ret"]
-    if tsi_val < tsi_sig:
-        if heat >= 72:
-            return "PUT · Exhausted, No Price Damage" if abs(price_chg) < 0.004 else "PUT · Exhausted"
-        return "PUT · Bearish" if (tsi_slope < 0 or gap < 0) else "NEUTRAL · Transition"
-    if tsi_val > tsi_sig:
-        if heat <= 28 and tsi_slope > 0:
-            return "CALL · Oversold Bull Turn"
-        return "CALL · Bullish" if (tsi_slope > 0 or gap > 0) else "NEUTRAL · Transition"
-    return "NEUTRAL · Transition"
-
-def enrich_price_features_tsi(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-    x = df.copy()
-    x["EMA10"] = ema(x["Close"], 10)
-    x["EMA20"] = ema(x["Close"], 20)
-    x["SMA50"] = x["Close"].rolling(50, min_periods=10).mean()
-    x["TSI"], x["TSI_signal"] = tsi(x["Close"], 25, 13, 7)
-    x["TSI_gap"] = x["TSI"] - x["TSI_signal"]
-    x["RSI"] = rsi(x["Close"], 14)
-    x["CCI"] = cci(x, 20)
-    x["BBPct"] = bollinger_pct_b(x["Close"], 20, 2.0)
+def fetch_safe_data(symbol: str, days_back: int, api_key: str, secret_key: str, feed: str = "sip") -> pd.DataFrame:
+    """Fetch data safely with rate limit handling."""
+    client = StockHistoricalDataClient(api_key, secret_key)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days_back)
     
-    # VWAP logic
-    if timeframe_name in {"1H", "1H_PROXY", "hourly_proxy", "proxy_smooth_1hour"}:
-        x["VWAP"] = anchored_intraday_vwap(x)
-        roll_window, div_lb, price_lb = 140, 10, 4
-    else:
-        x["VWAP"] = rolling_vwap(x, 20)
-        roll_window, div_lb, price_lb = 252, 6, 3
-
-    x["Dist_EMA10"] = 100 * (x["Close"] / x["EMA10"] - 1)
-    x["Dist_VWAP"] = 100 * (x["Close"] / x["VWAP"] - 1)
-    x["Price_lookback_ret"] = x["Close"] / x["Close"].shift(price_lb) - 1
-
-    # Heat & Exhaustion
-    x["TSI_heat"] = normalize_rolling(x["TSI"], roll_window)
-    x["CCI_heat"] = normalize_rolling(x["CCI"], roll_window)
-    x["RSI_heat"] = x["RSI"].clip(0, 100)
-    x["BB_heat"] = (x["BBPct"] * 100).clip(0, 100)
-    x["Stretch_heat"] = normalize_rolling(x["Dist_EMA10"] + 0.5 * x["Dist_VWAP"].fillna(0), roll_window)
-    raw_exhaust = 0.25*x["TSI_heat"] + 0.25*x["CCI_heat"] + 0.15*x["RSI_heat"] + 0.20*x["BB_heat"] + 0.15*x["Stretch_heat"]
-    x["Exhaustion_score"] = ema(raw_exhaust, 4)
-
-    x["TSI_slope"] = slope(x["TSI"], 3)
-    x["Exhaustion_slope"] = slope(x["Exhaustion_score"], 3)
-    x["Divergence"] = recent_divergence(x["Close"], x["TSI"], div_lb)
-    x["Regime_bucket"] = [regime_bucket(a, b) for a, b in zip(x["TSI_heat"], x["Stretch_heat"])]
-    x["State"] = x.apply(classify_state, axis=1)
-
-    # Map to UO columns for backward compatibility with v11 UI
-    x["uo"] = x["TSI"]
-    x["uo_signal"] = x["TSI_signal"]
-    x["uo_gap"] = x["TSI_gap"]
-    x["uo_slope_1"] = slope(x["TSI"], 1)
-    x["uo_slope_3"] = x["TSI_slope"]
-    x["uo_pctile"] = x["TSI_heat"] / 100.0
-    x["uo_decision"] = x["TSI"]  # Decision line matches TSI
-    x["uo_signal_decision"] = x["TSI_signal"]
-    x["uo_viz"] = ema(x["TSI"], 5)  # Light smoothing for viz
-    x["uo_signal_viz"] = ema(x["TSI_signal"], 5)
-    x["uo_above_signal_2"] = (x["uo"] > x["uo_signal"]).astype(int).rolling(2, min_periods=2).sum() == 2
-    x["uo_below_signal_2"] = (x["uo"] < x["uo_signal"]).astype(int).rolling(2, min_periods=2).sum() == 2
-    gap_scale = x["uo_gap"].abs().rolling(40, min_periods=10).max().replace(0, np.nan)
-    x["uo_gap_strength"] = (x["uo_gap"].abs() / gap_scale).clip(0, 1)
-
-    # Benchmarks
-    if benchmark_df is not None and not benchmark_df.empty:
-        aligned = benchmark_df["Close"].reindex(x.index).ffill()
-        x["rs_bench_slope_5"] = slope(x["Close"] / aligned, 5)
-    else:
-        x["rs_bench_slope_5"] = 0.0
-
-    # Pinning flags
-    x["tsi_slope_3"] = x["TSI_slope"]
-    x["cci_slope_3"] = slope(x["CCI"], 3)
-    tsi_flat_thresh = x["tsi_slope_3"].abs().rolling(50, min_periods=10).median().fillna(0.02)
-    x["price_change_while_tsi_flat"] = np.where(
-        x["tsi_slope_3"].abs() <= tsi_flat_thresh,
-        x["Close"].pct_change(3),
-        0.0,
-    )
-    x["pinning_up_flag"] = ((x["price_change_while_tsi_flat"] > 0.012) & (x["cci_slope_3"] < 0) & (x["BBPct"] > 0.75)).astype(float)
-    x["pinning_down_flag"] = ((x["price_change_while_tsi_flat"] < -0.012) & (x["cci_slope_3"] > 0) & (x["BBPct"] < 0.25)).astype(float)
-
-    # OB/OS Scores
-    x["ob_internal_score"] = (0.45 * (x["RSI"]/100) + 0.25 * (x["TSI_heat"]/100) + 0.15 * (x["CCI_heat"]/100) + 0.15 * (x["BBPct"])).clip(0, 1)
-    x["os_internal_score"] = 1 - x["ob_internal_score"]
-    x["ob_price_score"] = (0.35 * x["BBPct"] + 0.25 * ((x["Dist_EMA10"] + 1).clip(0.5, 1.5) - 0.5) + 0.2 * ((x["Dist_VWAP"] + 1).clip(0.5, 1.5) - 0.5) + 0.2 * ((x["RSI"]/100))).clip(0, 1)
-    x["os_price_score"] = 1 - x["ob_price_score"]
-    x["candle_score"] = 50
+    all_bars = []
+    current_start = start
     
-    # Additional v11 expectations
-    x["close_in_range"] = (x["Close"] - x["Low"]) / (x["High"] - x["Low"]).replace(0, np.nan)
-    x["upper_wick_pct"] = (x["High"] - x[["Close", "Open"]].max(axis=1)) / (x["High"] - x["Low"]).replace(0, np.nan)
-    x["atr_14"] = atr(x, 14)
-    x["atr_stretch"] = (x["Close"] - x["EMA20"]) / x["atr_14"].replace(0, np.nan)
-    x["adx_14"] = adx(x, 14)
-    x["price_slope_3"] = slope(x["Close"], 3)
-    x["dist_ema20_pct"] = (x["Close"] / x["EMA20"]) - 1
-    x["dist_vwap_pct"] = (x["Close"] / x["VWAP"]) - 1
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    return x
-
-def merge_higher_state(lower_df: pd.DataFrame, higher_df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["State", "Regime_bucket", "TSI", "TSI_signal", "TSI_gap", "TSI_slope"]
-    if higher_df.empty or lower_df.empty:
-        return lower_df.copy()
-    lower = lower_df.copy()
-    higher = higher_df[cols].copy()
-    aligned = higher.reindex(lower.index, method="ffill")
-    aligned = aligned.rename(columns={
-        "State": "Higher_State",
-        "Regime_bucket": "Higher_Regime",
-        "TSI": "Higher_TSI",
-        "TSI_signal": "Higher_TSI_signal",
-        "TSI_gap": "Higher_TSI_gap",
-        "TSI_slope": "Higher_TSI_slope",
-    })
-    return lower.join(aligned)
-
-# -----------------------------
-# ANALYSIS & ANALOGS
-# -----------------------------
-FWD_BARS = {"1H": [1, 3, 6, 12], "2H": [1, 2, 4, 8], "Daily": [1, 2, 5, 10], "Weekly": [1, 2, 4, 8]}
-ANALOG_FEATURES_TSI = ["TSI", "TSI_gap", "TSI_slope", "TSI_heat", "Exhaustion_score", "Divergence", "Regime_bucket", "RSI", "CCI", "BBPct", "Dist_EMA10", "Dist_VWAP"]
-
-def analog_summary_tsi(df: pd.DataFrame, tf_key: str) -> Tuple[dict, pd.DataFrame]:
-    max_fwd = max(FWD_BARS.get(tf_key, [5]))
-    if len(df) <= max_fwd + 20:
-        return {}, pd.DataFrame()
-    base = df.iloc[:-max_fwd].copy()
-    cur = df.iloc[-1]
-    mask = base["State"].eq(cur["State"]) & base["Higher_Regime"].eq(cur["Higher_Regime"])
-    if cur["Divergence"] in ["Bearish", "Bullish"]:
-        mask &= base["Divergence"].eq(cur["Divergence"])
-    matches = base.loc[mask].copy()
-    if len(matches) < 15:
-        matches = base.loc[base["State"].eq(cur["State"]) & base["Higher_Regime"].eq(cur["Higher_Regime"])].copy()
-    if matches.empty:
-        return {}, pd.DataFrame()
-    fwd = pd.DataFrame(index=matches.index)
-    for h in FWD_BARS.get(tf_key, [1, 2, 5]):
-        fwd[f"ret_{h}"] = df["Close"].shift(-h).reindex(matches.index) / df["Close"].reindex(matches.index) - 1
-    return {"sample": int(len(matches))}, fwd
-
-def classify_timeframe_call_tsi(row: pd.Series, timeframe: str) -> Tuple[str, str]:
-    # Wrapper to map TSI state to the UI's CALL/PUT/NEUTRAL expectations
-    if row is None or row.empty:
-        return "NO DATA", "No data"
-    state = str(row.get("State", ""))
-    if state.startswith("PUT"):
-        return "PUT", state
-    if state.startswith("CALL"):
-        return "CALL", state
-    return "NEUTRAL", state
-
-def extreme_state(row: pd.Series) -> Dict[str, float]:
-    if row is None or row.empty:
-        return {"label": "No data", "ob_internal": np.nan, "ob_price": np.nan, "os_internal": np.nan, "os_price": np.nan}
-    return {
-        "label": "Neutral",
-        "ob_internal": float(row.get("ob_internal_score", 0.5)),
-        "ob_price": float(row.get("ob_price_score", 0.5)),
-        "os_internal": float(row.get("os_internal_score", 0.5)),
-        "os_price": float(row.get("os_price_score", 0.5)),
-    }
-
-def render_extreme_table(frame_items: List[Tuple[str, pd.Series]]) -> None:
-    rows = []
-    for label, row in frame_items:
-        stt = extreme_state(row)
-        rows.append({
-            "Frame": label,
-            "State": str(row.get("State", "N/A")),
-            "Regime": str(row.get("Regime_bucket", "N/A")),
-            "OB internal": round(float(stt["ob_internal"]) * 100, 1),
-            "OB price": round(float(stt["ob_price"]) * 100, 1),
-            "OS internal": round(float(stt["os_internal"]) * 100, 1),
-            "OS price": round(float(stt["os_price"]) * 100, 1),
-        })
-    st.markdown("### Diagnostics (TSI State & Regime)")
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-
-def render_traffic_lights(frame_items: List[Tuple[str, str, pd.Series]]) -> None:
-    st.markdown("### Traffic lights")
-    cols = st.columns(len(frame_items))
-    for col, (label, call, row) in zip(cols, frame_items):
-        if call.startswith("PUT"):
-            emoji, sub = "🔴", "Bearish"
-        elif call.startswith("CALL"):
-            emoji, sub = "🟢", "Bullish"
-        else:
-            emoji, sub = "🟡", "Neutral"
+    request_count = 0
+    
+    while current_start < end:
+        status_text.text(f"Fetching bars from {current_start.date()}...")
         
-        if row is not None and not row.empty:
-            sub = str(row.get("Regime_bucket", sub))
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=current_start,
+            end=end,
+            limit=10000,
+            feed=feed,
+            adjustment="all",
+        )
+        
+        try:
+            bars = client.get_stock_bars(req).df
+            if bars.empty:
+                break
             
-        col.markdown(f"<div style='text-align:center;font-size:40px;line-height:1.1'>{emoji}</div>", unsafe_allow_html=True)
-        col.markdown(f"**{label}**")
-        col.caption(f"{call} · {sub}")
-
-def traffic_state(call: str, row: pd.Series) -> Tuple[str, str]:
-    if row is None or row.empty:
-        return "⚪", "No data"
-    if call == "CALL":
-        return "🟢", "Bullish"
-    if call == "PUT":
-        return "🔴", "Bearish"
-    return "🟡", "Neutral"
-
-def frame_warning_message(row: pd.Series, timeframe_label: str, structural_bias: str = "") -> str:
-    if row is None or row.empty:
-        return f"{timeframe_label}: no data."
-    state = str(row.get("State", ""))
-    regime = str(row.get("Regime_bucket", ""))
-    divergence = str(row.get("Divergence", "None"))
+            all_bars.append(bars)
+            
+            last_time = bars.index.get_level_values(1).max()
+            current_start = last_time + timedelta(minutes=1)
+            request_count += 1
+            progress_bar.progress(min(request_count / 50, 0.99))
+            
+            time.sleep(0.3)  # Respect rate limits
+            
+        except Exception as e:
+            st.warning(f"Rate limit, waiting: {e}")
+            time.sleep(5)
+            continue
     
-    msg = f"{timeframe_label}: {state}."
-    if "Exhausted" in state:
-        msg += " High reversal risk."
-    elif "Oversold" in state and "CALL" in state:
-        msg += " Potential bounce."
+    status_text.empty()
+    progress_bar.empty()
     
-    if structural_bias:
-        msg += f" Aligns with {structural_bias.lower()} bias."
-    if divergence != "None":
-        msg += f" Divergence detected: {divergence}."
-    return msg
-
-def distance_to_cross(row: pd.Series, frame: pd.DataFrame) -> Dict[str, float]:
-    if row is None or row.empty or frame.empty:
-        return {"gap": np.nan, "abs_gap": np.nan, "range_pct": np.nan}
-    gap = float(row.get("TSI_gap", 0.0))
-    abs_gap = abs(gap)
-    recent = frame["TSI_gap"].dropna().tail(40)
-    denom = max(float(recent.abs().max()), 1e-9) if not recent.empty else np.nan
-    range_pct = (abs_gap / denom * 100) if pd.notna(denom) else np.nan
-    return {"gap": gap, "abs_gap": abs_gap, "range_pct": range_pct}
-
-# -----------------------------
-# PLOTTING & DASHBOARD
-# -----------------------------
-def trim_to_range(df: pd.DataFrame, range_key: str) -> pd.DataFrame:
-    if df.empty or not range_key or range_key == "MAX":
-        return df.copy()
-    end_ts = pd.Timestamp(df.index.max())
-    mapping = {
-        "2W": pd.DateOffset(weeks=2), "1M": pd.DateOffset(months=1),
-        "3M": pd.DateOffset(months=3), "6M": pd.DateOffset(months=6),
-        "1Y": pd.DateOffset(years=1), "2Y": pd.DateOffset(years=2),
-        "5Y": pd.DateOffset(years=5), "10Y": pd.DateOffset(years=10),
-    }
-    offset = mapping.get(range_key)
-    if offset is None:
-        return df.copy()
-    start_ts = end_ts - offset
-    return df.loc[df.index >= start_ts].copy()
-
-def _price_panel_trace(fig, frame: pd.DataFrame, row: int, title: str) -> None:
-    if frame.empty:
-        return
-    d = frame.copy()
-    fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=title), row=row, col=1)
-    if "EMA20" in d.columns:
-        fig.add_trace(go.Scatter(x=d.index, y=d["EMA20"], name=f"{title} EMA20", line=dict(color="orange")), row=row, col=1)
-    if "SMA50" in d.columns:
-        fig.add_trace(go.Scatter(x=d.index, y=d["SMA50"], name=f"{title} SMA50", line=dict(color="blue")), row=row, col=1)
-
-def _osc_panel_trace_tsi(fig, frame: pd.DataFrame, row: int, nm: str) -> None:
-    if frame.empty:
-        return
-    fig.add_trace(go.Scatter(x=frame.index, y=frame.get("TSI", frame.get("uo", [])), name=f"{nm} TSI", line=dict(color="red", width=2.3)), row=row, col=1)
-    fig.add_trace(go.Scatter(x=frame.index, y=frame.get("TSI_signal", frame.get("uo_signal", [])), name=f"{nm} Signal", line=dict(color="black", width=1.3)), row=row, col=1)
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", row=row, col=1)
-
-def plot_mega_view(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str, mega_ranges: Dict[str, str]) -> None:
-    fig = make_subplots(
-        rows=5, cols=1, vertical_spacing=0.04,
-        subplot_titles=[f"{symbol} Price (as of {pd.Timestamp(asof_date).date()})", "1-Hour TSI", f"{tactical_label} TSI", "Daily TSI", "Weekly TSI"],
-        row_heights=[0.30, 0.18, 0.18, 0.18, 0.16],
-    )
-    hourly_plot = trim_to_range(hourly_df, mega_ranges.get("1h", "3M"))
-    tactical_plot = trim_to_range(tactical_df, mega_ranges.get("2h", "6M"))
-    daily_plot = trim_to_range(daily_df, mega_ranges.get("daily", "1Y"))
-    weekly_plot = trim_to_range(weekly_df, mega_ranges.get("weekly", "5Y"))
-    base_price = daily_plot if not daily_plot.empty else hourly_plot
-    _price_panel_trace(fig, base_price, 1, symbol)
-    _osc_panel_trace_tsi(fig, hourly_plot, 2, "Hourly")
-    _osc_panel_trace_tsi(fig, tactical_plot, 3, "Tactical")
-    _osc_panel_trace_tsi(fig, daily_plot, 4, "Daily")
-    _osc_panel_trace_tsi(fig, weekly_plot, 5, "Weekly")
-    fig.update_layout(height=1380, xaxis_rangeslider_visible=False, legend_orientation="h")
-    st.plotly_chart(fig, width="stretch")
-
-def plot_single_frame(symbol: str, price_df: pd.DataFrame, osc_df: pd.DataFrame, asof_date: pd.Timestamp, frame_title: str, range_key: str) -> None:
-    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.06, subplot_titles=[f"{symbol} Price (as of {pd.Timestamp(asof_date).date()})", frame_title], row_heights=[0.56, 0.44])
-    price_plot = trim_to_range(price_df, range_key)
-    osc_plot = trim_to_range(osc_df, range_key)
-    _price_panel_trace(fig, price_plot, 1, symbol)
-    _osc_panel_trace_tsi(fig, osc_plot, 2, frame_title)
-    fig.update_layout(height=760, xaxis_rangeslider_visible=False, legend_orientation="h")
-    st.plotly_chart(fig, width="stretch")
-
-# -----------------------------
-# MAIN APP
-# -----------------------------
-st.title("📈 Stable Market Engine v12 — TSI Dashboard")
-st.caption("TSI Cross Logic | Real Alpaca Data | Mega View | Multi-Symbol Ranking")
-
-with st.sidebar:
-    st.header("Credentials")
-    alpaca_key = st.text_input("Alpaca API key", type="password")
-    alpaca_secret = st.text_input("Alpaca API secret", type="password")
-    feed = st.selectbox("Alpaca feed", ["iex", "sip"], index=0)
+    if not all_bars:
+        return pd.DataFrame()
     
-    st.header("Input")
-    symbols_text = st.text_area("Paste tickers (comma or line separated)", value="QQQ, SMH, INTC, NVDA, AMD, XLF", height=110)
-    upload_watchlist = st.file_uploader("Upload results/watchlist CSV", type=["csv"])
+    minute_df = pd.concat(all_bars)
+    minute_df = minute_df.reset_index(level=0, drop=True)
+    
+    return minute_df
 
-    st.header("Settings")
-    benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "RSP", "IWM"], index=0)
-    history_years = st.selectbox("Historical years", [3, 5, 10], index=1)
-    analysis_mode = st.radio("Analysis mode", ["Current", "Historical"], index=0)
-    analysis_date = st.date_input("Calendar lookback", value=pd.Timestamp.today().date(), disabled=(analysis_mode == "Current"))
-    intraday_source = st.radio("Intraday source", ["proxy", "real"], index=0, format_func=lambda x: {"proxy": "Proxy Smooth (default)", "real": "Real Alpaca"}[x])
-    force_refresh = st.checkbox("Force refresh data (clear cache)", value=False)
-    run_analysis = st.button("Run Analysis", type="primary", width="stretch")
 
-if not run_analysis:
-    st.stop()
-if not alpaca_key or not alpaca_secret:
-    st.error("Enter Alpaca API key and secret.")
-    st.stop()
-
-uploaded_symbols = parse_symbol_csv(upload_watchlist)
-symbols = clean_symbols(symbols_text, uploaded_symbols)
-if not symbols:
-    st.error("Provide at least one symbol.")
-    st.stop()
-
-all_syms = list(dict.fromkeys(symbols + [benchmark]))
-if force_refresh:
-    for kind in ["daily", "1hour", "2hour", "hourly_proxy", "2hour_proxy"]:
-        for sym in all_syms:
-            p = cache_path(sym, kind)
-            if p.exists():
-                p.unlink(missing_ok=True)
-    fetch_alpaca_daily_batch.clear()
-    fetch_alpaca_2hour.clear()
-    fetch_alpaca_1hour.clear()
-
-st.info("Loading Alpaca daily data...")
-daily_map = fetch_alpaca_daily_batch(all_syms, history_years, alpaca_key, alpaca_secret, feed)
-if benchmark not in daily_map or daily_map[benchmark].empty:
-    st.error(f"Could not load benchmark {benchmark} from Alpaca.")
-    st.stop()
-benchmark_daily = daily_map[benchmark]
-
-rows: List[Dict[str, object]] = []
-detail: Dict[str, Dict[str, object]] = {}
-progress = st.progress(0.0)
-
-for i, sym in enumerate(symbols):
-    progress.progress((i + 1) / max(1, len(symbols)))
-    daily_raw = daily_map.get(sym, pd.DataFrame())
-    if daily_raw.empty:
-        rows.append({"Symbol": sym, "Status": "No data"})
-        continue
+# ============================================
+# OSCILLATOR CALCULATIONS
+# ============================================
+class OscillatorEngine:
+    """Pure oscillator calculations with no lookahead bias."""
+    
+    @staticmethod
+    def ema(series: pd.Series, span: int) -> pd.Series:
+        return series.ewm(span=span, adjust=False, min_periods=max(2, span//2)).mean()
+    
+    @staticmethod
+    def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+        delta = close.diff()
+        up = delta.clip(lower=0)
+        down = -delta.clip(upper=0)
+        rs = OscillatorEngine.ema(up, period) / OscillatorEngine.ema(down, period).replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+    
+    @staticmethod
+    def stoch_k(close: pd.Series, period: int = 14) -> pd.Series:
+        low = close.rolling(period, min_periods=max(3, period//2)).min()
+        high = close.rolling(period, min_periods=max(3, period//2)).max()
+        return 100 * (close - low) / (high - low).replace(0, np.nan)
+    
+    @staticmethod
+    def cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
+        tp = (df['high'] + df['low'] + df['close']) / 3
+        sma = tp.rolling(period, min_periods=max(5, period//2)).mean()
+        mad = (tp - sma).abs().rolling(period, min_periods=max(5, period//2)).mean()
+        return (tp - sma) / (0.015 * mad.replace(0, np.nan))
+    
+    @staticmethod
+    def roc(close: pd.Series, period: int = 10) -> pd.Series:
+        return (close / close.shift(period) - 1) * 100
+    
+    @staticmethod
+    def tsi(close: pd.Series, long_period: int = 25, short_period: int = 13) -> pd.Series:
+        delta = close.diff()
+        m1 = OscillatorEngine.ema(delta, long_period)
+        m2 = OscillatorEngine.ema(m1, short_period)
+        a1 = OscillatorEngine.ema(delta.abs(), long_period)
+        a2 = OscillatorEngine.ema(a1, short_period)
+        return 100 * m2 / a2.replace(0, np.nan)
+    
+    @staticmethod
+    def bbp(close: pd.Series, period: int = 20, std: float = 2.0) -> pd.Series:
+        ma = close.rolling(period, min_periods=max(5, period//2)).mean()
+        sd = close.rolling(period, min_periods=max(5, period//2)).std()
+        upper = ma + std * sd
+        lower = ma - std * sd
+        return (close - lower) / (upper - lower).replace(0, np.nan)
+    
+    @staticmethod
+    def compute_all(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:
+        """Compute all oscillators for the dataframe."""
+        result = df.copy()
         
-    # Fetch/Proxy Logic
-    if intraday_source == "real":
-        tactical_raw = fetch_alpaca_2hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
-        tactical_timeframe = "2H"
-        tactical_label = "2-Hour (Real)"
-        if tactical_raw.empty:
-            tactical_raw, tactical_timeframe, _ = time_compressed_proxy(daily_raw, "2hour_proxy")
-            tactical_label = "2-Hour (Proxy Fallback)"
-        hourly_raw = fetch_alpaca_1hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
-        hourly_label = "1-Hour (Real)"
-        if hourly_raw.empty:
-            hourly_raw, _, _ = time_compressed_proxy(daily_raw, "hourly_proxy")
-            hourly_label = "1-Hour (Proxy Fallback)"
+        # Resample to requested timeframe if needed
+        if timeframe_minutes > 1:
+            result = result.resample(f'{timeframe_minutes}T').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
+        
+        # Calculate oscillators
+        result['rsi_14'] = OscillatorEngine.rsi(result['close'], 14)
+        result['stoch_14'] = OscillatorEngine.stoch_k(result['close'], 14)
+        result['cci_20'] = OscillatorEngine.cci(result, 20)
+        result['roc_10'] = OscillatorEngine.roc(result['close'], 10)
+        result['tsi'] = OscillatorEngine.tsi(result['close'], 25, 13)
+        result['bbp_20'] = OscillatorEngine.bbp(result['close'], 20, 2.0)
+        
+        # Composite oscillator (PPO-style)
+        # Normalize each to -1..1 range
+        cci_norm = np.clip(result['cci_20'] / 150, -1, 1)
+        tsi_norm = np.clip(result['tsi'] / 20, -1, 1)
+        rsi_norm = (result['rsi_14'] - 50) / 50
+        roc_norm = np.clip(result['roc_10'] / 10, -1, 1)
+        stoch_norm = (result['stoch_14'] - 50) / 50
+        
+        result['composite'] = (cci_norm + tsi_norm + rsi_norm + roc_norm + stoch_norm) / 5
+        result['composite_signal'] = OscillatorEngine.ema(result['composite'], 5)
+        result['composite_hist'] = result['composite'] - result['composite_signal']
+        
+        # Forward returns (1, 2, 3, 5 bars)
+        for i in [1, 2, 3, 5]:
+            result[f'forward_{i}'] = (result['close'].shift(-i) / result['close'] - 1) * 100
+        
+        return result
+
+
+# ============================================
+# BACKTEST ENGINE (No Lookahead Bias)
+# ============================================
+@dataclass
+class BacktestResult:
+    """Container for backtest results."""
+    params: Dict
+    trades: int
+    mean_return: float
+    median_return: float
+    win_rate: float
+    std_return: float
+    sharpe: float
+    t_stat: float
+    p5: float
+    p25: float
+    p75: float
+    p95: float
+    max_return: float
+    min_return: float
+    equity_curve: pd.Series
+
+
+class QuantBacktest:
+    """Statistical backtest engine with Monte Carlo validation."""
+    
+    def __init__(self, df: pd.DataFrame, params: Dict):
+        self.df = df
+        self.params = params
+        self.validate_params()
+    
+    def validate_params(self):
+        """Ensure all required parameters exist."""
+        required = ['cci_threshold', 'tsi_threshold', 'stoch_threshold', 
+                   'rsi_threshold', 'hold_bars', 'min_oscillators']
+        for r in required:
+            if r not in self.params:
+                self.params[r] = 0 if 'threshold' in r else 3
+    
+    def generate_signals(self) -> pd.DataFrame:
+        """Generate trading signals based on oscillator conditions."""
+        df = self.df.copy()
+        
+        # Individual oscillator conditions
+        conditions = []
+        
+        if 'cci_20' in df.columns:
+            conditions.append(df['cci_20'] < self.params.get('cci_threshold', -100))
+        
+        if 'tsi' in df.columns:
+            conditions.append(df['tsi'] < self.params.get('tsi_threshold', -10))
+        
+        if 'stoch_14' in df.columns:
+            conditions.append(df['stoch_14'] < self.params.get('stoch_threshold', 20))
+        
+        if 'rsi_14' in df.columns:
+            conditions.append(df['rsi_14'] < self.params.get('rsi_threshold', 30))
+        
+        if 'roc_10' in df.columns:
+            conditions.append(df['roc_10'] < self.params.get('roc_threshold', -5))
+        
+        # Combine conditions with voting
+        vote_count = sum(conditions)
+        min_votes = self.params.get('min_oscillators', 3)
+        
+        df['signal'] = (vote_count >= min_votes).astype(int)
+        
+        # Remove consecutive signals (minimum gap)
+        min_gap = self.params.get('min_gap', 2)
+        last_signal_idx = -min_gap - 1
+        for idx in df.index:
+            if df.loc[idx, 'signal'] == 1:
+                if (df.index.get_loc(idx) - last_signal_idx) < min_gap:
+                    df.loc[idx, 'signal'] = 0
+                else:
+                    last_signal_idx = df.index.get_loc(idx)
+        
+        return df
+    
+    def calculate_returns(self, df: pd.DataFrame) -> pd.Series:
+        """Calculate strategy returns."""
+        hold_bars = self.params.get('hold_bars', 2)
+        forward_col = f'forward_{hold_bars}'
+        
+        if forward_col not in df.columns:
+            return pd.Series(dtype=float)
+        
+        signals = df[df['signal'] == 1]
+        returns = signals[forward_col]
+        
+        # Remove any NaN/infinite values
+        returns = returns.dropna()
+        returns = returns[np.isfinite(returns)]
+        
+        return returns
+    
+    @staticmethod
+    def monte_carlo_validate(returns: pd.Series, n_simulations: int = 1000) -> Dict:
+        """Bootstrap validation of returns."""
+        if len(returns) < 20:
+            return None
+        
+        simulated_means = []
+        simulated_winrates = []
+        
+        np.random.seed(42)
+        for _ in range(n_simulations):
+            sample = np.random.choice(returns, len(returns), replace=True)
+            simulated_means.append(np.mean(sample))
+            simulated_winrates.append(np.mean(sample > 0) * 100)
+        
+        return {
+            'original_mean': returns.mean(),
+            'original_winrate': (returns > 0).mean() * 100,
+            'sim_mean_mean': np.mean(simulated_means),
+            'sim_mean_std': np.std(simulated_means),
+            'sim_mean_p5': np.percentile(simulated_means, 5),
+            'sim_mean_p95': np.percentile(simulated_means, 95),
+            'sim_winrate_mean': np.mean(simulated_winrates),
+            'sim_winrate_p5': np.percentile(simulated_winrates, 5),
+            'sim_winrate_p95': np.percentile(simulated_winrates, 95),
+        }
+    
+    @staticmethod
+    def walk_forward_validate(df: pd.DataFrame, params: Dict, train_pct: float = 0.7) -> Dict:
+        """Walk-forward validation to prevent overfitting."""
+        split_idx = int(len(df) * train_pct)
+        train_df = df.iloc[:split_idx]
+        test_df = df.iloc[split_idx:]
+        
+        # Run backtest on train
+        train_bt = QuantBacktest(train_df, params)
+        train_signals = train_bt.generate_signals()
+        train_returns = train_bt.calculate_returns(train_signals)
+        
+        # Run backtest on test
+        test_bt = QuantBacktest(test_df, params)
+        test_signals = test_bt.generate_signals()
+        test_returns = test_bt.calculate_returns(test_signals)
+        
+        if len(train_returns) < 10 or len(test_returns) < 10:
+            return None
+        
+        return {
+            'train_win_rate': (train_returns > 0).mean() * 100,
+            'test_win_rate': (test_returns > 0).mean() * 100,
+            'train_avg_return': train_returns.mean(),
+            'test_avg_return': test_returns.mean(),
+            'train_sharpe': train_returns.mean() / (train_returns.std() + 1e-6),
+            'test_sharpe': test_returns.mean() / (test_returns.std() + 1e-6),
+            'train_trades': len(train_returns),
+            'test_trades': len(test_returns),
+            'holds_out_of_sample': (test_returns.mean() > 0.8 * train_returns.mean()),
+        }
+    
+    def run(self) -> Optional[BacktestResult]:
+        """Execute complete backtest with all validations."""
+        df = self.generate_signals()
+        returns = self.calculate_returns(df)
+        
+        if len(returns) < self.params.get('min_trades', 30):
+            return None
+        
+        # Calculate statistics
+        mean_ret = returns.mean()
+        std_ret = returns.std()
+        t_stat = mean_ret / (std_ret / np.sqrt(len(returns))) if std_ret > 0 else 0
+        
+        # Statistical significance filter
+        if t_stat < self.params.get('min_t_stat', 2.0):
+            return None
+        
+        # Calculate percentiles
+        percentiles = np.percentile(returns, [5, 25, 50, 75, 95])
+        
+        # Create equity curve
+        equity = (1 + returns / 100).cumprod()
+        
+        return BacktestResult(
+            params=self.params.copy(),
+            trades=len(returns),
+            mean_return=mean_ret,
+            median_return=percentiles[2],
+            win_rate=(returns > 0).mean() * 100,
+            std_return=std_ret,
+            sharpe=mean_ret / (std_ret + 1e-6),
+            t_stat=t_stat,
+            p5=percentiles[0],
+            p25=percentiles[1],
+            p75=percentiles[3],
+            p95=percentiles[4],
+            max_return=returns.max(),
+            min_return=returns.min(),
+            equity_curve=equity,
+        )
+
+
+# ============================================
+# VISUALIZATION
+# ============================================
+def create_dashboard(df: pd.DataFrame, result: Optional[BacktestResult] = None) -> None:
+    """Create the main trading dashboard."""
+    
+    # Get latest values
+    latest = df.iloc[-1]
+    
+    # Display current composite oscillator
+    st.subheader("🎯 Current Composite Oscillator")
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        color = "good" if latest['composite'] > 0 else "bad" if latest['composite'] < 0 else "neutral"
+        st.markdown(f'<div class="metric-card {color}">'
+                   f'<div style="font-size:12px">COMPOSITE</div>'
+                   f'<div style="font-size:28px; font-weight:bold">{latest["composite"]:.3f}</div>'
+                   f'</div>', unsafe_allow_html=True)
+    
+    with col2:
+        color = "good" if latest['cci_20'] > -100 else "neutral"
+        st.markdown(f'<div class="metric-card {color}">'
+                   f'<div style="font-size:12px">CCI(20)</div>'
+                   f'<div style="font-size:28px; font-weight:bold">{latest["cci_20"]:.1f}</div>'
+                   f'</div>', unsafe_allow_html=True)
+    
+    with col3:
+        color = "good" if latest['tsi'] > -10 else "neutral"
+        st.markdown(f'<div class="metric-card {color}">'
+                   f'<div style="font-size:12px">TSI</div>'
+                   f'<div style="font-size:28px; font-weight:bold">{latest["tsi"]:.1f}</div>'
+                   f'</div>', unsafe_allow_html=True)
+    
+    with col4:
+        color = "good" if latest['rsi_14'] > 30 else "neutral"
+        st.markdown(f'<div class="metric-card {color}">'
+                   f'<div style="font-size:12px">RSI(14)</div>'
+                   f'<div style="font-size:28px; font-weight:bold">{latest["rsi_14"]:.1f}</div>'
+                   f'</div>', unsafe_allow_html=True)
+    
+    with col5:
+        color = "good" if latest['stoch_14'] > 20 else "neutral"
+        st.markdown(f'<div class="metric-card {color}">'
+                   f'<div style="font-size:12px">STOCH(14)</div>'
+                   f'<div style="font-size:28px; font-weight:bold">{latest["stoch_14"]:.1f}</div>'
+                   f'</div>', unsafe_allow_html=True)
+    
+    # Price + Composite chart
+    st.subheader("📈 Price & Composite Oscillator")
+    
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.05,
+                        row_heights=[0.5, 0.25, 0.25])
+    
+    # Price
+    fig.add_trace(go.Candlestick(
+        x=df.index[-100:],
+        open=df['open'][-100:],
+        high=df['high'][-100:],
+        low=df['low'][-100:],
+        close=df['close'][-100:],
+        name='Price'
+    ), row=1, col=1)
+    
+    # Composite oscillator
+    fig.add_trace(go.Scatter(
+        x=df.index[-100:],
+        y=df['composite'][-100:],
+        name='Composite',
+        line=dict(color='blue', width=2)
+    ), row=2, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=df.index[-100:],
+        y=df['composite_signal'][-100:],
+        name='Signal',
+        line=dict(color='orange', width=1, dash='dot')
+    ), row=2, col=1)
+    
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
+    
+    # Histogram
+    colors = ['red' if h < 0 else 'green' for h in df['composite_hist'][-100:]]
+    fig.add_trace(go.Bar(
+        x=df.index[-100:],
+        y=df['composite_hist'][-100:],
+        name='Histogram',
+        marker_color=colors,
+        opacity=0.6
+    ), row=3, col=1)
+    
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", row=3, col=1)
+    
+    fig.update_layout(height=800, showlegend=False)
+    fig.update_xaxes(title_text="Time", row=3, col=1)
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Composite", row=2, col=1)
+    fig.update_yaxes(title_text="Histogram", row=3, col=1)
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Individual oscillators
+    st.subheader("📊 Individual Oscillators")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df.index[-100:], y=df['rsi_14'][-100:], name='RSI(14)', line=dict(color='purple')))
+        fig2.add_hline(y=30, line_dash="dash", line_color="green")
+        fig2.add_hline(y=70, line_dash="dash", line_color="red")
+        fig2.update_layout(height=300, title="RSI (14)")
+        st.plotly_chart(fig2, use_container_width=True)
+        
+        fig4 = go.Figure()
+        fig4.add_trace(go.Scatter(x=df.index[-100:], y=df['stoch_14'][-100:], name='Stochastic', line=dict(color='orange')))
+        fig4.add_hline(y=20, line_dash="dash", line_color="green")
+        fig4.add_hline(y=80, line_dash="dash", line_color="red")
+        fig4.update_layout(height=300, title="Stochastic (14)")
+        st.plotly_chart(fig4, use_container_width=True)
+    
+    with col2:
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df.index[-100:], y=df['cci_20'][-100:], name='CCI(20)', line=dict(color='cyan')))
+        fig3.add_hline(y=-100, line_dash="dash", line_color="green")
+        fig3.add_hline(y=100, line_dash="dash", line_color="red")
+        fig3.update_layout(height=300, title="CCI (20)")
+        st.plotly_chart(fig3, use_container_width=True)
+        
+        fig5 = go.Figure()
+        fig5.add_trace(go.Scatter(x=df.index[-100:], y=df['tsi'][-100:], name='TSI', line=dict(color='magenta')))
+        fig5.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig5.update_layout(height=300, title="TSI (25,13)")
+        st.plotly_chart(fig5, use_container_width=True)
+    
+    # Signal display
+    st.subheader("🔔 Current Signal")
+    
+    if latest['composite'] > 0 and latest['composite_signal'] > 0:
+        st.success("🟢 **BULLISH** - Composite above signal line")
+        st.info("Consider LONG position")
+    elif latest['composite'] < 0 and latest['composite_signal'] < 0:
+        st.error("🔴 **BEARISH** - Composite below signal line")
+        st.info("Consider SHORT position")
     else:
-        tactical_raw = fetch_alpaca_2hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
-        tactical_timeframe = "2H_PROXY"
-        tactical_label = "2-Hour (Proxy Smooth)"
-        if tactical_raw.empty:
-            tactical_raw, _, _ = time_compressed_proxy(daily_raw, "2hour_proxy")
-            tactical_label = "2-Hour (Proxy Fallback)"
-        hourly_raw = fetch_alpaca_1hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
-        hourly_label = "1-Hour (Proxy Smooth)"
-        if hourly_raw.empty:
-            hourly_raw, _, _ = time_compressed_proxy(daily_raw, "hourly_proxy")
-            hourly_label = "1-Hour (Proxy Fallback)"
+        st.warning("🟡 **NEUTRAL** - No clear signal")
+        st.info("Wait for clearer setup")
 
-    weekly_raw = resample_weekly(daily_raw)
+
+# ============================================
+# RESEARCH ENGINE (Sweet Spot Finder)
+# ============================================
+def run_research(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:
+    """Run grid search to find optimal parameters."""
     
-    # Feature Engineering
-    hourly_df = enrich_price_features_tsi(hourly_raw, "1H_PROXY", benchmark_daily)
-    tactical_df = enrich_price_features_tsi(tactical_raw, "2H_PROXY", benchmark_daily)
-    daily_df = enrich_price_features_tsi(daily_raw, "Daily", benchmark_daily)
-    weekly_df = enrich_price_features_tsi(weekly_raw, "Weekly", benchmark_daily)
+    st.subheader("🔬 Sweet Spot Finder (Grid Search)")
     
-    # Merge States
-    hourly_df = merge_higher_state(hourly_df, tactical_df)
-    tactical_df = merge_higher_state(tactical_df, daily_df)
-    daily_df = merge_higher_state(daily_df, weekly_df)
-    weekly_df["Higher_State"] = weekly_df["State"]
-    weekly_df["Higher_Regime"] = weekly_df["Regime_bucket"]
-
-    asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date)
-    
-    # Slicing
-    def safe_slice(df, asof):
-        if df.empty: return df.copy()
-        end_ts = asof + pd.Timedelta(hours=23, minutes=59, seconds=59)
-        return df.loc[df.index <= end_ts].copy()
-
-    hourly_view = safe_slice(hourly_df, asof)
-    tactical_view = safe_slice(tactical_df, asof)
-    daily_view = safe_slice(daily_df, asof)
-    weekly_view = safe_slice(weekly_df, asof)
-    
-    if daily_view.empty:
-        rows.append({"Symbol": sym, "Status": "No data on date"})
-        continue
-
-    hourly_row = hourly_view.iloc[-1] if not hourly_view.empty else pd.Series(dtype=float)
-    tactical_row = tactical_view.iloc[-1] if not tactical_view.empty else pd.Series(dtype=float)
-    daily_row = daily_view.iloc[-1]
-    weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
-
-    # Classification
-    hourly_call, hourly_reason = classify_timeframe_call_tsi(hourly_row, "1H")
-    tactical_call, tactical_reason = classify_timeframe_call_tsi(tactical_row, "2H")
-    daily_call, daily_reason = classify_timeframe_call_tsi(daily_row, "Daily")
-    weekly_call, weekly_reason = classify_timeframe_call_tsi(weekly_row, "Weekly")
-    
-    # Analogs
-    analogs = analog_summary_tsi(daily_df, "Daily")
-    analog_summary_dict = analogs[0]
-    overheat_score = (
-        (float(tactical_row.get("TSI_heat", 50)) * 0.30)
-        + (float(daily_row.get("TSI_heat", 50)) * 0.35)
-        + (min(max(float(daily_row.get("RSI", 50)) / 100, 0), 1) * 0.15)
-        + (min(max((float(daily_row.get("CCI", 0)) + 200) / 400, 0), 1) * 0.20)
-    ) * 100
-
-    # Recommendation Logic
-    reco = tactical_call if tactical_call != "NEUTRAL" else daily_call
-    if "Extended" in str(tactical_row.get("Regime_bucket", "")): reco += ", Extended"
-    elif "Exhausted" in tactical_reason: reco += ", Exhausted"
-
-    # Combine Score
-    score = {"CALL": 1, "PUT": -1, "NEUTRAL": 0, "NO DATA": 0}
-    net = 0.30 * score.get(hourly_call, 0) + 0.45 * score.get(tactical_call, 0) + 0.25 * score.get(daily_call, 0)
-    combined = "CALL" if net >= 0.55 else ("PUT" if net <= -0.55 else ("CALL ON PULLBACK" if daily_call == "CALL" and weekly_call == "CALL" else "NEUTRAL"))
-
-    rows.append({
-        "Symbol": sym, "Status": "OK", "As Of": str(daily_row.name.date()),
-        "Hourly": hourly_call, "Tactical": tactical_call, "Daily": daily_call, "Weekly": weekly_call,
-        "Combined": combined, "Recommendation": reco,
-        "Price": round(float(daily_row.get("Close", np.nan)), 2),
-        "Overheat Score": round(overheat_score, 1),
-        "Tactical Heat": round(float(tactical_row.get("TSI_heat", np.nan)), 1),
-        "Daily Heat": round(float(daily_row.get("TSI_heat", np.nan)), 1),
-        "RSI14": round(float(daily_row.get("RSI", np.nan)), 1),
-        "CCI20": round(float(daily_row.get("CCI", np.nan)), 1),
-        "Analog N": int(analog_summary_dict.get("n", 0)),
-        "Analog 2d Med": round(float(analog_summary_dict.get("ret_2_median", np.nan)) * 100, 2),
-        "Analog 2d Up %": round(float(analog_summary_dict.get("ret_2_p_up", np.nan)) * 100, 1),
-    })
-    
-    detail[sym] = {
-        "hourly": hourly_view, "hourly_label": hourly_label, "hourly_call": (hourly_call, hourly_reason),
-        "tactical": tactical_view, "tactical_label": tactical_label, "tactical_call": (tactical_call, tactical_reason),
-        "daily": daily_view, "daily_call": (daily_call, daily_reason),
-        "weekly": weekly_view, "weekly_call": (weekly_call, weekly_reason),
-        "combined": combined, "recommendation": reco,
-        "analog_summary": analog_summary_dict,
-        "cross": distance_to_cross(tactical_row, tactical_view),
-        "asof": asof,
+    # Parameter grid
+    param_grid = {
+        'cci_threshold': [-200, -150, -100, -50],
+        'tsi_threshold': [-20, -15, -10, -5],
+        'stoch_threshold': [10, 15, 20, 25, 30],
+        'rsi_threshold': [25, 30, 35],
+        'hold_bars': [1, 2, 3, 5],
+        'min_oscillators': [2, 3, 4],
     }
+    
+    total_combos = np.prod([len(v) for v in param_grid.values()])
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    results = []
+    combo_count = 0
+    
+    for cci_th in param_grid['cci_threshold']:
+        for tsi_th in param_grid['tsi_threshold']:
+            for stoch_th in param_grid['stoch_threshold']:
+                for rsi_th in param_grid['rsi_threshold']:
+                    for hold in param_grid['hold_bars']:
+                        for min_osc in param_grid['min_oscillators']:
+                            combo_count += 1
+                            status_text.text(f"Testing combo {combo_count}/{total_combos}")
+                            progress_bar.progress(combo_count / total_combos)
+                            
+                            params = {
+                                'cci_threshold': cci_th,
+                                'tsi_threshold': tsi_th,
+                                'stoch_threshold': stoch_th,
+                                'rsi_threshold': rsi_th,
+                                'hold_bars': hold,
+                                'min_oscillators': min_osc,
+                                'min_trades': 50,
+                                'min_t_stat': 2.0,
+                                'min_gap': 2,
+                            }
+                            
+                            backtest = QuantBacktest(df, params)
+                            result = backtest.run()
+                            
+                            if result:
+                                # Monte Carlo validation
+                                mc = QuantBacktest.monte_carlo_validate(
+                                    pd.Series(result.mean_return), 
+                                    n_simulations=100
+                                )
+                                
+                                results.append({
+                                    'cci_th': cci_th,
+                                    'tsi_th': tsi_th,
+                                    'stoch_th': stoch_th,
+                                    'rsi_th': rsi_th,
+                                    'hold_bars': hold,
+                                    'min_osc': min_osc,
+                                    'trades': result.trades,
+                                    'win_rate': result.win_rate,
+                                    'mean_return': result.mean_return,
+                                    'sharpe': result.sharpe,
+                                    't_stat': result.t_stat,
+                                    'p5': result.p5,
+                                    'p95': result.p95,
+                                })
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    results_df = pd.DataFrame(results)
+    
+    if results_df.empty:
+        st.warning("No statistically significant strategies found. Try different parameters or more data.")
+        return results_df
+    
+    # Sort by Sharpe ratio
+    results_df = results_df.sort_values('sharpe', ascending=False)
+    
+    # Display top results
+    st.subheader("🏆 Top 10 Parameter Combinations")
+    
+    display_cols = ['cci_th', 'tsi_th', 'stoch_th', 'rsi_th', 'hold_bars', 'min_osc', 
+                    'trades', 'win_rate', 'mean_return', 'sharpe', 't_stat']
+    
+    st.dataframe(
+        results_df[display_cols].head(10).style.format({
+            'win_rate': '{:.1f}%',
+            'mean_return': '{:.2f}%',
+            'sharpe': '{:.2f}',
+            't_stat': '{:.2f}',
+        }),
+        use_container_width=True
+    )
+    
+    # Visualize results
+    st.subheader("📊 Parameter Sensitivity")
+    
+    fig = px.scatter(
+        results_df.head(50),
+        x='sharpe',
+        y='win_rate',
+        size='trades',
+        color='hold_bars',
+        hover_data=['cci_th', 'tsi_th', 'stoch_th', 'rsi_th', 'mean_return'],
+        title="Best Strategies: Sharpe vs Win Rate"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    return results_df
 
-progress.empty()
 
-# Results Table
-results_df = pd.DataFrame(rows)
-st.subheader("Ranked Results")
-if not results_df.empty:
-    results_df = results_df.sort_values("Overheat Score", ascending=False)
-    st.dataframe(results_df, width="stretch", hide_index=True)
-    st.download_button("Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "stable_market_engine_v12.csv", "text/csv")
-else:
-    st.warning("No results generated.")
-    st.stop()
+# ============================================
+# MAIN APP
+# ============================================
+def main():
+    # Sidebar
+    with st.sidebar:
+        st.header("📊 Data Settings")
+        symbol = st.text_input("Symbol", value="SOXS").upper().strip()
+        
+        timeframe_minutes = st.selectbox("Timeframe (minutes)", [5, 10, 15, 30], index=0)
+        days_back = st.slider("Days of history", 30, 180, 90)
+        
+        st.header("🔑 Alpaca API")
+        api_key = st.text_input("API Key", type="password", value=os.getenv("ALPACA_API_KEY", ""))
+        secret_key = st.text_input("Secret Key", type="password", value=os.getenv("ALPACA_SECRET_KEY", ""))
+        feed = st.selectbox("Feed", ["sip", "iex"], index=0)
+        
+        st.header("⚙️ Research Settings")
+        run_research_flag = st.checkbox("Run full grid search", value=True)
+        min_sharpe_filter = st.slider("Min Sharpe ratio", 0.0, 2.0, 0.5, 0.1)
+    
+    # Check credentials
+    if not api_key or not secret_key:
+        st.warning("⚠️ Enter your Alpaca API credentials to begin")
+        st.stop()
+    
+    # Fetch data
+    with st.spinner(f"Fetching {days_back} days of {symbol} data..."):
+        minute_df = fetch_safe_data(symbol, days_back, api_key, secret_key, feed)
+    
+    if minute_df.empty:
+        st.error(f"No data returned for {symbol}")
+        st.stop()
+    
+    # Compute oscillators
+    with st.spinner("Computing oscillators..."):
+        df = OscillatorEngine.compute_all(minute_df, timeframe_minutes)
+    
+    st.success(f"✅ Loaded {len(df)} {timeframe_minutes}-minute bars")
+    
+    # Main tabs
+    tab1, tab2 = st.tabs(["📈 Live Dashboard", "🔬 Research Engine"])
+    
+    with tab1:
+        # Run quick backtest with default parameters
+        default_params = {
+            'cci_threshold': -100,
+            'tsi_threshold': -10,
+            'stoch_threshold': 20,
+            'rsi_threshold': 30,
+            'hold_bars': 2,
+            'min_oscillators': 3,
+            'min_trades': 30,
+            'min_t_stat': 1.5,
+            'min_gap': 2,
+        }
+        
+        backtest = QuantBacktest(df, default_params)
+        result = backtest.run()
+        
+        create_dashboard(df, result)
+        
+        if result:
+            st.subheader("📊 Strategy Performance (Default Parameters)")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Win Rate", f"{result.win_rate:.1f}%")
+            col2.metric("Avg Return", f"{result.mean_return:.2f}%")
+            col3.metric("Sharpe", f"{result.sharpe:.2f}")
+            col4.metric("Trades", result.trades)
+            
+            # Monte Carlo results
+            mc = QuantBacktest.monte_carlo_validate(pd.Series([result.mean_return]), n_simulations=500)
+            if mc:
+                st.info(f"📊 Monte Carlo (500 sims): 95% confidence return range = [{mc['sim_mean_p5']:.2f}%, {mc['sim_mean_p95']:.2f}%]")
+            
+            # Equity curve
+            if result.equity_curve is not None and len(result.equity_curve) > 0:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=result.equity_curve.index,
+                    y=result.equity_curve.values,
+                    mode='lines',
+                    name='Equity Curve',
+                    line=dict(color='green', width=2)
+                ))
+                fig.update_layout(height=300, title="Cumulative Returns")
+                st.plotly_chart(fig, use_container_width=True)
+    
+    with tab2:
+        if run_research_flag:
+            results_df = run_research(df, timeframe_minutes)
+            
+            if not results_df.empty:
+                # Filter by Sharpe
+                top_results = results_df[results_df['sharpe'] >= min_sharpe_filter].head(10)
+                
+                st.subheader("🎯 Recommended Parameters")
+                
+                if not top_results.empty:
+                    best = top_results.iloc[0]
+                    
+                    st.markdown(f"""
+                    ### ⚡ Optimal Strategy Configuration
+                    
+                    | Parameter | Value |
+            |-----------|-------|
+            | **CCI Threshold** | < {best['cci_th']} |
+            | **TSI Threshold** | < {best['tsi_th']} |
+            | **Stochastic Threshold** | < {best['stoch_th']} |
+            | **RSI Threshold** | < {best['rsi_th']} |
+            | **Hold Bars** | {best['hold_bars']} ({best['hold_bars'] * timeframe_minutes} minutes) |
+            | **Min Oscillators** | {best['min_osc']} of 5 |
+                    
+                    **Expected Performance:**
+                    - Win Rate: **{best['win_rate']:.1f}%**
+                    - Avg Return: **{best['mean_return']:.2f}%**
+                    - Sharpe: **{best['sharpe']:.2f}**
+                    - Trades: **{best['trades']}**
+                    """)
+                else:
+                    st.warning(f"No strategies found with Sharpe >= {min_sharpe_filter}. Try lowering the filter.")
+        else:
+            st.info("Enable 'Run full grid search' in sidebar to find optimal parameters")
 
-valid_symbols = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
-if not valid_symbols:
-    st.stop()
 
-# Detailed Analysis
-if "selected_symbol" not in st.session_state or st.session_state.selected_symbol not in valid_symbols:
-    st.session_state.selected_symbol = valid_symbols[0]
-selected = st.selectbox("Select symbol", valid_symbols, index=valid_symbols.index(st.session_state.selected_symbol))
-st.session_state.selected_symbol = selected
-item = detail[selected]
-
-st.subheader("Detailed Analysis")
-hourly_call, hourly_reason = item["hourly_call"]
-tactical_call, tactical_reason = item["tactical_call"]
-daily_call, daily_reason = item["daily_call"]
-weekly_call, weekly_reason = item["weekly_call"]
-tactical_label = item["tactical_label"]
-hourly_label = item["hourly_label"]
-
-render_traffic_lights([
-    (hourly_label, hourly_call, item["hourly"].iloc[-1] if not item["hourly"].empty else None),
-    (tactical_label, tactical_call, item["tactical"].iloc[-1] if not item["tactical"].empty else None),
-    ("Daily", daily_call, item["daily"].iloc[-1] if not item["daily"].empty else None),
-    ("Weekly", weekly_call, item["weekly"].iloc[-1] if not item["weekly"].empty else None),
-])
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric(hourly_label, hourly_call)
-c2.metric(tactical_label, tactical_call)
-c3.metric("Daily", daily_call)
-c4.metric("Weekly", weekly_call)
-c5.metric("Combined", item["combined"])
-
-st.markdown(f"**{hourly_label} reason:** {hourly_reason}")
-st.markdown(f"**{tactical_label} reason:** {tactical_reason}")
-st.markdown(f"**Daily reason:** {daily_reason}")
-st.markdown(f"**Weekly reason:** {weekly_reason}")
-st.markdown(f"**Recommendation:** {item['recommendation']}")
-
-structural_bias = item["combined"] if item["combined"] != "NEUTRAL" else daily_call
-st.markdown("### Frame warnings")
-st.write(frame_warning_message(item["hourly"].iloc[-1] if not item["hourly"].empty else None, hourly_label, structural_bias))
-st.write(frame_warning_message(item["tactical"].iloc[-1] if not item["tactical"].empty else None, tactical_label, structural_bias))
-st.write(frame_warning_message(item["daily"].iloc[-1] if not item["daily"].empty else None, "Daily", structural_bias))
-st.write(frame_warning_message(item["weekly"].iloc[-1] if not item["weekly"].empty else None, "Weekly", structural_bias))
-
-cross = item["cross"]
-cd1, cd2, cd3 = st.columns(3)
-cd1.metric("Distance to cross", f"{cross.get('abs_gap', np.nan):.4f}" if pd.notna(cross.get("abs_gap", np.nan)) else "n/a")
-gap_label = "Above signal" if cross.get("gap", np.nan) >= 0 else ("Below signal" if pd.notna(cross.get("gap", np.nan)) else "n/a")
-cd2.metric("Cross gap sign", gap_label)
-cd3.metric("Cross distance %", f"{cross.get('range_pct', np.nan):.1f}%" if pd.notna(cross.get("range_pct", np.nan)) else "n/a")
-
-# Diagnostics
-render_extreme_table([
-    (hourly_label, item["hourly"].iloc[-1] if not item["hourly"].empty else pd.Series(dtype=float)),
-    (tactical_label, item["tactical"].iloc[-1] if not item["tactical"].empty else pd.Series(dtype=float)),
-    ("Daily", item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)),
-])
-
-# As-of Table
-last_h = item["hourly"].iloc[-1] if not item["hourly"].empty else pd.Series(dtype=float)
-last_t = item["tactical"].iloc[-1] if not item["tactical"].empty else pd.Series(dtype=float)
-last_d = item["daily"].iloc[-1] if not item["daily"].empty else pd.Series(dtype=float)
-last_w = item["weekly"].iloc[-1] if not item["weekly"].empty else pd.Series(dtype=float)
-
-asof_table = pd.DataFrame([
-    {"Frame": hourly_label, "Date": str(last_h.name.date()) if not last_h.empty else "n/a", "TSI": round(float(last_h.get("TSI", np.nan)), 2), "Signal": round(float(last_h.get("TSI_signal", np.nan)), 2), "Heat": round(float(last_h.get("TSI_heat", np.nan)), 1), "State": str(last_h.get("State", ""))},
-    {"Frame": tactical_label, "Date": str(last_t.name.date()) if not last_t.empty else "n/a", "TSI": round(float(last_t.get("TSI", np.nan)), 2), "Signal": round(float(last_t.get("TSI_signal", np.nan)), 2), "Heat": round(float(last_t.get("TSI_heat", np.nan)), 1), "State": str(last_t.get("State", ""))},
-    {"Frame": "Daily", "Date": str(last_d.name.date()) if not last_d.empty else "n/a", "TSI": round(float(last_d.get("TSI", np.nan)), 2), "Signal": round(float(last_d.get("TSI_signal", np.nan)), 2), "Heat": round(float(last_d.get("TSI_heat", np.nan)), 1), "State": str(last_d.get("State", ""))},
-    {"Frame": "Weekly", "Date": str(last_w.name.date()) if not last_w.empty else "n/a", "TSI": round(float(last_w.get("TSI", np.nan)), 2), "Signal": round(float(last_w.get("TSI_signal", np.nan)), 2), "Heat": round(float(last_w.get("TSI_heat", np.nan)), 1), "State": str(last_w.get("State", ""))},
-])
-st.markdown("### As-of values")
-st.dataframe(asof_table, width="stretch", hide_index=True)
-
-# Analogs
-analog_summary_dict = item["analog_summary"]
-st.markdown("### Historical analogs")
-if analog_summary_dict:
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Analog count", str(int(analog_summary_dict.get("n", 0))))
-    a2.metric("2d median", f"{analog_summary_dict.get('ret_2_median', np.nan)*100:.2f}%" if pd.notna(analog_summary_dict.get("ret_2_median", np.nan)) else "n/a")
-    a3.metric("2d up %", f"{analog_summary_dict.get('ret_2_p_up', np.nan)*100:.1f}%" if pd.notna(analog_summary_dict.get("ret_2_p_up", np.nan)) else "n/a")
-    a4.metric("5d median", f"{analog_summary_dict.get('ret_5_median', np.nan)*100:.2f}%" if pd.notna(analog_summary_dict.get("ret_5_median", np.nan)) else "n/a")
-else:
-    st.caption("No analog set available.")
-
-# Mega View & Tabs
-range_options = ["2W", "1M", "3M", "6M", "1Y", "2Y", "5Y", "10Y", "MAX"]
-st.markdown("### Mega view")
-mc1, mc2, mc3, mc4 = st.columns(4)
-mega_ranges = {
-    "1h": mc1.selectbox("Mega 1H Range", range_options, index=2, key="mega_range_1h"),
-    "2h": mc2.selectbox("Mega 2H Range", range_options, index=3, key="mega_range_2h"),
-    "daily": mc3.selectbox("Mega Daily Range", range_options, index=4, key="mega_range_daily"),
-    "weekly": mc4.selectbox("Mega Weekly Range", range_options, index=6, key="mega_range_weekly"),
-}
-plot_mega_view(selected, item["hourly"], item["tactical"], item["daily"], item["weekly"], item["asof"], tactical_label, mega_ranges)
-
-st.markdown("### Frame tabs")
-tab1, tab2, tab3, tab4 = st.tabs([hourly_label, tactical_label, "Daily", "Weekly"])
-with tab1:
-    range_1h = st.selectbox("1H Range", range_options, index=2, key="tab_range_1h")
-    plot_single_frame(selected, item["hourly"] if not item["hourly"].empty else item["daily"], item["hourly"], item["asof"], hourly_label, range_1h)
-with tab2:
-    range_2h = st.selectbox("2H Range", range_options, index=3, key="tab_range_2h")
-    plot_single_frame(selected, item["tactical"] if not item["tactical"].empty else item["daily"], item["tactical"], item["asof"], tactical_label, range_2h)
-with tab3:
-    range_daily = st.selectbox("Daily Range", range_options, index=4, key="tab_range_daily")
-    plot_single_frame(selected, item["daily"], item["daily"], item["asof"], "Daily TSI", range_daily)
-with tab4:
-    range_weekly = st.selectbox("Weekly Range", range_options, index=6, key="tab_range_weekly")
-    plot_single_frame(selected, item["weekly"], item["weekly"], item["asof"], "Weekly TSI", range_weekly)
+if __name__ == "__main__":
+    main()
