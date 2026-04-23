@@ -1,15 +1,12 @@
+#!/usr/bin/env python3
 """
-UNIVERSAL SWEET SPOT BACKTEST - WITH DEBUG LOGS
-Run this script directly (python script.py)
-Will save results to CSV and print debug info
+UNIVERSAL OSCILLATOR BACKTEST - INSTITUTIONAL v2.0
+Run: python soxs_backtest_debug.py
+Features: Score-based signals, Regime filters, Slippage-aware Monte Carlo, Full debugging
 """
 
-import numpy as np
-import pandas as pd
+import os, sys, time, numpy as np, pandas as pd
 from datetime import datetime, timedelta, timezone
-from itertools import product
-import sys
-
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -17,368 +14,270 @@ from alpaca.data.timeframe import TimeFrame
 # ============================================
 # CONFIGURATION - EDIT THESE
 # ============================================
-API_KEY = "YOUR_ALPACA_API_KEY"
-SECRET_KEY = "YOUR_ALPACA_SECRET"
+API_KEY = os.getenv("ALPACA_API_KEY", "YOUR_ALPACA_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "YOUR_ALPACA_SECRET")
 FEED = "sip"  # sip = full market, iex = limited
 
-SYMBOL = "SOXS"  # Change this to test different symbols
+SYMBOL = "SOXS"
 DAYS_BACK = 180
-TIMEFRAME_MIN = 10  # 5, 10, or 15
-HOLD_BARS = 2  # 1, 2, 3, or 5
+TIMEFRAME_MIN = 10
+HOLD_BARS = 3  # 3 bars × 10 min = 30 min hold
+MIN_TRADES = 20
+SLIPPAGE_PCT = 0.008  # 0.8% realistic for leveraged ETFs
+MC_ITERATIONS = 500
+CONFIDENCE_LEVEL = 95
 
-# Signal type: "cross" or "level"
-SIGNAL_TYPE = "cross"  # cross = when oscillator crosses threshold (RECOMMENDED)
-# SIGNAL_TYPE = "level"  # level = when oscillator is above threshold
-
-# Thresholds to test
-TSI_THRESHOLDS = [0]
-CCI_THRESHOLDS = [0]
-ROC_THRESHOLDS = [0]
-RSI_THRESHOLDS = [50]
+# Score engine & regime filters
+SCORE_THRESHOLD = 0.6
+MIN_VOL_PCT = 0.4  # 0.4% ATR floor (filters dead/chop markets)
 
 # ============================================
-# DEBUG LOGGING
+# DEBUGGING ENGINE
 # ============================================
 def log(msg, level="INFO"):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {level}: {msg}")
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {level}: {msg}")
     sys.stdout.flush()
 
-log(f"Starting backtest for {SYMBOL}")
-log(f"Timeframe: {TIMEFRAME_MIN}min | Hold: {HOLD_BARS} bars ({TIMEFRAME_MIN * HOLD_BARS} min)")
-log(f"Signal type: {SIGNAL_TYPE}")
+# ============================================
+# OSCILLATOR CALCULATIONS
+# ============================================
+def calc_oscillators(df):
+    c = df['close']
+    h, l = df['high'], df['low']
+    
+    # RSI
+    delta = c.diff()
+    up = delta.clip(lower=0).rolling(14).mean()
+    down = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = up / down.replace(0, np.nan)
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # CCI
+    tp = (h + l + c) / 3
+    sma = tp.rolling(20).mean()
+    mad = (tp - sma).abs().rolling(20).mean()
+    df['cci'] = (tp - sma) / (0.015 * mad.replace(0, np.nan))
+    
+    # ROC
+    df['roc'] = (c / c.shift(10) - 1) * 100
+    
+    # TSI
+    mom = c.diff()
+    m1 = mom.ewm(span=25).mean()
+    m2 = m1.ewm(span=13).mean()
+    a1 = mom.abs().ewm(span=25).mean()
+    a2 = a1.ewm(span=13).mean()
+    df['tsi'] = 100 * m2 / a2.replace(0, np.nan)
+    
+    # Stoch
+    lo, hi = c.rolling(14).min(), c.rolling(14).max()
+    df['stoch'] = 100 * (c - lo) / (hi - lo).replace(0, np.nan)
+    
+    return df
 
 # ============================================
-# FETCH DATA
+# SIGNAL & REGIME ENGINE
 # ============================================
-log(f"Fetching {DAYS_BACK} days of data from Alpaca...")
+def generate_signals(df):
+    # 1. Component signals (crossing above threshold)
+    df['sig_rsi']   = (df['rsi'].shift(1) <= 50) & (df['rsi'] > 50)
+    df['sig_cci']   = (df['cci'].shift(1) <= 0)  & (df['cci'] > 0)
+    df['sig_roc']   = (df['roc'].shift(1) <= 0)  & (df['roc'] > 0)
+    df['sig_tsi']   = (df['tsi'].shift(1) <= 0)  & (df['tsi'] > 0)
+    df['sig_stoch'] = (df['stoch'].shift(1) <= 50) & (df['stoch'] > 50)
+    
+    # 2. Score engine (0.0 to 1.0)
+    df['score'] = (df['sig_rsi'].astype(int) + df['sig_cci'].astype(int) + 
+                   df['sig_roc'].astype(int) + df['sig_tsi'].astype(int) + 
+                   df['sig_stoch'].astype(int)) / 5.0
+    
+    # 3. Regime filters
+    df['atr'] = np.maximum(df['high'] - df['low'], 
+                  np.maximum((df['high'] - df['close'].shift(1)).abs(),
+                             (df['low'] - df['close'].shift(1)).abs())).rolling(14).mean()
+    df['vol_pct'] = (df['atr'] / df['close']) * 100
+    
+    df['trend_ok'] = df['close'] > df['close'].rolling(50).mean()  # Above 50-bar trend
+    df['vol_ok']   = df['vol_pct'] >= MIN_VOL_PCT
+    
+    # 4. Final signal: Score threshold + regime filters
+    df['signal'] = (df['score'] >= SCORE_THRESHOLD) & df['trend_ok'] & df['vol_ok']
+    return df
 
-try:
+# ============================================
+# MONTE CARLO VALIDATION
+# ============================================
+def monte_carlo(returns, n_iter=MC_ITERATIONS, slip=SLIPPAGE_PCT, conf=CONFIDENCE_LEVEL):
+    if len(returns) < 5: return None
+    boots_mean, boots_wr = [], []
+    for _ in range(n_iter):
+        samp = np.random.choice(returns, len(returns), replace=True)
+        net = samp - (slip * 100)  # Apply slippage per trade
+        boots_mean.append(net.mean())
+        boots_wr.append((net > 0).mean() * 100)
+    
+    alpha = (100 - conf) / 200
+    return {
+        'mean_ci': (np.percentile(boots_mean, alpha*100), np.percentile(boots_mean, (1-alpha)*100)),
+        'wr_ci':   (np.percentile(boots_wr, alpha*100), np.percentile(boots_wr, (1-alpha)*100)),
+        'mean': np.mean(boots_mean),
+        'std': np.std(boots_mean)
+    }
+
+# ============================================
+# MAIN EXECUTION
+# ============================================
+def main():
+    log("="*70)
+    log(f"STARTING BACKTEST: {SYMBOL}")
+    log(f"Timeframe: {TIMEFRAME_MIN}min | Hold: {HOLD_BARS} bars ({TIMEFRAME_MIN*HOLD_BARS}min)")
+    log(f"Score Threshold: {SCORE_THRESHOLD} | Min Vol: {MIN_VOL_PCT}% | Slippage: {SLIPPAGE_PCT*100:.1f}%")
+    
+    # 1. FETCH DATA
+    if API_KEY == "YOUR_ALPACA_KEY":
+        log("⚠️ Replace API keys at the top of the script", "ERROR")
+        sys.exit(1)
+        
+    log(f"Fetching {DAYS_BACK} days from Alpaca ({FEED} feed)...")
     client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=DAYS_BACK)
     
-    req = StockBarsRequest(
-        symbol_or_symbols=SYMBOL,
-        timeframe=TimeFrame.Minute,
-        start=start,
-        end=end,
-        limit=50000,
-        feed=FEED,
-        adjustment="all",
-    )
-    
+    req = StockBarsRequest(symbol_or_symbols=SYMBOL, timeframe=TimeFrame.Minute, 
+                           start=start, end=end, limit=50000, feed=FEED, adjustment="all")
     bars = client.get_stock_bars(req).df
-    log(f"Raw bars fetched: {len(bars)}")
     
     if bars.empty:
-        log("No data returned! Check API keys and symbol.", "ERROR")
+        log("No data returned. Check symbol/API keys.", "ERROR")
         sys.exit(1)
         
-except Exception as e:
-    log(f"API Error: {e}", "ERROR")
-    sys.exit(1)
-
-# Clean data
-bars = bars.reset_index(level=0, drop=True)
-bars.index = pd.to_datetime(bars.index)
-bars = bars.tz_localize(None)
-
-log(f"Data range: {bars.index[0]} to {bars.index[-1]}")
-log(f"Total minute bars: {len(bars)}")
-
-# ============================================
-# RESAMPLE TO TIMEFRAME
-# ============================================
-freq = f'{TIMEFRAME_MIN}min'
-df = bars.resample(freq).agg({
-    'open': 'first',
-    'high': 'max',
-    'low': 'min',
-    'close': 'last',
-    'volume': 'sum'
-}).dropna()
-
-log(f"Resampled to {len(df)} {TIMEFRAME_MIN}-min bars")
-
-if len(df) < 100:
-    log(f"Only {len(df)} bars - need at least 100 for valid backtest", "WARNING")
-
-# ============================================
-# OSCILLATOR FUNCTIONS
-# ============================================
-def ema(s, span):
-    return s.ewm(span=span, adjust=False).mean()
-
-def tsi(close, long_p=25, short_p=13):
-    delta = close.diff()
-    m1 = ema(delta, long_p)
-    m2 = ema(m1, short_p)
-    a1 = ema(delta.abs(), long_p)
-    a2 = ema(a1, short_p)
-    return 100 * m2 / a2.replace(0, np.nan)
-
-def cci(df, period=20):
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    sma = tp.rolling(period, min_periods=2).mean()
-    mad = (tp - sma).abs().rolling(period, min_periods=2).mean()
-    return (tp - sma) / (0.015 * mad.replace(0, np.nan))
-
-def roc(close, period=10):
-    return (close / close.shift(period) - 1) * 100
-
-def rsi(close, period=14):
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    avg_up = up.ewm(alpha=1/period, adjust=False).mean()
-    avg_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_up / avg_down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-# ============================================
-# CALCULATE OSCILLATORS
-# ============================================
-log("Calculating oscillators...")
-
-df['tsi'] = tsi(df['close'])
-df['cci'] = cci(df)
-df['roc'] = roc(df['close'])
-df['rsi'] = rsi(df['close'])
-
-# Forward returns
-df[f'forward_{HOLD_BARS}'] = (df['close'].shift(-HOLD_BARS) / df['close'] - 1) * 100
-
-log(f"Oscillator stats:")
-log(f"  TSI: min={df['tsi'].min():.1f}, max={df['tsi'].max():.1f}, mean={df['tsi'].mean():.1f}")
-log(f"  CCI: min={df['cci'].min():.1f}, max={df['cci'].max():.1f}, mean={df['cci'].mean():.1f}")
-log(f"  ROC: min={df['roc'].min():.1f}, max={df['roc'].max():.1f}, mean={df['roc'].mean():.1f}")
-log(f"  RSI: min={df['rsi'].min():.1f}, max={df['rsi'].max():.1f}, mean={df['rsi'].mean():.1f}")
-
-# ============================================
-# GENERATE SIGNALS (CROSS vs LEVEL)
-# ============================================
-log(f"Generating {SIGNAL_TYPE} signals...")
-
-if SIGNAL_TYPE == "cross":
-    # CROSS signal - enters when oscillator crosses threshold
-    df['tsi_signal'] = (df['tsi'].shift(1) <= 0) & (df['tsi'] > 0)
-    df['cci_signal'] = (df['cci'].shift(1) <= 0) & (df['cci'] > 0)
-    df['roc_signal'] = (df['roc'].shift(1) <= 0) & (df['roc'] > 0)
-    df['rsi_signal'] = (df['rsi'].shift(1) <= 50) & (df['rsi'] > 50)
-else:
-    # LEVEL signal - enters when oscillator is above threshold (ALREADY MOVED)
-    df['tsi_signal'] = df['tsi'] > 0
-    df['cci_signal'] = df['cci'] > 0
-    df['roc_signal'] = df['roc'] > 0
-    df['rsi_signal'] = df['rsi'] > 50
-
-# Combine signals (ALL must be true)
-df['signal'] = (
-    df['tsi_signal'] & 
-    df['cci_signal'] & 
-    df['roc_signal'] & 
-    df['rsi_signal']
-)
-
-signal_count = df['signal'].sum()
-signal_pct = signal_count / len(df) * 100
-
-log(f"Total signals: {signal_count} ({signal_pct:.2f}% of bars)")
-
-if signal_count < 20:
-    log(f"Only {signal_count} signals - need at least 20 for valid backtest", "WARNING")
-    log("Try: lower thresholds, longer timeframe, or more days of data")
-
-# ============================================
-# BACKTEST
-# ============================================
-signals = df[df['signal']].copy()
-returns = signals[f'forward_{HOLD_BARS}'].dropna()
-
-if len(returns) < 10:
-    log(f"Only {len(returns)} trades with valid returns - cannot backtest", "ERROR")
-    sys.exit(1)
-
-win_rate = (returns > 0).mean() * 100
-avg_return = returns.mean()
-median_return = returns.median()
-std_return = returns.std()
-sharpe = avg_return / std_return if std_return > 0 else 0
-t_stat = avg_return / (std_return / np.sqrt(len(returns))) if std_return > 0 else 0
-
-# Percentiles
-p5 = np.percentile(returns, 5)
-p25 = np.percentile(returns, 25)
-p75 = np.percentile(returns, 75)
-p95 = np.percentile(returns, 95)
-
-# ============================================
-# MONTE CARLO SIMULATION
-# ============================================
-log(f"Running Monte Carlo ({min(500, len(returns))} iterations)...")
-
-n_sims = min(500, len(returns) * 10)
-sim_means = []
-sim_wins = []
-
-np.random.seed(42)
-for _ in range(n_sims):
-    sample = np.random.choice(returns, len(returns), replace=True)
-    sim_means.append(sample.mean())
-    sim_wins.append((sample > 0).mean() * 100)
-
-mc_mean = np.mean(sim_means)
-mc_std = np.std(sim_means)
-mc_p5 = np.percentile(sim_means, 5)
-mc_p95 = np.percentile(sim_means, 95)
-mc_win_mean = np.mean(sim_wins)
-mc_win_p5 = np.percentile(sim_wins, 5)
-mc_win_p95 = np.percentile(sim_wins, 95)
-
-# ============================================
-# PRINT RESULTS
-# ============================================
-print("\n" + "="*70)
-print(f"RESULTS FOR {SYMBOL}")
-print("="*70)
-print(f"""
-Configuration:
+    bars = bars.reset_index(level=0, drop=True)
+    log(f"✅ Raw minute bars: {len(bars)}")
+    
+    # 2. RESAMPLE
+    freq = f'{TIMEFRAME_MIN}min'
+    df = bars.resample(freq).agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+    log(f"✅ Resampled to {len(df)} {TIMEFRAME_MIN}-min bars | Range: {df.index[0].date()} → {df.index[-1].date()}")
+    
+    # 3. OSCILLATORS
+    log("Calculating oscillators...")
+    df = calc_oscillators(df)
+    log(f"📊 Oscillator Stats:")
+    for col in ['rsi','cci','roc','tsi','stoch']:
+        log(f"   {col.upper():5} | Min: {df[col].min():.1f} | Max: {df[col].max():.1f} | Mean: {df[col].mean():.1f}")
+        
+    # 4. SIGNALS
+    log("Generating signals (score engine + regime filters)...")
+    df = generate_signals(df)
+    total_signals = df['signal'].sum()
+    log(f"📈 Total signals: {total_signals} ({total_signals/len(df)*100:.2f}% of bars)")
+    
+    if total_signals < MIN_TRADES:
+        log(f"⚠️ Only {total_signals} signals (min: {MIN_TRADES}). Try lower threshold or longer timeframe.", "WARNING")
+        
+    # 5. BACKTEST
+    log("Running backtest...")
+    signals = df[df['signal']].copy()
+    ret_col = f'forward_{HOLD_BARS}'
+    df[ret_col] = (df['close'].shift(-HOLD_BARS) / df['close'] - 1) * 100
+    gross_ret = signals[ret_col].dropna()
+    net_ret = gross_ret - (SLIPPAGE_PCT * 100)
+    
+    if len(net_ret) < MIN_TRADES:
+        log(f"⚠️ Insufficient valid returns: {len(net_ret)}. Aborting.", "WARNING")
+        sys.exit(1)
+        
+    win_rate = (net_ret > 0).mean() * 100
+    avg_ret = net_ret.mean()
+    std_ret = net_ret.std()
+    sharpe = avg_ret / std_ret if std_ret > 0 else 0
+    t_stat = avg_ret / (std_ret / np.sqrt(len(net_ret))) if std_ret > 0 else 0
+    
+    # 6. MONTE CARLO
+    log(f"Running Monte Carlo ({MC_ITERATIONS} iterations)...")
+    mc = monte_carlo(gross_ret)
+    mc_mean, mc_std, mc_ci = mc['mean'], mc['std'], mc['mean_ci']
+    mc_wr_ci = mc['wr_ci']
+    log(f"✅ MC Mean: {mc_mean:.2f}% | 95% CI: [{mc_ci[0]:.2f}%, {mc_ci[1]:.2f}%]")
+    log(f"✅ MC WinRate 95% CI: [{mc_wr_ci[0]:.1f}%, {mc_wr_ci[1]:.1f}%]")
+    
+    # 7. PRINT RESULTS
+    print("\n" + "="*70)
+    print(f"RESULTS FOR {SYMBOL}")
+    print("="*70)
+    print(f"""Configuration:
   Timeframe:        {TIMEFRAME_MIN} minutes
   Hold time:        {TIMEFRAME_MIN * HOLD_BARS} minutes ({HOLD_BARS} bars)
-  Signal type:      {SIGNAL_TYPE}
   Data period:      {df.index[0].date()} to {df.index[-1].date()}
   Total bars:       {len(df)}
 
 Signal Statistics:
-  Total signals:    {signal_count}
-  Signal frequency: {signal_pct:.2f}% of bars
-  Valid trades:     {len(returns)}
+  Total signals:    {total_signals}
+  Signal frequency: {total_signals/len(df)*100:.2f}% of bars
+  Valid trades:     {len(net_ret)}
 
-Performance:
+Performance (Net of {SLIPPAGE_PCT*100:.1f}% slippage):
   Win Rate:         {win_rate:.1f}%
-  Avg Return:       {avg_return:.2f}%
-  Median Return:    {median_return:.2f}%
-  Std Deviation:    {std_return:.2f}%
+  Avg Return:       {avg_ret:.2f}%
+  Std Deviation:    {std_ret:.2f}%
   Sharpe Ratio:     {sharpe:.2f}
   t-statistic:      {t_stat:.2f}
 
 Return Distribution:
-  5th percentile:   {p5:.2f}%
-  25th percentile:  {p25:.2f}%
-  75th percentile:  {p75:.2f}%
-  95th percentile:  {p95:.2f}%
-  Best trade:       {returns.max():.2f}%
-  Worst trade:      {returns.min():.2f}%
+  5th percentile:   {np.percentile(net_ret, 5):.2f}%
+  25th percentile:  {np.percentile(net_ret, 25):.2f}%
+  75th percentile:  {np.percentile(net_ret, 75):.2f}%
+  95th percentile:  {np.percentile(net_ret, 95):.2f}%
+  Best trade:       {net_ret.max():.2f}%
+  Worst trade:      {net_ret.min():.2f}%
 
-Monte Carlo (95% confidence):
-  Return range:     [{mc_p5:.2f}%, {mc_p95:.2f}%]
-  Win rate range:   [{mc_win_p5:.1f}%, {mc_win_p95:.1f}%]
+Monte Carlo Validation ({CONFIDENCE_LEVEL}% confidence):
+  Avg Return CI:    [{mc_ci[0]:.2f}%, {mc_ci[1]:.2f}%]
+  Win Rate CI:      [{mc_wr_ci[0]:.1f}%, {mc_wr_ci[1]:.1f}%]
 """)
+    
+    # 8. INTERPRETATION
+    print("="*70)
+    print("INTERPRETATION")
+    print("="*70)
+    if t_stat > 2.0:
+        print("✅ t-stat > 2.0 - Statistically significant edge")
+    else:
+        print("❌ t-stat < 2.0 - Not statistically significant (likely noise)")
+        
+    if win_rate > 60:
+        print(f"✅ Win rate {win_rate:.1f}% - Strong edge")
+    elif win_rate > 55:
+        print(f"🟡 Win rate {win_rate:.1f}% - Modest edge")
+    else:
+        print(f"❌ Win rate {win_rate:.1f}% - Below random")
+        
+    if avg_ret > 0.5:
+        print(f"✅ Positive expectancy: {avg_ret:.2f}% per trade (survives slippage)")
+    elif avg_ret > 0:
+        print(f"🟡 Positive but thin: {avg_ret:.2f}% (vulnerable to execution drag)")
+    else:
+        print(f"❌ Negative expectancy: {avg_ret:.2f}% per trade")
+        
+    if mc_ci[0] > 0:
+        print(f"✅ Monte Carlo confirms positive lower bound")
+    else:
+        print(f"⚠️ Monte Carlo lower bound dips into negative territory")
+        
+    # 9. EXPORT
+    out_file = f"{SYMBOL}_backtest_{TIMEFRAME_MIN}min_{HOLD_BARS}bars.csv"
+    trade_log = pd.DataFrame({
+        'timestamp': signals.index[:len(net_ret)],
+        'score': signals['score'].values[:len(net_ret)],
+        'vol_pct': signals['vol_pct'].values[:len(net_ret)],
+        'net_return_pct': net_ret.values,
+        'win': (net_ret > 0).astype(int)
+    })
+    trade_log.to_csv(out_file, index=False)
+    log(f"\n📁 Trade log saved to: {out_file}")
+    log("="*70)
+    log("BACKTEST COMPLETE")
 
-# ============================================
-# INTERPRETATION
-# ============================================
-print("="*70)
-print("INTERPRETATION")
-print("="*70)
-
-if t_stat > 2.0:
-    print("✅ t-stat > 2.0 - Statistically significant")
-else:
-    print("❌ t-stat < 2.0 - Not statistically significant (may be random)")
-
-if win_rate > 60:
-    print(f"✅ Win rate {win_rate:.1f}% - Better than coin flip")
-elif win_rate > 55:
-    print(f"🟡 Win rate {win_rate:.1f}% - Modest edge")
-else:
-    print(f"❌ Win rate {win_rate:.1f}% - Worse than coin flip")
-
-if avg_return > 0:
-    print(f"✅ Positive expectancy: {avg_return:.2f}% per trade")
-else:
-    print(f"❌ Negative expectancy: {avg_return:.2f}% per trade")
-
-if signal_count < 50:
-    print(f"⚠️ Only {signal_count} signals - may not be enough for reliable strategy")
-
-# ============================================
-# CHECK SIGNAL DIRECTION
-# ============================================
-print("\n" + "="*70)
-print("SIGNAL DIRECTION CHECK")
-print("="*70)
-
-# Check what happens AFTER signal
-signal_returns = returns
-no_signal_returns = df[~df['signal']][f'forward_{HOLD_BARS}'].dropna()
-
-print(f"With signal:    avg return = {signal_returns.mean():.3f}%")
-print(f"Without signal: avg return = {no_signal_returns.mean():.3f}%")
-print(f"Difference:     {signal_returns.mean() - no_signal_returns.mean():.3f}%")
-
-if signal_returns.mean() > no_signal_returns.mean():
-    print("✅ Signal is better than random (positive edge)")
-else:
-    print("❌ Signal is WORSE than random (try OPPOSITE signal)")
-
-# ============================================
-# SAVE RESULTS
-# ============================================
-results = {
-    'symbol': SYMBOL,
-    'timeframe_min': TIMEFRAME_MIN,
-    'hold_minutes': TIMEFRAME_MIN * HOLD_BARS,
-    'signal_type': SIGNAL_TYPE,
-    'days_back': DAYS_BACK,
-    'total_bars': len(df),
-    'total_signals': signal_count,
-    'signal_pct': round(signal_pct, 2),
-    'valid_trades': len(returns),
-    'win_rate': round(win_rate, 1),
-    'avg_return': round(avg_return, 2),
-    'median_return': round(median_return, 2),
-    'sharpe': round(sharpe, 2),
-    't_stat': round(t_stat, 2),
-    'p5': round(p5, 2),
-    'p95': round(p95, 2),
-    'mc_return_p5': round(mc_p5, 2),
-    'mc_return_p95': round(mc_p95, 2),
-    'mc_win_p5': round(mc_win_p5, 1),
-    'mc_win_p95': round(mc_win_p95, 1),
-}
-
-# Save to CSV
-output_file = f"{SYMBOL}_backtest_{TIMEFRAME_MIN}min_{SIGNAL_TYPE}.csv"
-
-# Also save full trade list
-trades_df = pd.DataFrame({
-    'timestamp': signals.index[:len(returns)],
-    'return_pct': returns.values
-})
-trades_file = f"{SYMBOL}_trades_{TIMEFRAME_MIN}min_{SIGNAL_TYPE}.csv"
-trades_df.to_csv(trades_file, index=False)
-
-print(f"\n📁 Results saved to: {output_file}")
-print(f"📁 Trade list saved to: {trades_file}")
-
-# ============================================
-# RECOMMENDATION
-# ============================================
-print("\n" + "="*70)
-print("RECOMMENDATION")
-print("="*70)
-
-if avg_return > 0 and t_stat > 2.0 and win_rate > 55:
-    print(f"✅ This strategy works for {SYMBOL}!")
-    print(f"   Entry: When TSI, CCI, ROC cross above 0 AND RSI > 50")
-    print(f"   Exit: After {TIMEFRAME_MIN * HOLD_BARS} minutes")
-elif avg_return < 0 and t_stat > 2.0:
-    print(f"🔄 Try the OPPOSITE signal for {SYMBOL}")
-    print(f"   Entry: When TSI, CCI, ROC cross BELOW 0 AND RSI < 50")
-elif t_stat < 2.0:
-    print(f"❌ No statistically significant edge found for {SYMBOL}")
-    print(f"   Try: Different timeframe, hold time, or thresholds")
-else:
-    print(f"❌ Strategy does not work for {SYMBOL} with current settings")
+if __name__ == "__main__":
+    main()
