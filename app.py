@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Stable Market Engine v13.1 — Probabilistic Ranker & MC Predictor
-✅ FIXED: Added CSV Upload Widget
-✅ FIXED: Pandas resample offset syntax ("9h30T" with lowercase 'h')
+Stable Market Engine v13.2 — Probabilistic Ranker & MC Predictor
+✅ FIXED: Direct 1-hour bars from Alpaca (no resampling needed)
+✅ ADDED: 1-hour, 2-hour, daily, weekly timeframes
 ✅ Bulk CSV/Paste Scanning | Monte Carlo Predictor | Smooth Oscillator
 """
 
@@ -29,7 +29,7 @@ CACHE_DIR = APP_DIR / "cache_store_alpaca"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NY_TZ = "America/New_York"
 
-st.set_page_config(page_title="Stable Market Engine v13.1", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stable Market Engine v13.2", layout="wide", initial_sidebar_state="expanded")
 
 # -----------------------------
 # UTILITY HELPERS
@@ -156,8 +156,9 @@ def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: s
     return data_map
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: str) -> pd.DataFrame:
-    p = cache_path(symbol, "2hour_real")
+def fetch_alpaca_hourly(symbol: str, months: int, key: str, secret: str, feed: str) -> pd.DataFrame:
+    """Fetch 1-hour bars directly from Alpaca"""
+    p = cache_path(symbol, "hourly")
     if is_fresh(p, max_hours=4):
         try: return pd.read_parquet(p)
         except: pass
@@ -166,9 +167,18 @@ def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: st
     start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
     end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
     
-    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(30, TimeFrameUnit.Minute), start=start, end=end, adjustment="raw", feed=feed)
-    try: raw = client.get_stock_bars(req).df
-    except: return pd.DataFrame()
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol, 
+        timeframe=TimeFrame(1, TimeFrameUnit.Hour),  # 1-hour bars directly
+        start=start, 
+        end=end, 
+        adjustment="raw", 
+        feed=feed
+    )
+    try: 
+        raw = client.get_stock_bars(req).df
+    except: 
+        return pd.DataFrame()
     
     if symbol in raw.index.get_level_values(0):
         sub = raw.xs(symbol, level=0)
@@ -176,24 +186,50 @@ def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: st
     else:
         clean = normalize_ohlcv(raw)
         
-    if clean.empty: return pd.DataFrame()
+    if clean.empty: 
+        return pd.DataFrame()
+    
+    # Filter to market hours only
     clean = clean.between_time("09:30", "16:00")
+    
+    if not clean.empty: 
+        clean.to_parquet(p)
+    return clean
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_alpaca_2hour_bars(symbol: str, months: int, key: str, secret: str, feed: str) -> pd.DataFrame:
+    """Fetch 1-hour bars and resample to 2-hour (simple resample, no offset issues)"""
+    p = cache_path(symbol, "2hour")
+    if is_fresh(p, max_hours=4):
+        try: return pd.read_parquet(p)
+        except: pass
+    
+    # Get 1-hour bars first
+    hourly = fetch_alpaca_hourly(symbol, months, key, secret, feed)
+    if hourly.empty:
+        return pd.DataFrame()
+    
+    # Simple resample to 2-hour (pairs of 1-hour bars)
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    resampled = hourly.resample("2h").agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
     
-    # ✅ FIXED: Use lowercase 'h' for hours (changed from "2H" to "2h" and "9H30T" to "9h30T")
-    resampled = clean.resample("2h", offset="9h30T").agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
-    
-    if not resampled.empty: resampled.to_parquet(p)
+    if not resampled.empty:
+        resampled.to_parquet(p)
     return resampled
 
 # -----------------------------
 # FEATURE ENGINEERING & OSCILLATOR
 # -----------------------------
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
-    spans = {"2hour_proxy": (10, 26, 8), "real_2hour": (10, 26, 8), "daily": (16, 42, 10), "weekly": (8, 21, 7)}
-    pre_smooth_map = {"2hour_proxy": 5, "real_2hour": 5, "daily": 5, "weekly": 3}
-    decision_smooth_map = {"2hour_proxy": 2, "real_2hour": 2, "daily": 1, "weekly": 1}
-    viz_smooth_map = {"2hour_proxy": 12, "real_2hour": 12, "daily": 5, "weekly": 3}
+    spans = {
+        "hourly": (8, 21, 6),      # Fast for 1-hour
+        "2hour": (10, 26, 8),      # Medium for 2-hour
+        "daily": (16, 42, 10),     # Slow for daily
+        "weekly": (8, 21, 7)       # Very slow for weekly
+    }
+    pre_smooth_map = {"hourly": 3, "2hour": 5, "daily": 5, "weekly": 3}
+    decision_smooth_map = {"hourly": 1, "2hour": 2, "daily": 1, "weekly": 1}
+    viz_smooth_map = {"hourly": 8, "2hour": 12, "daily": 5, "weekly": 3}
 
     fast, slow, sig = spans.get(timeframe_name, (16, 42, 10))
     tsi_n = np.tanh(out["tsi"].fillna(0.0) / 35.0)
@@ -222,7 +258,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     out["uo_gap"] = out["uo_decision"] - out["uo_signal_decision"]
     out["uo_slope_3"] = out["uo_decision"].diff(3)
     
-    lookback = 120 if "2hour" in timeframe_name else 252
+    lookback = 252 if "daily" in timeframe_name else 120
     out["uo_pctile"] = ((out["uo_decision"] - out["uo_decision"].rolling(lookback, min_periods=20).min()) / 
                         (out["uo_decision"].rolling(lookback, min_periods=20).max() - out["uo_decision"].rolling(lookback, min_periods=20).min()).replace(0, np.nan)).clip(0, 1)
     return out
@@ -237,7 +273,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     x["pct_b"] = bollinger_pct_b(x["Close"], 20, 2)
     x["adx_14"] = adx(x, 14)
     x["dist_ema20_pct"] = (x["Close"] / x["ema_20"]) - 1
-    x["vwap"] = rolling_vwap(x, 12) if "2hour" in timeframe_name else rolling_vwap(x, 20)
+    x["vwap"] = rolling_vwap(x, 12) if "hourly" in timeframe_name or "2hour" in timeframe_name else rolling_vwap(x, 20)
     x["dist_vwap_pct"] = (x["Close"] / x["vwap"]) - 1
     x["close_zscore"] = (x["Close"] - x["Close"].rolling(252).mean()) / x["Close"].rolling(252).std()
     
@@ -343,29 +379,30 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
 # -----------------------------
 # DASHBOARD & PLOTTING
 # -----------------------------
-def plot_dashboard(symbol: str, hourly_df, tactical_df, daily_df, weekly_df, asof_date, tactical_label):
+def plot_dashboard(symbol: str, hourly_df, twohour_df, daily_df, weekly_df, asof_date, tactical_label):
     fig = make_subplots(rows=5, cols=1, vertical_spacing=0.04,
-        subplot_titles=[f"{symbol} Price", f"{tactical_label} Oscillator", "Daily Oscillator", "Weekly Oscillator", "Overbought/Oversold"],
+        subplot_titles=[f"{symbol} Price", f"1-Hour Oscillator", f"2-Hour Oscillator", "Daily Oscillator", "Weekly Oscillator"],
         row_heights=[0.25, 0.18, 0.18, 0.18, 0.21])
     
     if not daily_df.empty:
         d = daily_df.tail(260)
         fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Price"), row=1, col=1)
         
-    for rn, frame, nm in zip([2,3,4], [tactical_df.tail(260), daily_df.tail(260), weekly_df.tail(160)], [tactical_label, "Daily", "Weekly"]):
+    for rn, frame, nm in zip([2,3,4,5], [hourly_df.tail(260), twohour_df.tail(260), daily_df.tail(260), weekly_df.tail(160)], 
+                              ["1-Hour", "2-Hour", "Daily", "Weekly"]):
         if frame.empty: continue
         fig.add_trace(go.Scatter(x=frame.index, y=frame["uo"], name=f"{nm} UO", line=dict(color="red", width=2.3)), row=rn, col=1)
         fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"{nm} Signal", line=dict(color="black", width=1.3)), row=rn, col=1)
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=rn, col=1)
         
-    fig.update_layout(height=1300, xaxis_rangeslider_visible=False, legend_orientation="h")
+    fig.update_layout(height=1500, xaxis_rangeslider_visible=False, legend_orientation="h")
     st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------
 # MAIN APP
 # -----------------------------
-st.title("📈 Stable Market Engine v13.1 — Probabilistic Ranker")
-st.caption("Upload CSV / Paste Symbols | 2H Tactical Call | MC Predictor | Real 2H Data")
+st.title("📈 Stable Market Engine v13.2 — 1H/2H/Daily/Weekly Oscillator")
+st.caption("Upload CSV / Paste Symbols | 1H & 2H Tactical Calls | MC Predictor | Real Alpaca Data")
 
 with st.sidebar:
     st.header("Credentials")
@@ -375,7 +412,7 @@ with st.sidebar:
     
     st.header("Input")
     symbols_text = st.text_area("Paste Tickers", value="QQQ, SMH, NVDA, XLF", height=80)
-    csv_file = st.file_uploader("Or Upload CSV Watchlist", type=["csv"]) # ✅ CSV UPLOAD ADDED HERE
+    csv_file = st.file_uploader("Or Upload CSV Watchlist", type=["csv"])
     
     st.header("Settings")
     benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "IWM"], index=0)
@@ -391,24 +428,33 @@ symbols = list(dict.fromkeys(symbols))
 if not symbols: st.error("Provide symbols via paste or CSV."); st.stop()
 
 st.info(f"Fetching data for {len(symbols)} symbols...")
-daily_map = fetch_alpaca_daily_batch(symbols + ["SPY"], 5, key, secret, feed)
-if "SPY" not in daily_map: st.error("Failed to fetch benchmark."); st.stop()
+daily_map = fetch_alpaca_daily_batch(symbols + [benchmark], 5, key, secret, feed)
+if benchmark not in daily_map: st.error(f"Failed to fetch benchmark {benchmark}."); st.stop()
 
 rows, detail = [], {}
 for sym in symbols:
     daily_raw = daily_map.get(sym, pd.DataFrame())
     if daily_raw.empty: continue
     
-    tactical_raw = fetch_alpaca_2hour(sym, 3, key, secret, feed)
-    tactical_label = "2-Hour (Real Alpaca)" if not tactical_raw.empty else "2-Hour (Proxy Fallback)"
-    if tactical_raw.empty: tactical_raw = daily_raw.copy()
+    # Fetch all timeframes
+    hourly_raw = fetch_alpaca_hourly(sym, 3, key, secret, feed)
+    twohour_raw = fetch_alpaca_2hour_bars(sym, 3, key, secret, feed)
+    
+    # Fallbacks if data missing
+    if hourly_raw.empty: 
+        hourly_raw = daily_raw.copy()
+    if twohour_raw.empty: 
+        twohour_raw = daily_raw.copy()
         
     weekly_raw = daily_raw.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
     
-    tactical_df = enrich_price_features(tactical_raw, "real_2hour" if not tactical_raw.equals(daily_raw) else "2hour_proxy", daily_map["SPY"])
-    daily_df = enrich_price_features(daily_raw, "daily", daily_map["SPY"])
+    # Enrich all timeframes with features
+    hourly_df = enrich_price_features(hourly_raw, "hourly", daily_map[benchmark])
+    twohour_df = enrich_price_features(twohour_raw, "2hour", daily_map[benchmark])
+    daily_df = enrich_price_features(daily_raw, "daily", daily_map[benchmark])
     
-    row_2h = tactical_df.iloc[-1]
+    row_h = hourly_df.iloc[-1]
+    row_2h = twohour_df.iloc[-1]
     row_d = daily_df.iloc[-1]
     
     analogs = find_analogs(daily_df, row_d.name, n=30)
@@ -419,18 +465,28 @@ for sym in symbols:
     
     rows.append({
         "Symbol": sym, "Grade": grade, "Grade Reason": grade_reason,
-        "2H Tactical": "CALL" if row_2h["uo_gap"] > 0 else "PUT",
+        "1H Call": "CALL" if row_h["uo_gap"] > 0 else "PUT",
+        "2H Call": "CALL" if row_2h["uo_gap"] > 0 else "PUT",
         "Daily Call": "CALL" if row_d["uo_gap"] > 0 else "PUT",
         "Prob Adv % (2D)": round(mc2.get("p_up", 50.0), 1),
         "Prob Dec % (2D)": round(mc2.get("p_down", 50.0), 1),
         "Net Bias": round(mc2.get("p_up", 50.0) - 50.0, 1),
         "MC 2D Med %": round(mc2.get("median", 0)*100, 2),
         "MC 5D Med %": round(mc.get(5, {}).get("median", 0)*100, 2),
-        "Liq Options": "Y" if mc2.get("sample", 0) > 20 else "N",
         "RSI14": round(float(row_d.get("rsi_14", 0)), 1),
         "Status": "OK"
     })
-    detail[sym] = {"tactical": tactical_df, "daily": daily_df, "weekly": weekly_raw, "tactical_label": tactical_label, "mc": mc, "analogs": analogs, "grade_reason": grade_reason, "grade_score": grade_score}
+    
+    detail[sym] = {
+        "hourly": hourly_df, 
+        "twohour": twohour_df, 
+        "daily": daily_df, 
+        "weekly": weekly_raw, 
+        "mc": mc, 
+        "analogs": analogs, 
+        "grade_reason": grade_reason, 
+        "grade_score": grade_score
+    }
 
 results_df = pd.DataFrame(rows).sort_values("Net Bias", ascending=False).reset_index(drop=True)
 st.subheader("📊 Ranked Results")
@@ -456,7 +512,7 @@ c2.metric("Prob Decline (2D)", f"{mc.get(2,{}).get('p_down',50):.1f}%")
 c3.metric("MC 2D Median", f"{mc.get(2,{}).get('median',0)*100:.2f}%")
 c4.metric("MC 5D Median", f"{mc.get(5,{}).get('median',0)*100:.2f}%")
 
-plot_dashboard(selected, item["tactical"], item["tactical"], item["daily"], item["weekly"], pd.Timestamp.today(), item["tactical_label"])
+plot_dashboard(selected, item["hourly"], item["twohour"], item["daily"], item["weekly"], pd.Timestamp.today(), "tactical")
 
 if not item["analogs"].empty:
     st.markdown("### 🎲 Monte Carlo Forward Distribution (2-Day)")
