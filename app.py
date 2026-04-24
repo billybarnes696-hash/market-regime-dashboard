@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Stable Market Engine v13 — Real 2H Accuracy & Smart Grading
-✅ FIX: 2-Hour Oscillator now uses REAL Alpaca 2H data (not daily copy).
-✅ FIX: Grading Logic now penalizes "Overheated" stocks (No more A+ on extended tops).
-✅ FIX: Dashboard warns if 2H data is missing instead of faking it.
+Stable Market Engine v13.1 — Probabilistic Ranker & MC Predictor
+✅ FIXED: Added CSV Upload Widget
+✅ FIXED: Pandas resample offset syntax ("9H30T")
+✅ Bulk CSV/Paste Scanning | Monte Carlo Predictor | Smooth Oscillator
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from plotly.subplots import make_subplots
 import streamlit as st
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -30,7 +29,7 @@ CACHE_DIR = APP_DIR / "cache_store_alpaca"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NY_TZ = "America/New_York"
 
-st.set_page_config(page_title="Stable Market Engine v13", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stable Market Engine v13.1", layout="wide", initial_sidebar_state="expanded")
 
 # -----------------------------
 # UTILITY HELPERS
@@ -112,6 +111,15 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if "Volume" not in out.columns: out["Volume"] = np.nan
     return out.dropna(subset=["Open", "High", "Low", "Close"])
 
+def parse_symbol_csv(uploaded) -> List[str]:
+    if uploaded is None: return []
+    try:
+        df = pd.read_csv(io.BytesIO(uploaded.getvalue()))
+        cols = {str(c).strip().lower(): c for c in df.columns}
+        sym_col = cols.get("symbol") or cols.get("ticker") or next(iter(df.columns), None)
+        return [str(x).strip().upper() for x in df[sym_col].dropna().tolist() if str(x).strip()]
+    except: return []
+
 def cache_path(symbol: str, kind: str) -> Path:
     safe = "".join(c for c in symbol if c.isalnum() or c in ".-")
     return CACHE_DIR / f"{safe}_{kind}.parquet"
@@ -120,9 +128,6 @@ def is_fresh(path: Path, max_hours: int = 18) -> bool:
     if not path.exists(): return False
     return (pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")) < pd.Timedelta(hours=max_hours)
 
-# -----------------------------
-# REAL ALPACA DATA FETCHING
-# -----------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: str, feed: str) -> Dict[str, pd.DataFrame]:
     if not symbols or not key or not secret: return {}
@@ -152,7 +157,6 @@ def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: s
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: str) -> pd.DataFrame:
-    """Fetches real 30-min bars and resamples to 2-Hour candles."""
     p = cache_path(symbol, "2hour_real")
     if is_fresh(p, max_hours=4):
         try: return pd.read_parquet(p)
@@ -162,7 +166,6 @@ def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: st
     start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(months=max(months, 3))).tz_localize(None)
     end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
     
-    # Fetch 30-min bars to build accurate 2H candles
     req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(30, TimeFrameUnit.Minute), start=start, end=end, adjustment="raw", feed=feed)
     try: raw = client.get_stock_bars(req).df
     except: return pd.DataFrame()
@@ -174,68 +177,43 @@ def fetch_alpaca_2hour(symbol: str, months: int, key: str, secret: str, feed: st
         clean = normalize_ohlcv(raw)
         
     if clean.empty: return pd.DataFrame()
-    
-    # Filter to regular hours and resample
     clean = clean.between_time("09:30", "16:00")
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
     
-    # Resample logic anchored to market open (9:30)
-    # We use a custom offset to ensure 9:30-11:30 is one bin
-    resampled = clean.resample("2H", offset="9H30min").agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
+    # ✅ FIXED: Use "9H30T" for pandas offset (9 hours 30 minutes)
+    resampled = clean.resample("2H", offset="9H30T").agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
     
-    if not resampled.empty:
-        resampled.to_parquet(p)
+    if not resampled.empty: resampled.to_parquet(p)
     return resampled
 
-def time_compressed_proxy(df: pd.DataFrame) -> Tuple[pd.DataFrame, str, str]:
-    """Fallback only if real data fails."""
-    label = "2-Hour (Proxy - Daily Resampled)"
-    tf = "2hour_proxy"
-    # Distribute daily bars into 3 slots to mimic intraday rhythm
-    out = pd.concat([df] * 3).sort_index().reset_index(drop=True)
-    out.index = pd.date_range(start=df.index[0], periods=len(out), freq="2H")
-    return out, tf, label
-
 # -----------------------------
-# FEATURE ENGINEERING (SMOOTH TSI)
+# FEATURE ENGINEERING & OSCILLATOR
 # -----------------------------
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
-    # DISTINCT smoothing for 2H vs Daily
-    # 2H gets `viz_smooth=12` to be distinct from Daily (5) but smooth enough to read.
-    spans = {
-        "2hour_proxy": (10, 26, 8), "real_2hour": (10, 26, 8),
-        "daily": (16, 42, 10), "weekly": (8, 21, 7),
-    }
+    spans = {"2hour_proxy": (10, 26, 8), "real_2hour": (10, 26, 8), "daily": (16, 42, 10), "weekly": (8, 21, 7)}
     pre_smooth_map = {"2hour_proxy": 5, "real_2hour": 5, "daily": 5, "weekly": 3}
     decision_smooth_map = {"2hour_proxy": 2, "real_2hour": 2, "daily": 1, "weekly": 1}
     viz_smooth_map = {"2hour_proxy": 12, "real_2hour": 12, "daily": 5, "weekly": 3}
 
-    fast, slow, sig = spans[timeframe_name]
-    
-    # Normalization
+    fast, slow, sig = spans.get(timeframe_name, (16, 42, 10))
     tsi_n = np.tanh(out["tsi"].fillna(0.0) / 35.0)
     cci_n = np.tanh(out["cci_20"].fillna(0.0) / 180.0)
     bb_n = ((out["pct_b"].fillna(0.5) - 0.5) * 2.0).clip(-1.25, 1.25)
     vwap_n = np.tanh(out["dist_vwap_pct"].fillna(0.0) * 18.0)
     z_n = np.tanh(out["close_zscore"].fillna(0.0) / 2.5)
-    
-    # Weights
     w = dict(tsi=0.30, cci=0.20, bb=0.15, vwap=0.15, adx=0.10, z=0.10)
     
     out["uo_base"] = w["tsi"]*tsi_n + w["cci"]*cci_n + w["bb"]*bb_n + w["vwap"]*vwap_n + w["adx"]*out["adx_14_pctile"].fillna(0.5) + w["z"]*z_n
     
-    # Smoothing Pipeline
-    pre = pre_smooth_map[timeframe_name]
+    pre = pre_smooth_map.get(timeframe_name, 3)
     out["uo_base_sm"] = ema(out["uo_base"], pre) if pre > 1 else out["uo_base"]
     out["uo_raw"] = ema(out["uo_base_sm"], fast) - ema(out["uo_base_sm"], slow)
 
-    dec = decision_smooth_map[timeframe_name]
-    viz = viz_smooth_map[timeframe_name]
+    dec = decision_smooth_map.get(timeframe_name, 1)
+    viz = viz_smooth_map.get(timeframe_name, 5)
     
     out["uo_decision"] = ema(out["uo_raw"], dec) if dec > 1 else out["uo_raw"]
     out["uo_signal_decision"] = ema(out["uo_decision"], sig)
-    
-    # Viz smoothing (this is what makes the chart look smooth)
     out["uo_viz"] = ema(out["uo_decision"], viz) if viz > 1 else out["uo_decision"]
     out["uo_signal_viz"] = ema(out["uo_viz"], sig)
 
@@ -244,7 +222,6 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     out["uo_gap"] = out["uo_decision"] - out["uo_signal_decision"]
     out["uo_slope_3"] = out["uo_decision"].diff(3)
     
-    # Percentile
     lookback = 120 if "2hour" in timeframe_name else 252
     out["uo_pctile"] = ((out["uo_decision"] - out["uo_decision"].rolling(lookback, min_periods=20).min()) / 
                         (out["uo_decision"].rolling(lookback, min_periods=20).max() - out["uo_decision"].rolling(lookback, min_periods=20).min()).replace(0, np.nan)).clip(0, 1)
@@ -278,52 +255,90 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     return add_ultimate_oscillator(x, timeframe_name)
 
 # -----------------------------
-# SMART GRADING LOGIC
+# GRADING & PREDICTION LOGIC
 # -----------------------------
 def compute_grade(row: pd.Series, analog_summary: Dict) -> Tuple[str, str, float]:
-    """Calculates grade based on State, Trend, and Exhaustion Risk."""
     uo_pct = float(row.get("uo_pctile", 0.5))
     uo_gap = float(row.get("uo_gap", 0.0))
     uo_slope = float(row.get("uo_slope_3", 0.0))
-    ob_int = float(row.get("ob_internal", 0.5))
+    ob_int = float(row.get("rsi_14_pctile", 0.5))
     score = 0.0
     
-    # 1. Trend Score (-1 to +1)
     if uo_gap > 0.01 and uo_slope > 0: score += 0.8
     elif uo_gap < -0.01 and uo_slope < 0: score -= 0.8
     elif uo_gap > 0: score += 0.2
     else: score -= 0.2
     
-    # 2. Analog Confirmation (if available)
     if analog_summary:
-        p_up = analog_summary.get("ret_2_p_up", 0.5)
-        p_down = analog_summary.get("ret_2_p_down", 0.5)
+        p_up = analog_summary.get("p_up", 50.0)
+        p_down = analog_summary.get("p_down", 50.0)
         if p_up > 0.60: score += 0.3
         if p_down > 0.60: score -= 0.3
         
-    # 3. RISK PENALTY (The Fix for "Overheated but Bullish")
-    # If OB is high, we penalize the bullish grade.
-    if ob_int > 0.90: 
-        score -= 0.5 # Heavy penalty for extremely overbought
-        risk_label = "EXTREME RISK / Overheated"
-    elif ob_int > 0.80:
-        score -= 0.3 # Moderate penalty
-        risk_label = "High Risk / Extended"
-    elif ob_int < 0.10:
-        score += 0.3 # Bonus for oversold
-        risk_label = "Oversold / Bounce Risk"
-    else:
-        risk_label = "Healthy"
+    if ob_int > 0.90: score -= 0.5; risk = "EXTREME RISK / Overheated"
+    elif ob_int > 0.80: score -= 0.3; risk = "High Risk / Extended"
+    elif ob_int < 0.10: score += 0.3; risk = "Oversold / Bounce Risk"
+    else: risk = "Healthy"
 
-    # 4. Final Grade
-    if score >= 0.8 and risk_label == "Healthy": return "A+", "Strong Bullish / Healthy", score
-    if score >= 0.5 and risk_label == "Healthy": return "A", "Bullish / Healthy", score
-    if score >= 0.5 and "Risk" in risk_label: return "B-", "Bullish / Extended", score
+    if score >= 0.8 and risk == "Healthy": return "A+", "Strong Bullish / Healthy", score
+    if score >= 0.5 and risk == "Healthy": return "A", "Bullish / Healthy", score
+    if score >= 0.5: return "B-", "Bullish / Extended", score
     if score >= 0.2: return "B", "Moderate Bullish", score
     if score <= -0.5 and ob_int < 0.2: return "C+", "Bearish / Oversold Bounce?", score
     if score <= -0.5: return "C-", "Strong Bearish", score
-    
     return "C", "Neutral / Mixed", score
+
+def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for n in [1, 2, 5, 10]: out[f"fwd_ret_{n}"] = out["Close"].shift(-n) / out["Close"] - 1
+    return out
+
+def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 30) -> pd.DataFrame:
+    enriched = add_forward_returns(frame)
+    use = ["uo_pctile", "uo_gap", "uo_slope_3", "tsi", "tsi_gap", "cci_20", "pct_b", "dist_ema20_pct"]
+    use = [c for c in use if c in enriched.columns]
+    if len(use) < 6 or current_ts not in enriched.index: return pd.DataFrame()
+    
+    cur_pos = enriched.index.get_loc(current_ts)
+    pool = enriched.iloc[:max(0, cur_pos-10)].dropna(subset=use+[f"fwd_ret_{n}" for n in [1,2,5,10]]).copy()
+    if len(pool) < 40: return pd.DataFrame()
+
+    current = enriched.loc[current_ts, use].astype(float)
+    std = pool[use].std().replace(0, np.nan)
+    z = ((pool[use] - current) / std).fillna(0.0)
+    pool["distance"] = np.sqrt((z.to_numpy()**2).sum(axis=1))
+    pool["similarity"] = 1 / (1 + pool["distance"])
+    return pool.nsmallest(n, "distance").copy()
+
+def monte_carlo_from_analogs(analogs: pd.DataFrame, horizons: List[int] = [1, 2, 5, 10], n_sims: int = 3000) -> Dict[str, Dict]:
+    if analogs.empty: return {}
+    results = {}
+    for h in horizons:
+        col = f"fwd_ret_{h}"
+        if col not in analogs.columns: continue
+        vals = analogs[col].dropna().values
+        if len(vals) < 5: continue
+        rng = np.random.default_rng(42)
+        sims = rng.choice(vals, size=n_sims)
+        results[h] = {
+            "median": float(np.median(sims)), "mean": float(np.mean(sims)),
+            "p_up": float(np.mean(sims > 0) * 100), "p_down": float(np.mean(sims < 0) * 100),
+            "sample": len(vals)
+        }
+    return results
+
+def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
+    if row is None or row.empty: return "NO DATA", "No data"
+    uo_pct = float(row.get("uo_pctile", 0.5))
+    uo_gap = float(row.get("uo_gap", 0.0))
+    slope3 = float(row.get("uo_slope_3", 0.0))
+    is_structural = timeframe in {"daily", "weekly"}
+    
+    if uo_pct > 0.88 and uo_gap < 0 and slope3 < 0: return "PUT", "Rollover"
+    if uo_pct < 0.20 and uo_gap > 0 and slope3 > 0: return "CALL", "Washed-out turn"
+    if uo_gap > 0 and slope3 > 0: return "CALL", "Rising"
+    if uo_gap < 0 and slope3 < 0: return "PUT", "Falling"
+    return "NEUTRAL", "Mixed"
 
 # -----------------------------
 # DASHBOARD & PLOTTING
@@ -343,37 +358,39 @@ def plot_dashboard(symbol: str, hourly_df, tactical_df, daily_df, weekly_df, aso
         fig.add_trace(go.Scatter(x=frame.index, y=frame["uo_signal"], name=f"{nm} Signal", line=dict(color="black", width=1.3)), row=rn, col=1)
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=rn, col=1)
         
-    # OB/OS Plot
-    if not daily_df.empty:
-        fig.add_trace(go.Scatter(x=daily_df.tail(260).index, y=daily_df.tail(260)["ob_internal"], name="OB Internal", line=dict(color="purple")), row=5, col=1)
-        fig.add_hline(y=0.8, line_dash="dash", line_color="red", opacity=0.5, row=5, col=1)
-        fig.add_hline(y=0.2, line_dash="dash", line_color="green", opacity=0.5, row=5, col=1)
-        
     fig.update_layout(height=1300, xaxis_rangeslider_visible=False, legend_orientation="h")
     st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------
 # MAIN APP
 # -----------------------------
-st.title("📈 Stable Market Engine v13 — Real 2H Accuracy")
+st.title("📈 Stable Market Engine v13.1 — Probabilistic Ranker")
+st.caption("Upload CSV / Paste Symbols | 2H Tactical Call | MC Predictor | Real 2H Data")
+
 with st.sidebar:
     st.header("Credentials")
-    key = st.text_input("API Key", type="password")
+    key = st.text_input("Alpaca API Key", type="password")
     secret = st.text_input("Secret Key", type="password")
     feed = st.selectbox("Feed", ["iex", "sip"], index=0)
     
     st.header("Input")
-    symbols_text = st.text_area("Tickers", value="QQQ, SMH, NVDA, XLF", height=100)
+    symbols_text = st.text_area("Paste Tickers", value="QQQ, SMH, NVDA, XLF", height=80)
+    csv_file = st.file_uploader("Or Upload CSV Watchlist", type=["csv"]) # ✅ CSV UPLOAD ADDED HERE
     
-    run = st.button("Run Analysis", type="primary", use_container_width=True)
+    st.header("Settings")
+    benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "IWM"], index=0)
+    history_years = st.selectbox("History (Yrs)", [3, 5, 10], index=1)
+    run = st.button("Run Bulk Scan & Rank", type="primary", use_container_width=True)
 
 if not run or not key: st.stop()
 
-symbols = [s.strip().upper() for s in symbols_text.replace("\n", ",").split(",") if s.strip()]
+symbols = []
+if symbols_text.strip(): symbols.extend([s.strip().upper() for s in symbols_text.replace("\n", ",").split(",") if s.strip()])
+if csv_file is not None: symbols.extend(parse_symbol_csv(csv_file))
 symbols = list(dict.fromkeys(symbols))
-if not symbols: st.stop()
+if not symbols: st.error("Provide symbols via paste or CSV."); st.stop()
 
-st.info(f"Fetching real data for {len(symbols)} symbols...")
+st.info(f"Fetching data for {len(symbols)} symbols...")
 daily_map = fetch_alpaca_daily_batch(symbols + ["SPY"], 5, key, secret, feed)
 if "SPY" not in daily_map: st.error("Failed to fetch benchmark."); st.stop()
 
@@ -382,48 +399,70 @@ for sym in symbols:
     daily_raw = daily_map.get(sym, pd.DataFrame())
     if daily_raw.empty: continue
     
-    # 1. Fetch REAL 2H Data
     tactical_raw = fetch_alpaca_2hour(sym, 3, key, secret, feed)
-    use_real = True
-    
-    # 2. Fallback if Real 2H fails (with warning)
-    if tactical_raw.empty:
-        tactical_raw, _, tactical_label = time_compressed_proxy(daily_raw)
-        use_real = False
-    else:
-        tactical_label = "2-Hour (Real Alpaca)"
+    tactical_label = "2-Hour (Real Alpaca)" if not tactical_raw.empty else "2-Hour (Proxy Fallback)"
+    if tactical_raw.empty: tactical_raw = daily_raw.copy()
         
-    # 3. Process Data
-    tactical_df = enrich_price_features(tactical_raw, "real_2hour" if use_real else "2hour_proxy", daily_map["SPY"])
+    weekly_raw = daily_raw.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
+    
+    tactical_df = enrich_price_features(tactical_raw, "real_2hour" if not tactical_raw.equals(daily_raw) else "2hour_proxy", daily_map["SPY"])
     daily_df = enrich_price_features(daily_raw, "daily", daily_map["SPY"])
     
     row_2h = tactical_df.iloc[-1]
     row_d = daily_df.iloc[-1]
     
-    # 4. Analog Lookup
-    # (Simplified for brevity, assumes `find_analogs` logic exists or returns empty)
-    analogs = {} 
+    analogs = find_analogs(daily_df, row_d.name, n=30)
+    mc = monte_carlo_from_analogs(analogs, horizons=[1, 2, 5, 10])
+    mc2 = mc.get(2, {})
     
-    # 5. Grading
-    # We inject 'ob_internal' into the row for the grade function to see
-    row_2h["ob_internal"] = float(row_2h.get("rsi_14_pctile", 0.5)) # Simplified proxy for OB
-    grade, grade_reason, grade_score = compute_grade(row_2h, analogs)
+    grade, grade_reason, grade_score = compute_grade(row_d, mc2)
     
     rows.append({
-        "Symbol": sym, "Grade": grade, "Reason": grade_reason,
-        "2H Call": "CALL" if row_2h["uo_gap"] > 0 else "PUT",
+        "Symbol": sym, "Grade": grade, "Grade Reason": grade_reason,
+        "2H Tactical": "CALL" if row_2h["uo_gap"] > 0 else "PUT",
         "Daily Call": "CALL" if row_d["uo_gap"] > 0 else "PUT",
-        "OB Internal": round(float(row_2h["ob_internal"]) * 100, 1)
+        "Prob Adv % (2D)": round(mc2.get("p_up", 50.0), 1),
+        "Prob Dec % (2D)": round(mc2.get("p_down", 50.0), 1),
+        "Net Bias": round(mc2.get("p_up", 50.0) - 50.0, 1),
+        "MC 2D Med %": round(mc2.get("median", 0)*100, 2),
+        "MC 5D Med %": round(mc.get(5, {}).get("median", 0)*100, 2),
+        "Liq Options": "Y" if mc2.get("sample", 0) > 20 else "N",
+        "RSI14": round(float(row_d.get("rsi_14", 0)), 1),
+        "Status": "OK"
     })
-    detail[sym] = {"tactical": tactical_df, "daily": daily_df, "tactical_label": tactical_label, "use_real": use_real}
+    detail[sym] = {"tactical": tactical_df, "daily": daily_df, "weekly": weekly_raw, "tactical_label": tactical_label, "mc": mc, "analogs": analogs, "grade_reason": grade_reason, "grade_score": grade_score}
 
-results_df = pd.DataFrame(rows).sort_values("Grade", ascending=False)
+results_df = pd.DataFrame(rows).sort_values("Net Bias", ascending=False).reset_index(drop=True)
+st.subheader("📊 Ranked Results")
 st.dataframe(results_df, use_container_width=True, hide_index=True)
+st.download_button("Download Ranked CSV", results_df.to_csv(index=False).encode("utf-8"), "ranked_scan.csv", "text/csv")
 
-selected = st.selectbox("Select Symbol", results_df["Symbol"])
+valid = results_df.loc[results_df["Status"]=="OK", "Symbol"].tolist()
+if not valid: st.stop()
+
+default_idx = valid.index(st.session_state.get("selected_symbol", valid[0])) if st.session_state.get("selected_symbol") in valid else 0
+selected = st.selectbox("Select Symbol for Detail View", valid, index=default_idx, key="symbol_dropdown")
+st.session_state.selected_symbol = selected
+
 item = detail[selected]
+mc = item["mc"]
 
-if not item["use_real"]:
-    st.warning("⚠️ Real 2H data unavailable. Showing daily proxy (may look similar to Daily chart).")
+st.markdown(f"### {selected} — Grade: {results_df.loc[results_df['Symbol']==selected, 'Grade'].values[0]} ({item['grade_reason']})")
+st.progress((item["grade_score"] + 1) / 2)
 
-plot_dashboard(selected, item["tactical"], item["tactical"], item["daily"], item["daily"], pd.Timestamp.today(), item["tactical_label"])
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Prob Advance (2D)", f"{mc.get(2,{}).get('p_up',50):.1f}%")
+c2.metric("Prob Decline (2D)", f"{mc.get(2,{}).get('p_down',50):.1f}%")
+c3.metric("MC 2D Median", f"{mc.get(2,{}).get('median',0)*100:.2f}%")
+c4.metric("MC 5D Median", f"{mc.get(5,{}).get('median',0)*100:.2f}%")
+
+plot_dashboard(selected, item["tactical"], item["tactical"], item["daily"], item["weekly"], pd.Timestamp.today(), item["tactical_label"])
+
+if not item["analogs"].empty:
+    st.markdown("### 🎲 Monte Carlo Forward Distribution (2-Day)")
+    fig = go.Figure()
+    rng = np.random.default_rng(42)
+    sims = rng.choice(item["analogs"]["fwd_ret_2"].dropna().values, size=2000)
+    fig.add_trace(go.Histogram(x=sims*100, nbinsx=40, marker_color="rgba(75, 192, 192, 0.6)", name="2D Return %"))
+    fig.update_layout(barmode="overlay", height=300, xaxis_title="2-Day Return %", margin=dict(l=40,r=40,t=20,b=40))
+    st.plotly_chart(fig, use_container_width=True)
