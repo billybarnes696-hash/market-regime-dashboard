@@ -2,6 +2,7 @@
 """
 Stable Market Engine v13.3 - Simplified Working Version
 ✅ Direct 1-hour bars from Alpaca
+✅ Fixed: Using IEX feed (free tier) - CORRECTED
 ✅ Consistent oscillator calculations
 ✅ Clean signal generation
 ✅ Multi-timeframe (1H, Daily, Weekly)
@@ -14,7 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from pathlib import Path
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -34,45 +35,41 @@ st.set_page_config(page_title="Market Engine v13.3", layout="wide")
 # -----------------------------
 def calculate_oscillator(df: pd.DataFrame) -> pd.DataFrame:
     """Simple and reliable oscillator based on RSI, MACD, and Price Action"""
-    if df is None or df.empty or len(df) < 30:
+    if df.empty:
         return pd.DataFrame()
     
     df = df.copy()
     
-    # RSI with safe division
+    # RSI
     delta = df['Close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
-    
-    # Avoid division by zero
-    rs = gain / (loss.replace(0, np.nan))
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
-    df['rsi'] = df['rsi'].fillna(50)  # Default to neutral
     
     # Price vs Moving Average
     df['sma20'] = df['Close'].rolling(20).mean()
-    df['price_vs_sma'] = (df['Close'] / df['sma20'].replace(0, np.nan) - 1) * 100
-    df['price_vs_sma'] = df['price_vs_sma'].fillna(0)
+    df['price_vs_sma'] = (df['Close'] / df['sma20'] - 1) * 100
     
     # Rate of Change
     df['roc'] = df['Close'].pct_change(5) * 100
-    df['roc'] = df['roc'].fillna(0)
+    
+    # Volume trend
+    df['volume_sma'] = df['Volume'].rolling(20).mean()
+    df['volume_ratio'] = df['Volume'] / df['volume_sma']
     
     # Combined oscillator (normalized to -1 to 1 range)
     rsi_norm = (df['rsi'] - 50) / 50
-    roc_norm = df['roc'].clip(-10, 10) / 10
-    price_norm = df['price_vs_sma'].clip(-10, 10) / 10
+    roc_norm = np.clip(df['roc'] / 10, -1, 1)
+    price_norm = np.clip(df['price_vs_sma'] / 10, -1, 1)
     
-    df['oscillator'] = (rsi_norm * 0.5 + roc_norm * 0.3 + price_norm * 0.2).clip(-1, 1)
-    df['signal'] = df['oscillator'].ewm(span=5, adjust=False).mean()
+    df['oscillator'] = (rsi_norm * 0.5 + roc_norm * 0.3 + price_norm * 0.2)
+    df['signal'] = df['oscillator'].ewm(span=5).mean()
     df['gap'] = df['oscillator'] - df['signal']
     
-    # Forward returns for Monte Carlo (only if we have enough data)
+    # Forward returns for Monte Carlo
     for n in [1, 2, 5]:
-        if len(df) > n:
-            df[f'fwd_ret_{n}d'] = df['Close'].shift(-n) / df['Close'] - 1
-        else:
-            df[f'fwd_ret_{n}d'] = np.nan
+        df[f'fwd_ret_{n}d'] = df['Close'].shift(-n) / df['Close'] - 1
     
     return df
 
@@ -81,140 +78,155 @@ def calculate_oscillator(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_hourly_bars(symbol: str, months: int, key: str, secret: str) -> pd.DataFrame:
-    """Fetch 1-hour bars from Alpaca"""
+    """Fetch 1-hour bars from Alpaca using IEX feed"""
     cache_file = CACHE_DIR / f"{symbol}_hourly.parquet"
     
     # Check cache
     if cache_file.exists():
-        try:
-            age = pd.Timestamp.now() - pd.Timestamp(cache_file.stat().st_mtime, unit='s')
-            if age < pd.Timedelta(hours=4):
+        age = pd.Timestamp.now() - pd.Timestamp(cache_file.stat().st_mtime, unit='s')
+        if age < pd.Timedelta(hours=4):
+            try:
                 df = pd.read_parquet(cache_file)
                 if not df.empty:
                     return df
-        except:
-            pass
+            except:
+                pass
     
     try:
         client = StockHistoricalDataClient(key, secret)
-        end = pd.Timestamp.now(tz='UTC')
+        end = pd.Timestamp.now()
         start = end - pd.DateOffset(months=months)
         
+        # ✅ CORRECT WAY: Pass feed as parameter in the request
         request = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame(1, TimeFrameUnit.Hour),
             start=start,
             end=end,
-            adjustment='raw'
+            adjustment='raw',
+            feed='iex'  # Force IEX feed for free tier
         )
         
-        bars = client.get_stock_bars(request).df
+        bars = client.get_stock_bars(request)
         
-        if bars is None or bars.empty:
+        if bars.df is None or bars.df.empty:
+            st.warning(f"No hourly data for {symbol}")
             return pd.DataFrame()
         
+        df = bars.df
+        
         # Handle multi-index
-        if isinstance(bars.index, pd.MultiIndex) and symbol in bars.index.get_level_values(0):
-            df = bars.xs(symbol, level=0).copy()
-        else:
-            df = bars.copy()
+        if isinstance(df.index, pd.MultiIndex):
+            if symbol in df.index.get_level_values(0):
+                df = df.xs(symbol, level=0).copy()
+            else:
+                # Try to get first symbol
+                df = df.xs(df.index.get_level_values(0)[0], level=0).copy()
         
         # Clean up
         df = df.reset_index()
         if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
             df = df.set_index('timestamp')
+        elif df.index.name == 'timestamp':
+            df.index = pd.to_datetime(df.index)
         
-        # Keep only necessary columns
-        cols = ['open', 'high', 'low', 'close', 'volume']
-        df = df[[c for c in cols if c in df.columns]].copy()
+        # Keep only necessary columns (Alpaca uses lowercase)
+        df.columns = [col.lower() for col in df.columns]
+        df = df[['open', 'high', 'low', 'close', 'volume']]
         df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
         
-        # Filter market hours (naive timestamps)
-        if not df.empty:
-            df = df.between_time('09:30', '16:00')
+        # Filter market hours
+        df = df.between_time('09:30', '16:00')
         
-        # Handle NaN values safely
-        if not df.empty:
-            df = df.ffill().bfill()
-            df = df.dropna(subset=['Close'])
+        # Handle any NaN values
+        df = df.fillna(method='ffill').fillna(method='bfill')
         
-        # Cache if we have data
-        if not df.empty:
+        if not df.empty and len(df) > 10:
             df.to_parquet(cache_file)
-        
-        return df
+            return df
+        else:
+            return pd.DataFrame()
         
     except Exception as e:
-        st.warning(f"Error fetching hourly {symbol}: {str(e)[:100]}")
+        st.warning(f"Error fetching hourly {symbol}: {str(e)[:150]}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_daily_bars(symbols: List[str], years: int, key: str, secret: str) -> Dict[str, pd.DataFrame]:
-    """Fetch daily bars for multiple symbols"""
+    """Fetch daily bars for multiple symbols using IEX feed"""
     result = {}
     
     for symbol in symbols:
         cache_file = CACHE_DIR / f"{symbol}_daily.parquet"
         
-        # Check cache
         if cache_file.exists():
-            try:
-                age = pd.Timestamp.now() - pd.Timestamp(cache_file.stat().st_mtime, unit='s')
-                if age < pd.Timedelta(hours=12):
+            age = pd.Timestamp.now() - pd.Timestamp(cache_file.stat().st_mtime, unit='s')
+            if age < pd.Timedelta(hours=12):
+                try:
                     df = pd.read_parquet(cache_file)
                     if not df.empty:
                         result[symbol] = df
                         continue
-            except:
-                pass
+                except:
+                    pass
         
         try:
             client = StockHistoricalDataClient(key, secret)
-            end = pd.Timestamp.now(tz='UTC')
+            end = pd.Timestamp.now()
             start = end - pd.DateOffset(years=years)
             
+            # ✅ CORRECT WAY: Pass feed as parameter in the request
             request = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Day,
                 start=start,
                 end=end,
-                adjustment='raw'
+                adjustment='raw',
+                feed='iex'  # Force IEX feed for free tier
             )
             
-            bars = client.get_stock_bars(request).df
+            bars = client.get_stock_bars(request)
             
-            if bars is None or bars.empty:
+            if bars.df is None or bars.df.empty:
+                st.warning(f"No daily data for {symbol}")
                 result[symbol] = pd.DataFrame()
                 continue
             
-            # Handle multi-index
-            if isinstance(bars.index, pd.MultiIndex) and symbol in bars.index.get_level_values(0):
-                df = bars.xs(symbol, level=0).copy()
-            else:
-                df = bars.copy()
+            df = bars.df
             
+            # Handle multi-index
+            if isinstance(df.index, pd.MultiIndex):
+                if symbol in df.index.get_level_values(0):
+                    df = df.xs(symbol, level=0).copy()
+                else:
+                    # Try to get first symbol if exact match not found
+                    df = df.xs(df.index.get_level_values(0)[0], level=0).copy()
+            
+            # Clean up
             df = df.reset_index()
             if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df = df.set_index('timestamp')
+            elif df.index.name == 'timestamp':
+                df.index = pd.to_datetime(df.index)
             
-            cols = ['open', 'high', 'low', 'close', 'volume']
-            df = df[[c for c in cols if c in df.columns]].copy()
+            # Keep only necessary columns
+            df.columns = [col.lower() for col in df.columns]
+            df = df[['open', 'high', 'low', 'close', 'volume']]
             df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
             
             # Handle NaN values
-            if not df.empty:
-                df = df.ffill().bfill()
-                df = df.dropna(subset=['Close'])
+            df = df.fillna(method='ffill').fillna(method='bfill')
             
-            if not df.empty:
+            if not df.empty and len(df) > 20:
                 df.to_parquet(cache_file)
-            
-            result[symbol] = df
+                result[symbol] = df
+            else:
+                result[symbol] = pd.DataFrame()
             
         except Exception as e:
-            st.warning(f"Error fetching daily {symbol}: {str(e)[:100]}")
+            st.warning(f"Error fetching daily {symbol}: {str(e)[:150]}")
             result[symbol] = pd.DataFrame()
     
     return result
@@ -222,17 +234,17 @@ def fetch_daily_bars(symbols: List[str], years: int, key: str, secret: str) -> D
 # -----------------------------
 # SIGNAL GENERATION
 # -----------------------------
-def get_signal(row: Optional[pd.Series]) -> Tuple[str, float]:
+def get_signal(row) -> Tuple[str, float]:
     """Generate signal based on oscillator"""
-    if row is None or pd.isna(row.get('oscillator', np.nan)):
-        return "NEUTRAL", 0.0
+    if row is None or pd.isna(row.get('oscillator', 0)):
+        return "NEUTRAL", 0
     
-    osc = float(row.get('oscillator', 0))
-    gap = float(row.get('gap', 0))
+    osc = row.get('oscillator', 0)
+    gap = row.get('gap', 0)
     
-    if osc > 0.3 and gap > 0.05:
+    if osc > 0.3 and gap > 0:
         return "CALL", osc
-    elif osc < -0.3 and gap < -0.05:
+    elif osc < -0.3 and gap < 0:
         return "PUT", osc
     elif osc > 0.1:
         return "WEAK CALL", osc
@@ -263,25 +275,19 @@ def compute_grade(daily_strength: float, rsi: float) -> Tuple[str, str]:
 # MONTE CARLO SIMULATION
 # -----------------------------
 def monte_carlo_from_history(df: pd.DataFrame, horizon_days: int = 2, n_sims: int = 1000) -> Dict:
-    """Monte Carlo simulation using actual historical forward returns"""
-    if df is None or df.empty or len(df) < horizon_days + 20:
-        return {'p_up': 50.0, 'p_down': 50.0, 'median': 0.0, 'mean': 0.0}
+    """Simple Monte Carlo simulation based on historical returns"""
+    if df.empty or len(df) < 50:
+        return {'p_up': 50, 'p_down': 50, 'median': 0, 'mean': 0}
     
-    # Calculate actual forward returns
-    returns = []
-    for i in range(len(df) - horizon_days):
-        ret = df['Close'].iloc[i + horizon_days] / df['Close'].iloc[i] - 1
-        if np.isfinite(ret):
-            returns.append(ret)
+    returns = df['Close'].pct_change(horizon_days).dropna()
     
-    if len(returns) < 20:
-        return {'p_up': 50.0, 'p_down': 50.0, 'median': 0.0, 'mean': 0.0}
-    
-    returns = np.array(returns)
+    if len(returns) < 10:
+        return {'p_up': 50, 'p_down': 50, 'median': 0, 'mean': 0}
     
     # Bootstrap sampling
     np.random.seed(42)
-    sim_returns = np.random.choice(returns, size=n_sims, replace=True)
+    samples = np.random.choice(returns.values, size=(n_sims, len(returns)), replace=True)
+    sim_returns = samples.mean(axis=1)
     
     return {
         'p_up': float((sim_returns > 0).mean() * 100),
@@ -294,16 +300,17 @@ def monte_carlo_from_history(df: pd.DataFrame, horizon_days: int = 2, n_sims: in
 # MAIN APP
 # -----------------------------
 st.title("📈 Market Engine v13.3 - Multi-Timeframe Oscillator")
-st.caption("1-Hour, Daily, and Weekly signals from consistent oscillator | Monte Carlo predictions")
+st.caption("1-Hour, Daily, and Weekly signals from consistent oscillator | Monte Carlo predictions | IEX Data Feed")
 
 with st.sidebar:
     st.header("🔑 Alpaca Credentials")
     api_key = st.text_input("API Key", type="password")
     secret_key = st.text_input("Secret Key", type="password")
-    feed = st.selectbox("Data Feed", ["iex", "sip"], index=0, help="IEX is free, SIP requires premium")
+    
+    st.info("Using IEX data feed (free tier) - No subscription needed")
     
     st.header("📊 Symbol Input")
-    symbols_text = st.text_area("Enter symbols (comma separated)", "QQQ, SMH, NVDA, XLF", height=100)
+    symbols_text = st.text_area("Enter symbols (comma separated)", "QQQ,SMH,NVDA,XLF", height=100)
     csv_file = st.file_uploader("Or upload CSV with symbols", type=['csv'])
     
     st.header("⚙️ Settings")
@@ -325,8 +332,8 @@ if csv_file is not None:
             symbols.extend([s.strip().upper() for s in df_csv['ticker'].dropna().tolist()])
         else:
             symbols.extend([str(s).strip().upper() for s in df_csv.iloc[:, 0].dropna().tolist()])
-    except Exception as e:
-        st.error(f"Error parsing CSV file: {e}")
+    except:
+        st.error("Error parsing CSV file")
 
 symbols = list(dict.fromkeys(symbols))  # Remove duplicates
 
@@ -343,7 +350,7 @@ if not symbols:
     st.stop()
 
 # Fetch data
-with st.spinner(f"📡 Fetching market data for {len(symbols)} symbols..."):
+with st.spinner(f"📡 Fetching market data for {len(symbols)} symbols using IEX feed..."):
     # Add benchmark
     all_symbols = list(set(symbols + ['SPY']))
     daily_data = fetch_daily_bars(all_symbols, lookback_years, api_key, secret_key)
@@ -372,7 +379,7 @@ for sym in symbols:
     daily_osc = calculate_oscillator(daily)
     
     # Weekly from daily
-    if not daily.empty and len(daily) >= 5:
+    if not daily.empty:
         weekly = daily.resample('W-FRI').agg({
             'Open': 'first',
             'High': 'max', 
@@ -384,36 +391,38 @@ for sym in symbols:
     else:
         weekly_osc = pd.DataFrame()
     
-    # Get latest signals with safety checks
-    hourly_signal, hourly_strength = "NO DATA", 0.0
-    if not hourly_osc.empty and len(hourly_osc) > 0:
+    # Get latest signals
+    if len(hourly_osc) > 0:
         last_hourly = hourly_osc.iloc[-1]
         hourly_signal, hourly_strength = get_signal(last_hourly)
+    else:
+        hourly_signal, hourly_strength = "NO DATA", 0
     
-    daily_signal, daily_strength = "NO DATA", 0.0
-    daily_rsi = 50.0
-    mc_2d = {'p_up': 50.0, 'p_down': 50.0, 'median': 0.0}
-    mc_5d = {'p_up': 50.0, 'p_down': 50.0, 'median': 0.0}
-    
-    if not daily_osc.empty and len(daily_osc) > 0:
+    if len(daily_osc) > 0:
         last_daily = daily_osc.iloc[-1]
         daily_signal, daily_strength = get_signal(last_daily)
-        daily_rsi = float(last_daily.get('rsi', 50))
+        daily_rsi = last_daily.get('rsi', 50)
         
         # Monte Carlo prediction
         mc_2d = monte_carlo_from_history(daily_osc, 2)
         mc_5d = monte_carlo_from_history(daily_osc, 5)
+    else:
+        daily_signal, daily_strength = "NO DATA", 0
+        daily_rsi = 50
+        mc_2d = {'p_up': 50, 'p_down': 50, 'median': 0}
+        mc_5d = {'p_up': 50, 'p_down': 50, 'median': 0}
     
-    weekly_signal, weekly_strength = "NO DATA", 0.0
-    if not weekly_osc.empty and len(weekly_osc) > 0:
+    if len(weekly_osc) > 0:
         last_weekly = weekly_osc.iloc[-1]
         weekly_signal, weekly_strength = get_signal(last_weekly)
+    else:
+        weekly_signal, weekly_strength = "NO DATA", 0
     
     # Compute grade
     grade, grade_reason = compute_grade(daily_strength, daily_rsi)
     
     # Net bias (probability advantage)
-    net_bias = mc_2d.get('p_up', 50.0) - 50.0
+    net_bias = mc_2d.get('p_up', 50) - 50
     
     results.append({
         'Symbol': sym,
@@ -424,8 +433,8 @@ for sym in symbols:
         'Weekly Signal': weekly_signal,
         'RSI (Daily)': round(daily_rsi, 1),
         'Oscillator': round(daily_strength, 2),
-        'Prob Up 2D %': round(mc_2d.get('p_up', 50.0), 1),
-        'Prob Down 2D %': round(mc_2d.get('p_down', 50.0), 1),
+        'Prob Up 2D %': round(mc_2d.get('p_up', 50), 1),
+        'Prob Down 2D %': round(mc_2d.get('p_down', 50), 1),
         'Net Bias %': round(net_bias, 1),
         'MC 2D Med %': round(mc_2d.get('median', 0) * 100, 2),
         'MC 5D Med %': round(mc_5d.get('median', 0) * 100, 2),
@@ -483,28 +492,27 @@ if results:
             )
             
             # Price chart (daily)
-            if len(daily) >= 90:
-                daily_last_90 = daily.tail(90)
-                fig.add_trace(
-                    go.Candlestick(
-                        x=daily_last_90.index,
-                        open=daily_last_90['Open'],
-                        high=daily_last_90['High'],
-                        low=daily_last_90['Low'],
-                        close=daily_last_90['Close'],
-                        name="Price",
-                        showlegend=False
-                    ),
-                    row=1, col=1
-                )
+            daily_last_90 = daily.tail(90)
+            fig.add_trace(
+                go.Candlestick(
+                    x=daily_last_90.index,
+                    open=daily_last_90['Open'],
+                    high=daily_last_90['High'],
+                    low=daily_last_90['Low'],
+                    close=daily_last_90['Close'],
+                    name="Price",
+                    showlegend=False
+                ),
+                row=1, col=1
+            )
             
             # 1-Hour oscillator
-            if not hourly.empty and len(hourly) >= 50:
-                hourly_last = hourly.tail(200)
+            if not hourly.empty:
+                hourly_last_200 = hourly.tail(200)
                 fig.add_trace(
                     go.Scatter(
-                        x=hourly_last.index,
-                        y=hourly_last['oscillator'],
+                        x=hourly_last_200.index,
+                        y=hourly_last_200['oscillator'],
                         name="Oscillator",
                         line=dict(color='#2196F3', width=2)
                     ),
@@ -512,8 +520,8 @@ if results:
                 )
                 fig.add_trace(
                     go.Scatter(
-                        x=hourly_last.index,
-                        y=hourly_last['signal'],
+                        x=hourly_last_200.index,
+                        y=hourly_last_200['signal'],
                         name="Signal",
                         line=dict(color='#FF5722', width=1.5, dash='dash')
                     ),
@@ -521,12 +529,12 @@ if results:
                 )
             
             # Daily oscillator
-            if not daily.empty and len(daily) >= 50:
-                daily_last = daily.tail(200)
+            if not daily.empty:
+                daily_last_200 = daily.tail(200)
                 fig.add_trace(
                     go.Scatter(
-                        x=daily_last.index,
-                        y=daily_last['oscillator'],
+                        x=daily_last_200.index,
+                        y=daily_last_200['oscillator'],
                         name="Oscillator",
                         line=dict(color='#2196F3', width=2)
                     ),
@@ -534,8 +542,8 @@ if results:
                 )
                 fig.add_trace(
                     go.Scatter(
-                        x=daily_last.index,
-                        y=daily_last['signal'],
+                        x=daily_last_200.index,
+                        y=daily_last_200['signal'],
                         name="Signal",
                         line=dict(color='#FF5722', width=1.5, dash='dash')
                     ),
@@ -543,12 +551,12 @@ if results:
                 )
             
             # Weekly oscillator
-            if not weekly.empty and len(weekly) >= 30:
-                weekly_last = weekly.tail(100)
+            if not weekly.empty:
+                weekly_last_100 = weekly.tail(100)
                 fig.add_trace(
                     go.Scatter(
-                        x=weekly_last.index,
-                        y=weekly_last['oscillator'],
+                        x=weekly_last_100.index,
+                        y=weekly_last_100['oscillator'],
                         name="Oscillator",
                         line=dict(color='#2196F3', width=2)
                     ),
@@ -556,8 +564,8 @@ if results:
                 )
                 fig.add_trace(
                     go.Scatter(
-                        x=weekly_last.index,
-                        y=weekly_last['signal'],
+                        x=weekly_last_100.index,
+                        y=weekly_last_100['signal'],
                         name="Signal",
                         line=dict(color='#FF5722', width=1.5, dash='dash')
                     ),
@@ -597,10 +605,13 @@ if results:
             
             # Recent signals table
             st.markdown("#### Recent Daily Signals")
-            if not daily.empty and len(daily) >= 10:
+            if not daily.empty:
                 recent = daily.tail(10)[['oscillator', 'signal', 'rsi']].round(2)
                 recent.columns = ['Oscillator', 'Signal', 'RSI']
                 st.dataframe(recent, use_container_width=True)
 
 else:
-    st.error("❌ No data available for the selected symbols. Please check your API credentials and symbol list.")
+    st.error("❌ No data available for the selected symbols. Please check:")
+    st.error("1. Your Alpaca API credentials are correct")
+    st.error("2. You have an active Alpaca account (free tier works)")
+    st.error("3. The symbols exist and have trading data")
