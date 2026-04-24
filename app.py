@@ -5,6 +5,7 @@ Stable Market Engine v13 — Probabilistic Ranker & MC Predictor
 ✅ Rank by Advance/Decline Probability
 ✅ Monte Carlo Forward-Return Predictor (1D, 2D, 5D, 10D)
 ✅ Smooth TSI Oscillator + Real Alpaca Data + Analog Engine
+✅ FIXED: Dictionary key matching & trailing space errors
 """
 
 from __future__ import annotations
@@ -41,6 +42,9 @@ st.set_page_config(
 # -----------------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
+
+def smooth_component(series: pd.Series, span: int) -> pd.Series:
+    return ema(series, span) if span and span > 1 else series
 
 def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
@@ -134,83 +138,115 @@ def is_fresh(path: Path, max_hours: int = 18) -> bool:
     if not path.exists(): return False
     return (pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")) < pd.Timedelta(hours=max_hours)
 
+def parse_symbol_csv(uploaded) -> List[str]:
+    if uploaded is None: return []
+    try:
+        df = pd.read_csv(io.BytesIO(uploaded.getvalue()))
+        cols = {str(c).strip().lower(): c for c in df.columns}
+        sym_col = cols.get("symbol") or cols.get("ticker") or next(iter(df.columns), None)
+        return [str(x).strip().upper() for x in df[sym_col].dropna().tolist() if str(x).strip()]
+    except: return []
+
+def clean_symbols(text: str, uploaded_symbols: List[str]) -> List[str]:
+    symbols = []
+    if text.strip(): symbols.extend([s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()])
+    symbols.extend(uploaded_symbols)
+    return list(dict.fromkeys([s for s in symbols if s]))
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: str, feed: str) -> Dict[str, pd.DataFrame]:
     if not symbols or not key or not secret: return {}
     client = StockHistoricalDataClient(key, secret)
-    data_map = {}
-    missing = [s for s in symbols if not is_fresh(cache_path(s, "daily"))]
-    if not missing:
-        for s in symbols:
-            try: data_map[s] = pd.read_parquet(cache_path(s, "daily"))
+    data_map, missing = {}, []
+    for s in symbols:
+        p = cache_path(s, "daily")
+        if is_fresh(p):
+            try: data_map[s] = pd.read_parquet(p); continue
             except: pass
-        return data_map
-
+        missing.append(s)
+    if not missing: return data_map
+    
     start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(years=max(years, 5))).normalize().tz_localize(None)
     end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
     req = StockBarsRequest(symbol_or_symbols=missing, timeframe=TimeFrame.Day, start=start, end=end, adjustment="raw", feed=feed)
-    try:
-        raw = client.get_stock_bars(req).df
+    try: raw = client.get_stock_bars(req).df
     except: return data_map
-
+    
     for s in missing:
         try:
             sub = raw.xs(s, level=0) if isinstance(raw.index, pd.MultiIndex) else raw
             clean = normalize_ohlcv(sub)
-            if not clean.empty:
-                clean.to_parquet(cache_path(s, "daily"))
-                data_map[s] = clean
+            if not clean.empty: clean.to_parquet(cache_path(s, "daily")); data_map[s] = clean
         except: pass
     return data_map
 
 def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, str, str]:
-    label = "2-Hour Proxy" if target == "2hour_proxy" else "Hourly Proxy"
-    tf = "2hour_proxy" if target == "2hour_proxy" else "hourly_proxy"
-    return df.copy(), tf, label
+    target = str(target).strip()
+    out = df.copy()
+    if target == "2hour_proxy":
+        label, timeframe_name = "2-Hour Proxy", "2hour_proxy"
+    else:
+        label, timeframe_name = "Hourly Proxy", "hourly_proxy"
+    return out, timeframe_name, label
 
 # -----------------------------
 # FEATURE ENGINEERING (SMOOTH TSI)
 # -----------------------------
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
+    timeframe_name = str(timeframe_name).strip()
+    
     spans = {
         "proxy_smooth_1hour": (8, 21, 7), "real_1hour": (8, 21, 7),
         "proxy_smooth_2hour": (10, 26, 8), "real_2hour": (10, 26, 8),
-        "daily": (16, 42, 10), "weekly": (8, 21, 7)
+        "hourly_proxy": (8, 21, 7), "2hour_proxy": (10, 26, 8),
+        "daily": (16, 42, 10), "weekly": (8, 21, 7),
     }
     pre_smooth_map = {
         "proxy_smooth_1hour": 4, "real_1hour": 3,
         "proxy_smooth_2hour": 5, "real_2hour": 4,
-        "daily": 5, "weekly": 3
+        "hourly_proxy": 4, "2hour_proxy": 5,
+        "daily": 5, "weekly": 3,
     }
     decision_smooth_map = {
         "proxy_smooth_1hour": 2, "real_1hour": 1,
         "proxy_smooth_2hour": 2, "real_2hour": 1,
-        "daily": 1, "weekly": 1
+        "hourly_proxy": 2, "2hour_proxy": 2,
+        "daily": 1, "weekly": 1,
     }
     viz_smooth_map = {
         "proxy_smooth_1hour": 21, "real_1hour": 13,
         "proxy_smooth_2hour": 18, "real_2hour": 10,
-        "daily": 5, "weekly": 3
+        "hourly_proxy": 21, "2hour_proxy": 18,
+        "daily": 5, "weekly": 3,
     }
 
-    fast, slow, sig = spans[timeframe_name]
+    fast, slow, sig = spans.get(timeframe_name, (16, 42, 10))
+    
     tsi_n = np.tanh(out["tsi"].fillna(0.0) / 35.0)
     cci_n = np.tanh(out["cci_20"].fillna(0.0) / 180.0)
     bb_n = ((out["pct_b"].fillna(0.5) - 0.5) * 2.0).clip(-1.25, 1.25)
     vwap_n = np.tanh(out["dist_vwap_pct"].fillna(0.0) * 18.0)
     z_n = np.tanh(out["close_zscore"].fillna(0.0) / 2.5)
-    adx_dir = np.sign(out["tsi_gap"].fillna(0.0) + out["uo_seed_dir"].fillna(0.0))
+    adx_dir = np.sign(out["tsi_gap"].fillna(0.0) + out.get("uo_seed_dir", pd.Series(0, index=out.index)).fillna(0.0))
     adx_n = (((out["adx_14"].fillna(18.0) - 18.0) / 22.0).clip(-1.0, 1.0)) * adx_dir.replace(0, 1)
 
-    w = dict(tsi=0.31, cci=0.22, bb=0.14, vwap=0.15, adx=0.10, z=0.08) if "hour" in timeframe_name or "2hour" in timeframe_name else dict(tsi=0.34, cci=0.18, bb=0.16, vwap=0.06, adx=0.14, z=0.12)
+    w = dict(tsi=0.31, cci=0.22, bb=0.14, vwap=0.15, adx=0.10, z=0.08) if "hour" in timeframe_name or "2hour" in timeframe_name else dict(tsi=0.32, cci=0.20, bb=0.16, vwap=0.08, adx=0.12, z=0.12)
     
     out["uo_base"] = w["tsi"]*tsi_n + w["cci"]*cci_n + w["bb"]*bb_n + w["vwap"]*vwap_n + w["adx"]*adx_n + w["z"]*z_n
-    out["uo_base_sm"] = ema(out["uo_base"], pre_smooth_map[timeframe_name]) if pre_smooth_map[timeframe_name] > 1 else out["uo_base"]
+    if "hour" in timeframe_name or "2hour" in timeframe_name:
+        pin = 0.12 * out.get("pinning_up_flag", pd.Series(0, index=out.index)).fillna(0.0) - 0.12 * out.get("pinning_down_flag", pd.Series(0, index=out.index)).fillna(0.0)
+        out["uo_base"] = out["uo_base"] - pin
+
+    pre = pre_smooth_map.get(timeframe_name, 3)
+    out["uo_base_sm"] = ema(out["uo_base"], pre) if pre > 1 else out["uo_base"]
     out["uo_raw"] = ema(out["uo_base_sm"], fast) - ema(out["uo_base_sm"], slow)
 
-    out["uo_decision"] = ema(out["uo_raw"], decision_smooth_map[timeframe_name]) if decision_smooth_map[timeframe_name] > 1 else out["uo_raw"]
+    dec = decision_smooth_map.get(timeframe_name, 1)
+    viz = viz_smooth_map.get(timeframe_name, 5)
+    
+    out["uo_decision"] = ema(out["uo_raw"], dec) if dec > 1 else out["uo_raw"]
     out["uo_signal_decision"] = ema(out["uo_decision"], sig)
-    out["uo_viz"] = ema(out["uo_decision"], viz_smooth_map[timeframe_name])
+    out["uo_viz"] = ema(out["uo_decision"], viz) if viz > 1 else out["uo_decision"]
     out["uo_signal_viz"] = ema(out["uo_viz"], sig)
 
     out["uo"] = out["uo_viz"]
@@ -218,12 +254,15 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     out["uo_gap"] = out["uo_decision"] - out["uo_signal_decision"]
     out["uo_slope_1"] = out["uo_decision"].diff(1)
     out["uo_slope_3"] = out["uo_decision"].diff(3)
-    out["uo_pctile"] = hybrid_normalize(out["uo_decision"], 120 if "hour" in timeframe_name or "2hour" in timeframe_name else 252)
+    
+    lookback = 120 if "hour" in timeframe_name or "2hour" in timeframe_name else 252
+    out["uo_pctile"] = hybrid_normalize(out["uo_decision"], lookback)
     out["uo_above_signal_2"] = (out["uo_decision"] > out["uo_signal_decision"]).rolling(2, min_periods=2).sum() == 2
     out["uo_below_signal_2"] = (out["uo_decision"] < out["uo_signal_decision"]).rolling(2, min_periods=2).sum() == 2
     return out
 
 def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    timeframe_name = str(timeframe_name).strip()
     if df.empty: return df.copy()
     x = df.copy()
     x["ema_10"], x["ema_20"], x["sma_50"] = ema(x["Close"], 10), ema(x["Close"], 20), sma(x["Close"], 50)
@@ -234,21 +273,22 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     x["tsi_gap"] = x["tsi"] - x["tsi_signal"]
     x["pct_b"] = bollinger_pct_b(x["Close"], 20, 2)
     x["adx_14"] = adx(x, 14)
-    x["vwap"] = rolling_vwap(x, 20)
     x["dist_ema20_pct"] = (x["Close"] / x["ema_20"]) - 1
+    x["vwap"] = rolling_vwap(x, 8 if "1hour" in timeframe_name else 12 if "2hour" in timeframe_name else 20)
     x["dist_vwap_pct"] = (x["Close"] / x["vwap"]) - 1
     x["close_zscore"] = (x["Close"] - x["Close"].rolling(252).mean()) / x["Close"].rolling(252).std()
     
     if benchmark_df is not None and not benchmark_df.empty:
         aligned = benchmark_df["Close"].reindex(x.index).ffill()
         x["rs_bench_slope_5"] = slope(x["Close"] / aligned, 5)
-    else:
-        x["rs_bench_slope_5"] = 0.0
+    else: x["rs_bench_slope_5"] = 0.0
 
     x["uo_seed_dir"] = np.tanh(slope(x["Close"], 3).fillna(0.0) * 20.0)
+    x["pinning_up_flag"] = pd.Series(0.0, index=x.index)
+    x["pinning_down_flag"] = pd.Series(0.0, index=x.index)
+    
     for col in ["rsi_14", "cci_20", "tsi", "pct_b", "adx_14", "dist_ema20_pct", "dist_vwap_pct", "close_zscore"]:
-        if col in x.columns:
-            x[f"{col}_pctile"] = hybrid_normalize(x[col], 252)
+        if col in x.columns: x[f"{col}_pctile"] = hybrid_normalize(x[col], 120 if "hour" in timeframe_name or "2hour" in timeframe_name else 252)
     return add_ultimate_oscillator(x, timeframe_name)
 
 # -----------------------------
@@ -287,12 +327,9 @@ def monte_carlo_from_analogs(analogs: pd.DataFrame, horizons: List[int] = [1, 2,
         rng = np.random.default_rng(42)
         sims = rng.choice(vals, size=n_sims)
         results[h] = {
-            "median": float(np.median(sims)),
-            "mean": float(np.mean(sims)),
-            "p_up": float(np.mean(sims > 0) * 100),
-            "p_down": float(np.mean(sims < 0) * 100),
-            "pct_10": float(np.percentile(sims, 10)),
-            "pct_90": float(np.percentile(sims, 90)),
+            "median": float(np.median(sims)), "mean": float(np.mean(sims)),
+            "p_up": float(np.mean(sims > 0) * 100), "p_down": float(np.mean(sims < 0) * 100),
+            "pct_10": float(np.percentile(sims, 10)), "pct_90": float(np.percentile(sims, 90)),
             "sample": len(vals)
         }
     return results
@@ -305,10 +342,11 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     uo_pct = float(row.get("uo_pctile", 0.5))
     uo_gap = float(row.get("uo_gap", 0.0))
     slope3 = float(row.get("uo_slope_3", 0.0))
-    is_tactical = "hour" in timeframe or "2hour" in timeframe
-    is_structural = timeframe in {"daily", "weekly"}
+    rsi_val = float(row.get("rsi_14", 50.0))
+    is_tactical = "hour" in str(timeframe) or "2hour" in str(timeframe)
+    is_structural = str(timeframe) in {"daily", "weekly"}
 
-    if is_tactical and uo_pct > 0.88 and uo_gap < 0 and slope3 < 0:
+    if is_tactical and uo_pct > 0.88 and uo_gap < 0 and slope3 < 0 and rsi_val > 68:
         return "PUT", "Tactical rollover"
     if is_tactical and uo_pct > 0.75 and uo_gap > 0 and slope3 >= 0:
         return "CALL", "Tactical momentum"
@@ -365,10 +403,8 @@ if not run_analysis or not alpaca_key or not alpaca_secret:
     if not alpaca_key: st.warning("Enter Alpaca credentials.")
     st.stop()
 
-# Parse symbols
 symbols = []
-if symbols_text.strip():
-    symbols.extend([s.strip().upper() for s in symbols_text.replace("\n", ",").split(",") if s.strip()])
+if symbols_text.strip(): symbols.extend([s.strip().upper() for s in symbols_text.replace("\n", ",").split(",") if s.strip()])
 if csv_file:
     try:
         df = pd.read_csv(csv_file)
@@ -378,15 +414,13 @@ if csv_file:
 symbols = list(dict.fromkeys(symbols))
 if not symbols: st.error("Provide symbols via paste or CSV."); st.stop()
 
-# Fetch Data
 st.info(f"Fetching daily data for {len(symbols)} symbols...")
 daily_map = fetch_alpaca_daily_batch(list(set(symbols + [benchmark])), history_years, alpaca_key, alpaca_secret, feed)
 if benchmark not in daily_map or daily_map[benchmark].empty:
     st.error(f"Failed to fetch {benchmark}."); st.stop()
 bench = daily_map[benchmark]
 
-rows = []
-detail = {}
+rows, detail = [], {}
 progress = st.progress(0.0)
 
 for i, sym in enumerate(symbols):
@@ -396,7 +430,6 @@ for i, sym in enumerate(symbols):
         rows.append({"Symbol": sym, "Status": "No Data"})
         continue
         
-    # Create tactical proxy (smooth) & real daily
     tactical_raw, tactical_tf, tactical_label = time_compressed_proxy(daily_raw, "2hour_proxy")
     weekly_raw = daily_raw.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
     
@@ -412,31 +445,22 @@ for i, sym in enumerate(symbols):
     d_call, _ = classify_timeframe_call(daily_row, "daily")
     w_call, _ = classify_timeframe_call(weekly_row, "weekly")
     
-    # Analogs & MC
     analogs = find_analogs(daily_df, daily_row.name, n=30)
     mc = monte_carlo_from_analogs(analogs, horizons=[1, 2, 5, 10], n_sims=3000)
     mc2 = mc.get(2, {})
     mc5 = mc.get(5, {})
     
-    # Probabilities & Ranking Score
     adv_prob = mc2.get("p_up", 50.0)
     dec_prob = mc2.get("p_down", 50.0)
     net_bias = adv_prob - 50.0
     
     rows.append({
-        "Symbol": sym,
-        "Price": round(float(daily_row.get("Close", np.nan)), 2),
-        "Daily Call": d_call,
-        "Tactical Call": t_call,
-        "Weekly Call": w_call,
-        "Prob Advance % (2D)": round(adv_prob, 1),
-        "Prob Decline % (2D)": round(dec_prob, 1),
-        "Net Bias Score": round(net_bias, 1),
-        "MC 2D Median %": round(mc2.get("median", 0)*100, 2),
-        "MC 5D Median %": round(mc5.get("median", 0)*100, 2),
-        "MC Sample": mc2.get("sample", 0),
-        "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1),
-        "Status": "OK"
+        "Symbol": sym, "Price": round(float(daily_row.get("Close", np.nan)), 2),
+        "Daily Call": d_call, "Tactical Call": t_call, "Weekly Call": w_call,
+        "Prob Advance % (2D)": round(adv_prob, 1), "Prob Decline % (2D)": round(dec_prob, 1),
+        "Net Bias Score": round(net_bias, 1), "MC 2D Median %": round(mc2.get("median", 0)*100, 2),
+        "MC 5D Median %": round(mc5.get("median", 0)*100, 2), "MC Sample": mc2.get("sample", 0),
+        "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1), "Status": "OK"
     })
     detail[sym] = {
         "hourly": hourly_df, "daily": daily_df, "weekly": weekly_df,
@@ -448,7 +472,6 @@ progress.empty()
 results_df = pd.DataFrame(rows)
 results_df = results_df[results_df["Status"]=="OK"].sort_values("Net Bias Score", ascending=False).reset_index(drop=True)
 
-# RESULTS TABLE
 st.subheader("📊 Ranked Results (Sorted by Net Bias)")
 col_sort = st.selectbox("Sort By", ["Net Bias Score", "Prob Advance % (2D)", "Prob Decline % (2D)", "RSI14"], index=0)
 if col_sort in results_df.columns:
@@ -458,7 +481,6 @@ if col_sort in results_df.columns:
 st.dataframe(results_df, use_container_width=True, hide_index=True)
 st.download_button("Download Ranked CSV", results_df.to_csv(index=False).encode("utf-8"), "ranked_scan.csv", "text/csv")
 
-# DETAILED VIEW
 valid = results_df["Symbol"].tolist()
 if not valid: st.stop()
 selected = st.selectbox("Select Symbol", valid)
@@ -473,7 +495,6 @@ c4.metric("MC 5D Median", f"{mc.get(5,{}).get('median',0)*100:.2f}%")
 
 plot_dashboard(selected, item["hourly"], item["daily"], item["weekly"], pd.Timestamp.today(), item["tactical_label"])
 
-# MC PATH VISUALIZATION
 if not item["analogs"].empty:
     st.markdown("### 🎲 Monte Carlo Forward Distribution (2-Day)")
     fig = go.Figure()
