@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Stable Market Engine v13 — Probabilistic Ranker & MC Predictor
+Stable Market Engine v12.1 — TSI Ranker + Options Liquidity
 ✅ Bulk CSV Upload / Paste
 ✅ Rank by Advance/Decline Probability
 ✅ Monte Carlo Forward-Return Predictor (1D, 2D, 5D, 10D)
+✅ 2H Tactical Call Column
+✅ Liquid Options Check (Y/N) based on Vol, OI, Spread
 ✅ Smooth TSI Oscillator + Real Alpaca Data + Analog Engine
-✅ FIXED: Dictionary key matching & trailing space errors
 """
 
 from __future__ import annotations
@@ -22,6 +23,11 @@ from pathlib import Path
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+try:
+    from alpaca.data import MarketDataClient
+    HAS_MARKET_DATA = True
+except ImportError:
+    HAS_MARKET_DATA = False
 
 # -----------------------------
 # CONFIG & SETUP
@@ -32,7 +38,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NY_TZ = "America/New_York"
 
 st.set_page_config(
-    page_title="Stable Market Engine v13 — Ranker",
+    page_title="Stable Market Engine v12.1 — Ranker",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -42,9 +48,6 @@ st.set_page_config(
 # -----------------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
-
-def smooth_component(series: pd.Series, span: int) -> pd.Series:
-    return ema(series, span) if span and span > 1 else series
 
 def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
@@ -107,9 +110,6 @@ def hybrid_normalize(series: pd.Series, window: int) -> pd.Series:
     hi = series.rolling(window, min_periods=max(20, window//5)).max()
     return ((series - lo) / (hi - lo).replace(0, np.nan)).clip(0, 1)
 
-def centered_pct(series: pd.Series) -> pd.Series:
-    return (series.fillna(0.5) - 0.5) * 2
-
 # -----------------------------
 # DATA FETCHING & CACHING
 # -----------------------------
@@ -130,14 +130,6 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if "Volume" not in out.columns: out["Volume"] = np.nan
     return out.dropna(subset=["Open", "High", "Low", "Close"])
 
-def cache_path(symbol: str, kind: str) -> Path:
-    safe = "".join(c for c in symbol if c.isalnum() or c in ".-")
-    return CACHE_DIR / f"{safe}_{kind}.parquet"
-
-def is_fresh(path: Path, max_hours: int = 18) -> bool:
-    if not path.exists(): return False
-    return (pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")) < pd.Timedelta(hours=max_hours)
-
 def parse_symbol_csv(uploaded) -> List[str]:
     if uploaded is None: return []
     try:
@@ -152,6 +144,14 @@ def clean_symbols(text: str, uploaded_symbols: List[str]) -> List[str]:
     if text.strip(): symbols.extend([s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()])
     symbols.extend(uploaded_symbols)
     return list(dict.fromkeys([s for s in symbols if s]))
+
+def cache_path(symbol: str, kind: str) -> Path:
+    safe = "".join(c for c in symbol if c.isalnum() or c in ".-")
+    return CACHE_DIR / f"{safe}_{kind}.parquet"
+
+def is_fresh(path: Path, max_hours: int = 18) -> bool:
+    if not path.exists(): return False
+    return (pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")) < pd.Timedelta(hours=max_hours)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: str, feed: str) -> Dict[str, pd.DataFrame]:
@@ -180,21 +180,58 @@ def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: s
         except: pass
     return data_map
 
-def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, str, str]:
-    target = str(target).strip()
-    out = df.copy()
-    if target == "2hour_proxy":
-        label, timeframe_name = "2-Hour Proxy", "2hour_proxy"
-    else:
-        label, timeframe_name = "Hourly Proxy", "hourly_proxy"
-    return out, timeframe_name, label
+# -----------------------------
+# OPTIONS LIQUIDITY CHECK
+# -----------------------------
+def check_options_liquidity(symbol: str, key: str, secret: str) -> str:
+    """Checks if there are liquid options for the symbol."""
+    if not HAS_MARKET_DATA or not key or not secret:
+        return "N"
+    try:
+        # MarketDataClient is used for options chain
+        mdc = MarketDataClient(key, secret)
+        # Get chain (using OPRA feed; fallback to default if restricted)
+        try:
+            chain = mdc.get_option_chain(symbol=symbol, feed="opra")
+        except:
+            chain = mdc.get_option_chain(symbol=symbol)
+            
+        if not chain or symbol not in chain:
+            return "N"
+            
+        options = chain[symbol]
+        if not options or len(options) == 0:
+            return "N"
+            
+        # Heuristic: Check if ANY option has Volume > 100 and OI > 500
+        liquid_found = False
+        for opt in options:
+            vol = getattr(opt, 'volume', 0) or 0
+            oi = getattr(opt, 'open_interest', 0) or 0
+            bid = getattr(opt, 'bid_price', 0) or 0
+            ask = getattr(opt, 'ask_price', 0) or 0
+            
+            if vol > 100 and oi > 500:
+                spread = ask - bid
+                mid = (ask + bid) / 2
+                # Check spread tightness: <$0.10 or <5% of mid
+                if spread < 0.10 or (mid > 0 and (spread / mid) < 0.05):
+                    liquid_found = True
+                    break
+                    
+        return "Y" if liquid_found else "N"
+    except Exception:
+        return "N"
 
 # -----------------------------
-# FEATURE ENGINEERING (SMOOTH TSI)
+# FEATURE ENGINEERING & OSCILLATOR
 # -----------------------------
+def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, str, str]:
+    label = "2-Hour Proxy" if target == "2hour_proxy" else "Hourly Proxy"
+    tf = "2hour_proxy" if target == "2hour_proxy" else "hourly_proxy"
+    return df.copy(), tf, label
+
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
-    timeframe_name = str(timeframe_name).strip()
-    
     spans = {
         "proxy_smooth_1hour": (8, 21, 7), "real_1hour": (8, 21, 7),
         "proxy_smooth_2hour": (10, 26, 8), "real_2hour": (10, 26, 8),
@@ -220,8 +257,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
         "daily": 5, "weekly": 3,
     }
 
-    fast, slow, sig = spans.get(timeframe_name, (16, 42, 10))
-    
+    fast, slow, sig = spans[timeframe_name]
     tsi_n = np.tanh(out["tsi"].fillna(0.0) / 35.0)
     cci_n = np.tanh(out["cci_20"].fillna(0.0) / 180.0)
     bb_n = ((out["pct_b"].fillna(0.5) - 0.5) * 2.0).clip(-1.25, 1.25)
@@ -233,10 +269,7 @@ def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFr
     w = dict(tsi=0.31, cci=0.22, bb=0.14, vwap=0.15, adx=0.10, z=0.08) if "hour" in timeframe_name or "2hour" in timeframe_name else dict(tsi=0.32, cci=0.20, bb=0.16, vwap=0.08, adx=0.12, z=0.12)
     
     out["uo_base"] = w["tsi"]*tsi_n + w["cci"]*cci_n + w["bb"]*bb_n + w["vwap"]*vwap_n + w["adx"]*adx_n + w["z"]*z_n
-    if "hour" in timeframe_name or "2hour" in timeframe_name:
-        pin = 0.12 * out.get("pinning_up_flag", pd.Series(0, index=out.index)).fillna(0.0) - 0.12 * out.get("pinning_down_flag", pd.Series(0, index=out.index)).fillna(0.0)
-        out["uo_base"] = out["uo_base"] - pin
-
+    
     pre = pre_smooth_map.get(timeframe_name, 3)
     out["uo_base_sm"] = ema(out["uo_base"], pre) if pre > 1 else out["uo_base"]
     out["uo_raw"] = ema(out["uo_base_sm"], fast) - ema(out["uo_base_sm"], slow)
@@ -292,7 +325,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     return add_ultimate_oscillator(x, timeframe_name)
 
 # -----------------------------
-# ANALOGS & MONTE CARLO
+# ANALOGS & CLASSIFICATION
 # -----------------------------
 def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -329,14 +362,10 @@ def monte_carlo_from_analogs(analogs: pd.DataFrame, horizons: List[int] = [1, 2,
         results[h] = {
             "median": float(np.median(sims)), "mean": float(np.mean(sims)),
             "p_up": float(np.mean(sims > 0) * 100), "p_down": float(np.mean(sims < 0) * 100),
-            "pct_10": float(np.percentile(sims, 10)), "pct_90": float(np.percentile(sims, 90)),
             "sample": len(vals)
         }
     return results
 
-# -----------------------------
-# CLASSIFICATION & RANKING
-# -----------------------------
 def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     if row is None or row.empty: return "NO DATA", "No data"
     uo_pct = float(row.get("uo_pctile", 0.5))
@@ -364,7 +393,7 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     return "NEUTRAL", "Mixed"
 
 # -----------------------------
-# PLOTTING
+# PLOTTING & UI
 # -----------------------------
 def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, weekly_df: pd.DataFrame, asof_date: pd.Timestamp, tactical_label: str) -> None:
     fig = make_subplots(rows=4, cols=1, vertical_spacing=0.05,
@@ -385,8 +414,8 @@ def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, 
 # -----------------------------
 # MAIN APP
 # -----------------------------
-st.title("📈 Stable Market Engine v13 — Probabilistic Ranker")
-st.caption("Upload CSV / Paste Symbols | Rank by Advance/Decline Probability | Monte Carlo Predictor")
+st.title("📈 Stable Market Engine v12.1 — Probabilistic Ranker")
+st.caption("Upload CSV / Paste Symbols | 2H Tactical Call | Options Liquidity | MC Predictor")
 
 with st.sidebar:
     st.header("Credentials & Input")
@@ -454,18 +483,27 @@ for i, sym in enumerate(symbols):
     dec_prob = mc2.get("p_down", 50.0)
     net_bias = adv_prob - 50.0
     
+    # Check Options Liquidity
+    liq_opts = check_options_liquidity(sym, alpaca_key, alpaca_secret)
+    
     rows.append({
         "Symbol": sym, "Price": round(float(daily_row.get("Close", np.nan)), 2),
-        "Daily Call": d_call, "Tactical Call": t_call, "Weekly Call": w_call,
-        "Prob Advance % (2D)": round(adv_prob, 1), "Prob Decline % (2D)": round(dec_prob, 1),
-        "Net Bias Score": round(net_bias, 1), "MC 2D Median %": round(mc2.get("median", 0)*100, 2),
-        "MC 5D Median %": round(mc5.get("median", 0)*100, 2), "MC Sample": mc2.get("sample", 0),
-        "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1), "Status": "OK"
+        "2H Tactical": t_call,  # <--- NEW COLUMN
+        "Daily Call": d_call, "Weekly Call": w_call,
+        "Prob Advance % (2D)": round(adv_prob, 1),
+        "Prob Decline % (2D)": round(dec_prob, 1),
+        "Net Bias Score": round(net_bias, 1),
+        "MC 2D Median %": round(mc2.get("median", 0)*100, 2),
+        "MC 5D Median %": round(mc5.get("median", 0)*100, 2),
+        "Liq Options": liq_opts,  # <--- NEW COLUMN
+        "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1),
+        "Status": "OK"
     })
     detail[sym] = {
         "hourly": hourly_df, "daily": daily_df, "weekly": weekly_df,
         "tactical_label": tactical_label, "mc": mc, "analogs": analogs,
-        "daily_row": daily_row, "tactical_row": tactical_row
+        "daily_row": daily_row, "tactical_row": tactical_row,
+        "tactical_call": t_call
     }
 
 progress.empty()
