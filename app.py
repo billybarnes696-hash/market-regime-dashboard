@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Stable Market Engine v12.1 — TSI Ranker + Options Liquidity
+Stable Market Engine v12.1 — Probabilistic Ranker & MC Predictor
 ✅ Bulk CSV Upload / Paste
 ✅ Rank by Advance/Decline Probability
 ✅ Monte Carlo Forward-Return Predictor (1D, 2D, 5D, 10D)
-✅ 2H Tactical Call Column
-✅ Liquid Options Check (Y/N) based on Vol, OI, Spread
+✅ 2H Tactical Call Column + Liquid Options Check (Y/N)
 ✅ Smooth TSI Oscillator + Real Alpaca Data + Analog Engine
+✅ Fixed: Dropdown persistence, trailing spaces, syntax errors
 """
 
 from __future__ import annotations
@@ -63,7 +63,8 @@ def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
 
 def rsi(series: pd.Series, window: int = 14) -> pd.Series:
     delta = series.diff()
-    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
     avg_up = up.ewm(alpha=1/window, min_periods=window, adjust=False).mean()
     avg_down = down.ewm(alpha=1/window, min_periods=window, adjust=False).mean()
     rs = avg_up / avg_down.replace(0, np.nan)
@@ -109,6 +110,9 @@ def hybrid_normalize(series: pd.Series, window: int) -> pd.Series:
     lo = series.rolling(window, min_periods=max(20, window//5)).min()
     hi = series.rolling(window, min_periods=max(20, window//5)).max()
     return ((series - lo) / (hi - lo).replace(0, np.nan)).clip(0, 1)
+
+def centered_pct(series: pd.Series) -> pd.Series:
+    return (series.fillna(0.5) - 0.5) * 2
 
 # -----------------------------
 # DATA FETCHING & CACHING
@@ -184,44 +188,25 @@ def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: s
 # OPTIONS LIQUIDITY CHECK
 # -----------------------------
 def check_options_liquidity(symbol: str, key: str, secret: str) -> str:
-    """Checks if there are liquid options for the symbol."""
-    if not HAS_MARKET_DATA or not key or not secret:
-        return "N"
+    if not HAS_MARKET_DATA or not key or not secret: return "N"
     try:
-        # MarketDataClient is used for options chain
         mdc = MarketDataClient(key, secret)
-        # Get chain (using OPRA feed; fallback to default if restricted)
-        try:
-            chain = mdc.get_option_chain(symbol=symbol, feed="opra")
-        except:
-            chain = mdc.get_option_chain(symbol=symbol)
-            
-        if not chain or symbol not in chain:
-            return "N"
-            
-        options = chain[symbol]
-        if not options or len(options) == 0:
-            return "N"
-            
-        # Heuristic: Check if ANY option has Volume > 100 and OI > 500
-        liquid_found = False
-        for opt in options:
+        try: chain = mdc.get_option_chain(symbol=symbol, feed="opra")
+        except: chain = mdc.get_option_chain(symbol=symbol)
+        if not chain or symbol not in chain or not chain[symbol]: return "N"
+        
+        for opt in chain[symbol][:50]: # Check nearest 50
             vol = getattr(opt, 'volume', 0) or 0
             oi = getattr(opt, 'open_interest', 0) or 0
             bid = getattr(opt, 'bid_price', 0) or 0
             ask = getattr(opt, 'ask_price', 0) or 0
-            
             if vol > 100 and oi > 500:
                 spread = ask - bid
                 mid = (ask + bid) / 2
-                # Check spread tightness: <$0.10 or <5% of mid
-                if spread < 0.10 or (mid > 0 and (spread / mid) < 0.05):
-                    liquid_found = True
-                    break
-                    
-        return "Y" if liquid_found else "N"
-    except Exception:
+                if spread < 0.15 or (mid > 0 and (spread / mid) < 0.06):
+                    return "Y"
         return "N"
+    except: return "N"
 
 # -----------------------------
 # FEATURE ENGINEERING & OSCILLATOR
@@ -325,7 +310,7 @@ def enrich_price_features(df: pd.DataFrame, timeframe_name: str, benchmark_df: O
     return add_ultimate_oscillator(x, timeframe_name)
 
 # -----------------------------
-# ANALOGS & CLASSIFICATION
+# ANALOGS, MC, & RANKING
 # -----------------------------
 def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -392,6 +377,37 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     if uo_gap < 0 and slope3 < 0: return "PUT", "Falling"
     return "NEUTRAL", "Mixed"
 
+def compute_grade_with_analogs(row: pd.Series, analog_summary: Dict) -> Tuple[str, str, float]:
+    uo_pct = float(row.get("uo_pctile", 0.5))
+    uo_gap = float(row.get("uo_gap", 0.0))
+    slope3 = float(row.get("uo_slope_3", 0.0))
+    dist_ema = float(row.get("dist_ema20_pct", 0.0))
+    
+    direction = 1.0 if (uo_gap > 0.015 and slope3 > 0.008) else (-1.0 if (uo_gap < -0.015 and slope3 < -0.008) else (0.3 if uo_gap > 0 else -0.3))
+    room = 1.0 if (uo_pct < 0.20 and dist_ema < 0.02) else (-1.0 if (uo_pct > 0.80 and dist_ema > -0.02) else (0.6 if uo_pct < 0.35 else (-0.6 if uo_pct > 0.65 else 0.0)))
+    
+    analog_score = 0.0
+    if analog_summary:
+        up_prob = analog_summary.get("p_up", 50.0)
+        down_prob = analog_summary.get("p_down", 50.0)
+        weight = min(1.0, analog_summary.get("sample", 0) / 25.0)
+        if up_prob > 0.60 and down_prob < 0.40: analog_score = weight * 1.0
+        elif down_prob > 0.60 and up_prob < 0.40: analog_score = weight * -1.0
+        elif up_prob > 0.55: analog_score = weight * 0.5
+        elif down_prob > 0.55: analog_score = weight * -0.5
+        
+    score = direction * (1 - abs(room) * 0.3) + room * 0.3 + analog_score * 0.4
+    
+    if score >= 0.75: return "A+", "Strong momentum + room + analog support", score
+    if score >= 0.55: return "A", "Bullish lean + analog support", score
+    if score >= 0.35: return "B+", "Bullish but extended / mixed analogs", score
+    if score >= 0.15: return "B", "Slightly bullish, neutral stretch", score
+    if score >= -0.15: return "C", "Neutral / no clear edge", score
+    if score >= -0.35: return "B-", "Slightly bearish, neutral stretch", score
+    if score >= -0.55: return "C+", "Bearish but extended / mixed analogs", score
+    if score >= -0.75: return "C", "Bearish lean + analog support", score
+    return "C-", "Strong bearish momentum + room + analog support", score
+
 # -----------------------------
 # PLOTTING & UI
 # -----------------------------
@@ -415,7 +431,7 @@ def plot_dashboard(symbol: str, proxy_df: pd.DataFrame, daily_df: pd.DataFrame, 
 # MAIN APP
 # -----------------------------
 st.title("📈 Stable Market Engine v12.1 — Probabilistic Ranker")
-st.caption("Upload CSV / Paste Symbols | 2H Tactical Call | Options Liquidity | MC Predictor")
+st.caption("Upload CSV / Paste Symbols | 2H Tactical Call | Options Liquidity | MC Predictor | Session Persistence")
 
 with st.sidebar:
     st.header("Credentials & Input")
@@ -428,102 +444,123 @@ with st.sidebar:
     history_years = st.selectbox("History (Yrs)", [3, 5, 10], index=1)
     run_analysis = st.button("Run Bulk Scan & Rank", type="primary", use_container_width=True)
 
-if not run_analysis or not alpaca_key or not alpaca_secret:
-    if not alpaca_key: st.warning("Enter Alpaca credentials.")
+# State initialization
+if "results_df" not in st.session_state: st.session_state.results_df = None
+if "detail" not in st.session_state: st.session_state.detail = {}
+if "analysis_ran" not in st.session_state: st.session_state.analysis_ran = False
+
+if not run_analysis and not st.session_state.analysis_ran:
+    st.stop()
+if not alpaca_key or not alpaca_secret:
+    st.warning("Enter Alpaca credentials.")
     st.stop()
 
-symbols = []
-if symbols_text.strip(): symbols.extend([s.strip().upper() for s in symbols_text.replace("\n", ",").split(",") if s.strip()])
-if csv_file:
-    try:
-        df = pd.read_csv(csv_file)
-        col = next((c for c in df.columns if "symbol" in c.lower() or "ticker" in c.lower()), df.columns[0])
-        symbols.extend([str(x).strip().upper() for x in df[col].dropna() if str(x).strip()])
-    except: st.error("Failed to parse CSV.")
-symbols = list(dict.fromkeys(symbols))
-if not symbols: st.error("Provide symbols via paste or CSV."); st.stop()
+# Only run heavy processing if button was clicked or state not initialized
+if run_analysis:
+    symbols = []
+    if symbols_text.strip(): symbols.extend([s.strip().upper() for s in symbols_text.replace("\n", ",").split(",") if s.strip()])
+    if csv_file:
+        try:
+            df = pd.read_csv(csv_file)
+            col = next((c for c in df.columns if "symbol" in c.lower() or "ticker" in c.lower()), df.columns[0])
+            symbols.extend([str(x).strip().upper() for x in df[col].dropna() if str(x).strip()])
+        except: st.error("Failed to parse CSV.")
+    symbols = list(dict.fromkeys(symbols))
+    if not symbols: st.error("Provide symbols via paste or CSV."); st.stop()
 
-st.info(f"Fetching daily data for {len(symbols)} symbols...")
-daily_map = fetch_alpaca_daily_batch(list(set(symbols + [benchmark])), history_years, alpaca_key, alpaca_secret, feed)
-if benchmark not in daily_map or daily_map[benchmark].empty:
-    st.error(f"Failed to fetch {benchmark}."); st.stop()
-bench = daily_map[benchmark]
+    st.info(f"Fetching daily data for {len(symbols)} symbols...")
+    daily_map = fetch_alpaca_daily_batch(list(set(symbols + [benchmark])), history_years, alpaca_key, alpaca_secret, feed)
+    if benchmark not in daily_map or daily_map[benchmark].empty:
+        st.error(f"Failed to fetch {benchmark}."); st.stop()
+    bench = daily_map[benchmark]
 
-rows, detail = [], {}
-progress = st.progress(0.0)
+    rows, detail = [], {}
+    progress = st.progress(0.0)
 
-for i, sym in enumerate(symbols):
-    progress.progress((i+1)/len(symbols))
-    daily_raw = daily_map.get(sym, pd.DataFrame())
-    if daily_raw.empty:
-        rows.append({"Symbol": sym, "Status": "No Data"})
-        continue
+    for i, sym in enumerate(symbols):
+        progress.progress((i+1)/len(symbols))
+        daily_raw = daily_map.get(sym, pd.DataFrame())
+        if daily_raw.empty:
+            rows.append({"Symbol": sym, "Status": "No Data"})
+            continue
+            
+        tactical_raw, tactical_tf, tactical_label = time_compressed_proxy(daily_raw, "2hour_proxy")
+        weekly_raw = daily_raw.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
         
-    tactical_raw, tactical_tf, tactical_label = time_compressed_proxy(daily_raw, "2hour_proxy")
-    weekly_raw = daily_raw.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
-    
-    hourly_df = enrich_price_features(tactical_raw, tactical_tf, bench)
-    daily_df = enrich_price_features(daily_raw, "daily", bench)
-    weekly_df = enrich_price_features(weekly_raw, "weekly", bench)
-    
-    daily_row = daily_df.iloc[-1]
-    tactical_row = hourly_df.iloc[-1]
-    weekly_row = weekly_df.iloc[-1] if not weekly_df.empty else pd.Series(dtype=float)
-    
-    t_call, _ = classify_timeframe_call(tactical_row, tactical_tf)
-    d_call, _ = classify_timeframe_call(daily_row, "daily")
-    w_call, _ = classify_timeframe_call(weekly_row, "weekly")
-    
-    analogs = find_analogs(daily_df, daily_row.name, n=30)
-    mc = monte_carlo_from_analogs(analogs, horizons=[1, 2, 5, 10], n_sims=3000)
-    mc2 = mc.get(2, {})
-    mc5 = mc.get(5, {})
-    
-    adv_prob = mc2.get("p_up", 50.0)
-    dec_prob = mc2.get("p_down", 50.0)
-    net_bias = adv_prob - 50.0
-    
-    # Check Options Liquidity
-    liq_opts = check_options_liquidity(sym, alpaca_key, alpaca_secret)
-    
-    rows.append({
-        "Symbol": sym, "Price": round(float(daily_row.get("Close", np.nan)), 2),
-        "2H Tactical": t_call,  # <--- NEW COLUMN
-        "Daily Call": d_call, "Weekly Call": w_call,
-        "Prob Advance % (2D)": round(adv_prob, 1),
-        "Prob Decline % (2D)": round(dec_prob, 1),
-        "Net Bias Score": round(net_bias, 1),
-        "MC 2D Median %": round(mc2.get("median", 0)*100, 2),
-        "MC 5D Median %": round(mc5.get("median", 0)*100, 2),
-        "Liq Options": liq_opts,  # <--- NEW COLUMN
-        "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1),
-        "Status": "OK"
-    })
-    detail[sym] = {
-        "hourly": hourly_df, "daily": daily_df, "weekly": weekly_df,
-        "tactical_label": tactical_label, "mc": mc, "analogs": analogs,
-        "daily_row": daily_row, "tactical_row": tactical_row,
-        "tactical_call": t_call
-    }
+        hourly_df = enrich_price_features(tactical_raw, tactical_tf, bench)
+        daily_df = enrich_price_features(daily_raw, "daily", bench)
+        weekly_df = enrich_price_features(weekly_raw, "weekly", bench)
+        
+        daily_row = daily_df.iloc[-1]
+        tactical_row = hourly_df.iloc[-1]
+        weekly_row = weekly_df.iloc[-1] if not weekly_df.empty else pd.Series(dtype=float)
+        
+        t_call, _ = classify_timeframe_call(tactical_row, tactical_tf)
+        d_call, _ = classify_timeframe_call(daily_row, "daily")
+        w_call, _ = classify_timeframe_call(weekly_row, "weekly")
+        
+        analogs = find_analogs(daily_df, daily_row.name, n=30)
+        mc = monte_carlo_from_analogs(analogs, horizons=[1, 2, 5, 10], n_sims=3000)
+        mc2 = mc.get(2, {})
+        mc5 = mc.get(5, {})
+        
+        adv_prob = mc2.get("p_up", 50.0)
+        dec_prob = mc2.get("p_down", 50.0)
+        
+        liq_opts = check_options_liquidity(sym, alpaca_key, alpaca_secret)
+        grade, grade_reason, grade_score = compute_grade_with_analogs(daily_row, mc2)
+        
+        rows.append({
+            "Symbol": sym, "Price": round(float(daily_row.get("Close", np.nan)), 2),
+            "2H Tactical": t_call, "Daily Call": d_call, "Weekly Call": w_call,
+            "Prob Adv % (2D)": round(adv_prob, 1), "Prob Dec % (2D)": round(dec_prob, 1),
+            "Net Bias": round(adv_prob - 50.0, 1),
+            "MC 2D Med %": round(mc2.get("median", 0)*100, 2),
+            "MC 5D Med %": round(mc5.get("median", 0)*100, 2),
+            "Liq Options": liq_opts, "Grade": grade,
+            "RSI14": round(float(daily_row.get("rsi_14", np.nan)), 1), "Status": "OK"
+        })
+        detail[sym] = {
+            "hourly": hourly_df, "daily": daily_df, "weekly": weekly_df,
+            "tactical_label": tactical_label, "mc": mc, "analogs": analogs,
+            "daily_row": daily_row, "tactical_row": tactical_row,
+            "tactical_call": t_call, "grade_reason": grade_reason, "grade_score": grade_score
+        }
 
-progress.empty()
-results_df = pd.DataFrame(rows)
-results_df = results_df[results_df["Status"]=="OK"].sort_values("Net Bias Score", ascending=False).reset_index(drop=True)
+    progress.empty()
+    st.session_state.results_df = pd.DataFrame(rows)
+    st.session_state.detail = detail
+    st.session_state.analysis_ran = True
 
-st.subheader("📊 Ranked Results (Sorted by Net Bias)")
-col_sort = st.selectbox("Sort By", ["Net Bias Score", "Prob Advance % (2D)", "Prob Decline % (2D)", "RSI14"], index=0)
+# Render results
+results_df = st.session_state.results_df
+detail = st.session_state.detail
+if results_df is None or results_df.empty: st.stop()
+
+st.subheader("📊 Ranked Results")
+col_sort = st.selectbox("Sort By", ["Net Bias", "Prob Adv % (2D)", "Prob Dec % (2D)", "RSI14"], index=0)
 if col_sort in results_df.columns:
-    asc = False if "Decline" in col_sort else True
-    results_df = results_df.sort_values(col_sort, ascending=asc)
+    asc = False if "Dec" in col_sort else True
+    results_df = results_df.sort_values(col_sort, ascending=asc).reset_index(drop=True)
 
 st.dataframe(results_df, use_container_width=True, hide_index=True)
 st.download_button("Download Ranked CSV", results_df.to_csv(index=False).encode("utf-8"), "ranked_scan.csv", "text/csv")
 
-valid = results_df["Symbol"].tolist()
+valid = results_df.loc[results_df["Status"]=="OK", "Symbol"].tolist()
 if not valid: st.stop()
-selected = st.selectbox("Select Symbol", valid)
+
+# Persistent dropdown
+default_idx = valid.index(st.session_state.get("selected_symbol", valid[0])) if st.session_state.get("selected_symbol") in valid else 0
+selected = st.selectbox("Select Symbol for Detail View", valid, index=default_idx, key="symbol_dropdown")
+st.session_state.selected_symbol = selected
+
 item = detail[selected]
 mc = item["mc"]
+grade = results_df.loc[results_df["Symbol"]==selected, "Grade"].values[0]
+grade_reason = item["grade_reason"]
+
+st.markdown(f"### {selected} — Grade: {grade} ({grade_reason})")
+st.progress((item["grade_score"] + 1) / 2)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Prob Advance (2D)", f"{mc.get(2,{}).get('p_up',50):.1f}%")
