@@ -18,7 +18,7 @@ CACHE_DIR = APP_DIR / "cache_store_alpaca"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NY_TZ = "America/New_York"
 
-st.set_page_config(page_title="Stable Market Engine v8.1 | Context MC Fixed", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stable Market Engine v8.2 | MC Fixed", layout="wide", initial_sidebar_state="expanded")
 
 # -----------------------------
 # Utility helpers
@@ -411,7 +411,7 @@ def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # -----------------------------
-# v8.1 UPGRADES: Regime, Cross-Ticker Pool, State-Aware MC, Confidence
+# v8.2 UPGRADES: Regime, Cross-Ticker Pool, State-Aware MC (Fixed), Confidence
 # -----------------------------
 def classify_market_regime(benchmark_df: pd.DataFrame) -> str:
     if benchmark_df.empty or len(benchmark_df) < 60: return "CHOP_RANGE"
@@ -426,7 +426,6 @@ def classify_market_regime(benchmark_df: pd.DataFrame) -> str:
     return "CHOP_RANGE"
 
 def build_analog_pool_batch(symbol: str, enriched_df: pd.DataFrame) -> pd.DataFrame:
-    """Defensive: only selects columns that actually exist in the dataframe."""
     if enriched_df.empty: return pd.DataFrame()
     available = [c for c in ANALOG_FEATURES if c in enriched_df.columns]
     fwd = [c for c in ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"] if c in enriched_df.columns]
@@ -437,7 +436,6 @@ def build_analog_pool_batch(symbol: str, enriched_df: pd.DataFrame) -> pd.DataFr
     return out[["Symbol", "Timestamp"] + available + fwd]
 
 def search_cross_ticker_analogs(pool: pd.DataFrame, current_vec: pd.Series, n: int = 30) -> pd.DataFrame:
-    """Defensive: aligns features dynamically, handles missing columns gracefully."""
     if pool.empty or len(pool) < 20: return pd.DataFrame()
     use_cols = [c for c in ANALOG_FEATURES if c in pool.columns and c in current_vec.index]
     if len(use_cols) < 8: return pd.DataFrame()
@@ -463,25 +461,25 @@ def compute_state_aware_mc(analog_df: pd.DataFrame, fallback_close: pd.Series, n
         mu, sigma = float(log_ret.mean()), float(log_ret.std())
     else: mu, sigma = 0.0001, 0.015
 
-    if len(analog_df) >= 15:
-        for h in horizons:
-            col = f"fwd_ret_{h}"
-            if col not in analog_df.columns: out[f"mc_up_{h}d"] = 0.5; continue
+    for h in horizons:
+        col = f"fwd_ret_{h}"
+        use_analog = len(analog_df) >= 15 and col in analog_df.columns
+        if use_analog:
             draws = analog_df[col].dropna().to_numpy()
-            if len(draws) < 5: out[f"mc_up_{h}d"] = 0.5; continue
-            sims = rng.choice(draws, size=n_sim, replace=True)
-            out[f"mc_up_{h}d"] = float(np.mean(sims > 0))
-            out[f"mc_down_{h}d"] = 1.0 - out[f"mc_up_{h}d"]
-            out[f"mc_median_{h}d"] = float(np.median(sims))
-    else:
-        for h in horizons:
-            drift = (mu - 0.5 * sigma**2) * h
-            vol = sigma * np.sqrt(h)
-            shocks = rng.normal(0, 1, n_sim)
-            final_returns = np.exp(drift + vol * shocks) - 1.0
-            out[f"mc_up_{h}d"] = float(np.mean(final_returns > 0))
-            out[f"mc_down_{h}d"] = 1.0 - out[f"mc_up_{h}d"]
-            out[f"mc_median_{h}d"] = float(np.median(final_returns))
+            if len(draws) >= 5:
+                sims = rng.choice(draws, size=n_sim, replace=True)
+                out[f"mc_up_{h}d"] = float(np.mean(sims > 0))
+                out[f"mc_down_{h}d"] = 1.0 - out[f"mc_up_{h}d"]
+                out[f"mc_median_{h}d"] = float(np.median(sims))
+                continue
+        # Fallback to GBM for 3D/4D or insufficient analogs
+        drift = (mu - 0.5 * sigma**2) * h
+        vol = sigma * np.sqrt(h)
+        shocks = rng.normal(0, 1, n_sim)
+        final_returns = np.exp(drift + vol * shocks) - 1.0
+        out[f"mc_up_{h}d"] = float(np.mean(final_returns > 0))
+        out[f"mc_down_{h}d"] = 1.0 - out[f"mc_up_{h}d"]
+        out[f"mc_median_{h}d"] = float(np.median(final_returns))
     return out
 
 def compute_confidence_grade(analog_count: int, avg_sim: float, regime: str, signal: str, vol_ratio: float) -> Tuple[str, float]:
@@ -632,9 +630,9 @@ def plot_dashboard(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFra
     st.plotly_chart(fig, width="stretch")
 
 # -----------------------------
-# Main App (State-Managed, Fixed)
+# Main App (State-Managed, v8.2 Fixed)
 # -----------------------------
-st.title("📈 Stable Market Engine v8.1 | Context MC Fixed")
+st.title("📈 Stable Market Engine v8.2 | Context MC Fixed")
 st.caption("Cross-Ticker Analogs | State-Aware Monte Carlo | Regime Filter | Confidence Grading | CSV/Alpaca")
 
 with st.sidebar:
@@ -654,7 +652,7 @@ with st.sidebar:
     force_refresh = st.checkbox("Force refresh data (clear cache)", value=False)
     run_analysis = st.button("🚀 Run Analysis", type="primary", width="stretch")
 
-# 🔒 STATE MANAGEMENT FIX: Prevents reset on dropdown/select changes
+# 🔒 STATE MANAGEMENT FIX
 if "analysis_ready" not in st.session_state:
     st.session_state.analysis_ready = False
     st.session_state.results_df = None
@@ -755,7 +753,6 @@ if run_analysis:
         combined = combine(tactical_call, daily_call, weekly_call)
         sev = compute_severity(tactical_view, tactical_row)
         
-        # 🛡️ FIX: Dynamic intersection prevents KeyError if columns are missing
         safe_features = [f for f in ANALOG_FEATURES if f in daily_row.index]
         current_vec = daily_row[safe_features].fillna(0) if len(daily_row) > 0 else pd.Series(dtype=float)
         
@@ -812,7 +809,7 @@ if run_analysis:
     st.session_state.detail_cache = detail
     st.session_state.analysis_ready = True
 
-# 🔒 RENDER FROM CACHE (Dropdown changes won't reset analysis)
+# 🔒 RENDER FROM CACHE
 if not st.session_state.analysis_ready or st.session_state.results_df is None:
     st.info("👈 Configure sidebar and click **Run Analysis** to begin.")
     st.stop()
@@ -826,7 +823,7 @@ if results_df.empty: st.warning("No results generated."); st.stop()
 
 results_df = results_df.sort_values("MC Rank Score", ascending=False)
 st.dataframe(results_df, width="stretch", hide_index=True)
-st.download_button("⬇️ Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "v8_1_mc_ranked_results.csv", "text/csv")
+st.download_button("⬇️ Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "v8_2_mc_ranked_results.csv", "text/csv")
 
 valid_symbols = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
 if not valid_symbols: st.stop()
