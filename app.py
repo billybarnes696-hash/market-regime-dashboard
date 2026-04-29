@@ -18,7 +18,7 @@ CACHE_DIR = APP_DIR / "cache_store_alpaca"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NY_TZ = "America/New_York"
 
-st.set_page_config(page_title="Stable Market Engine v8 | Context MC Ranked", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stable Market Engine v7 | MC Ranked", layout="wide", initial_sidebar_state="expanded")
 
 # -----------------------------
 # Utility helpers
@@ -87,10 +87,12 @@ def true_percentile(series: pd.Series, window: int = 252) -> pd.Series:
     out = np.full(len(values), np.nan, dtype=float)
     min_valid = max(30, window // 5)
     for i, v in enumerate(values):
-        if i + 1 < min_valid or not np.isfinite(v): continue
+        if i + 1 < min_valid or not np.isfinite(v):
+            continue
         w = values[max(0, i - window + 1) : i + 1]
         w = w[np.isfinite(w)]
-        if len(w) < min_valid: continue
+        if len(w) < min_valid:
+            continue
         out[i] = float((w <= v).mean())
     return pd.Series(out, index=series.index)
 
@@ -126,13 +128,15 @@ def hybrid_normalize(series: pd.Series, window: int) -> pd.Series:
     return out.clip(0, 1)
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
     out = df.copy()
     if isinstance(out.columns, pd.MultiIndex):
         out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
     out.columns = [str(c).strip().title() for c in out.columns]
     keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in out.columns]
-    if len(keep) < 4: return pd.DataFrame()
+    if len(keep) < 4:
+        return pd.DataFrame()
     out = out[keep].copy()
     out.index = pd.to_datetime(out.index, errors="coerce")
     if getattr(out.index, "tz", None) is not None:
@@ -140,28 +144,60 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_index()
     for c in keep:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-    if "Volume" not in out.columns: out["Volume"] = np.nan
+    if "Volume" not in out.columns:
+        out["Volume"] = np.nan
     return out.dropna(subset=["Open", "High", "Low", "Close"])
 
 # -----------------------------
 # CSV & Symbol Handling
 # -----------------------------
 def parse_symbol_csv(uploaded) -> List[str]:
-    if uploaded is None: return []
-    try: df = pd.read_csv(io.BytesIO(uploaded.getvalue()))
-    except Exception: return []
+    if uploaded is None:
+        return []
+    try:
+        df = pd.read_csv(io.BytesIO(uploaded.getvalue()))
+    except Exception:
+        return []
     cols = {str(c).strip().lower(): c for c in df.columns}
     sym_col = cols.get("symbol") or cols.get("ticker") or next(iter(df.columns), None)
-    if sym_col is None: return []
+    if sym_col is None:
+        return []
     return [str(x).strip().upper() for x in df[sym_col].dropna().tolist() if str(x).strip()]
 
 def clean_symbols(text: str, uploaded_symbols: List[str]) -> List[str]:
     symbols: List[str] = []
-    if text.strip(): symbols.extend([s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()])
+    if text.strip():
+        symbols.extend([s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()])
     symbols.extend(uploaded_symbols)
     out = []
     for s in symbols:
-        if s and s not in out: out.append(s)
+        if s and s not in out:
+            out.append(s)
+    return out
+
+# -----------------------------
+# Monte Carlo Engine
+# -----------------------------
+def compute_monte_carlo(close_series: pd.Series, n_sim: int = 5000, horizons: list[int] = [1, 2, 3, 4, 5]) -> dict:
+    """Returns UP/DOWN probabilities for each horizon using GBM."""
+    if len(close_series) < 20:
+        return {f"mc_up_{h}d": 0.5 for h in horizons}
+    log_ret = np.log(close_series).diff().dropna()
+    mu = float(log_ret.mean())
+    sigma = float(log_ret.std())
+    if sigma <= 1e-9 or np.isnan(mu):
+        return {f"mc_up_{h}d": 0.5 for h in horizons}
+
+    out = {}
+    rng = np.random.default_rng()
+    for h in horizons:
+        drift = (mu - 0.5 * sigma**2) * h
+        vol = sigma * np.sqrt(h)
+        shocks = rng.normal(0, 1, n_sim)
+        final_returns = np.exp(drift + vol * shocks) - 1.0
+        up_prob = float(np.mean(final_returns > 0))
+        out[f"mc_up_{h}d"] = up_prob
+        out[f"mc_down_{h}d"] = 1.0 - up_prob
     return out
 
 # -----------------------------
@@ -175,10 +211,12 @@ def clear_symbol_cache(symbols: List[str]) -> None:
     for s in symbols:
         for kind in ["daily", "1hour", "2hour", "hourly_proxy", "2hour_proxy"]:
             p = cache_path(s, kind)
-            if p.exists(): p.unlink(missing_ok=True)
+            if p.exists():
+                p.unlink(missing_ok=True)
 
 def is_fresh(path: Path, max_hours: int = 18) -> bool:
-    if not path.exists(): return False
+    if not path.exists():
+        return False
     age = pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")
     return age < pd.Timedelta(hours=max_hours)
 
@@ -186,19 +224,26 @@ def alpaca_client(key: str, secret: str) -> StockHistoricalDataClient:
     return StockHistoricalDataClient(key, secret)
 
 def _bars_df_for_symbol(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    if df is None or df.empty: return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
     if isinstance(df.index, pd.MultiIndex):
         if "symbol" in df.index.names:
-            try: sub = df.xs(symbol, level="symbol").copy()
-            except Exception: return pd.DataFrame()
-        else: return pd.DataFrame()
-    else: sub = df.copy()
-    if "timestamp" in sub.columns: sub = sub.set_index("timestamp")
+            try:
+                sub = df.xs(symbol, level="symbol").copy()
+            except Exception:
+                return pd.DataFrame()
+        else:
+            return pd.DataFrame()
+    else:
+        sub = df.copy()
+    if "timestamp" in sub.columns:
+        sub = sub.set_index("timestamp")
     return normalize_ohlcv(sub)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: str, feed: str) -> Dict[str, pd.DataFrame]:
-    if not symbols: return {}
+    if not symbols:
+        return {}
     data_map: Dict[str, pd.DataFrame] = {}
     missing = []
     for s in symbols:
@@ -207,15 +252,19 @@ def fetch_alpaca_daily_batch(symbols: List[str], years: int, key: str, secret: s
             try:
                 data_map[s] = pd.read_parquet(p)
                 continue
-            except Exception: pass
+            except Exception:
+                pass
         missing.append(s)
-    if not missing: return data_map
+    if not missing:
+        return data_map
     client = alpaca_client(key, secret)
     start = (pd.Timestamp.now(tz=NY_TZ) - pd.DateOffset(years=max(years, 5))).normalize().tz_localize(None)
     end = pd.Timestamp.now(tz=NY_TZ).tz_localize(None)
     req = StockBarsRequest(symbol_or_symbols=missing, timeframe=TimeFrame.Day, start=start, end=end, adjustment="raw", feed=feed)
-    try: raw = client.get_stock_bars(req).df
-    except Exception: return data_map
+    try:
+        raw = client.get_stock_bars(req).df
+    except Exception:
+        return data_map
     for s in missing:
         sub = _bars_df_for_symbol(raw, s)
         if not sub.empty:
@@ -304,21 +353,17 @@ def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
 
 def time_compressed_proxy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, str, str]:
     out = df.copy()
-    if target == "2hour_proxy": label, timeframe_name = "2-Hour Proxy", "2hour_proxy"
-    else: label, timeframe_name = "Hourly Proxy", "hourly_proxy"
+    if target == "2hour_proxy":
+        label = "2-Hour Proxy"
+        timeframe_name = "2hour_proxy"
+    else:
+        label = "Hourly Proxy"
+        timeframe_name = "hourly_proxy"
     return out, timeframe_name, label
 
 # -----------------------------
 # Signal & Feature Enrichment
 # -----------------------------
-ANALOG_FEATURES = [
-    "uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3", "uo_decision", "uo_signal_decision",
-    "tsi", "tsi_gap", "tsi_slope_3", "tsi_pctile", "cci_20", "cci_slope_3", "cci_20_pctile",
-    "pct_b", "pct_b_pctile", "dist_vwap_pct", "dist_vwap_pctile", "close_zscore",
-    "close_zscore_slope_3", "close_zscore_pctile", "adx_14", "adx_14_pctile",
-    "price_change_while_tsi_flat", "pinning_up_flag", "pinning_down_flag", "rs_bench_slope_5", "candle_score"
-]
-
 def add_ultimate_oscillator(out: pd.DataFrame, timeframe_name: str) -> pd.DataFrame:
     spans = {"hourly_proxy": (8, 21, 7), "real_1hour": (8, 21, 7), "2hour_proxy": (10, 26, 8), "real_2hour": (10, 26, 8), "daily": (16, 42, 10), "weekly": (8, 21, 7)}
     pre_smooth_map = {"hourly_proxy": 3, "real_1hour": 4, "2hour_proxy": 3, "real_2hour": 5, "daily": 5, "weekly": 3}
@@ -419,108 +464,35 @@ def add_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
     for n in [1, 2, 5]: out[f"fwd_ret_{n}"] = out["Close"].shift(-n) / out["Close"] - 1
     return out
 
-# -----------------------------
-# v8 UPGRADES: Regime, Cross-Ticker Pool, State-Aware MC, Confidence
-# -----------------------------
-def classify_market_regime(benchmark_df: pd.DataFrame) -> str:
-    if benchmark_df.empty or len(benchmark_df) < 60: return "CHOP_RANGE"
-    close = benchmark_df["Close"]
-    slope_20 = (close - close.shift(20)).rolling(5).mean().iloc[-1]
-    vol_20 = close.pct_change().rolling(20).std().iloc[-1]
-    vol_60 = close.pct_change().rolling(60).std().iloc[-1]
-    vol_ratio = vol_20 / (vol_60 if vol_60 > 0 else 1e-6)
-    
-    if slope_20 > 0.03 and vol_ratio < 1.1: return "BULL_TREND"
-    if slope_20 < -0.03: return "BEAR_DOWNTREND"
-    if vol_ratio > 1.4: return "VOL_SPIKE"
-    return "CHOP_RANGE"
+ANALOG_FEATURES = ["uo_pctile", "uo_gap", "uo_slope_1", "uo_slope_3", "uo_decision", "uo_signal_decision", "tsi", "tsi_gap", "tsi_slope_3", "tsi_pctile", "cci_20", "cci_slope_3", "cci_20_pctile", "pct_b", "pct_b_pctile", "dist_vwap_pct", "dist_vwap_pctile", "close_zscore", "close_zscore_slope_3", "close_zscore_pctile", "adx_14", "adx_14_pctile", "price_change_while_tsi_flat", "pinning_up_flag", "pinning_down_flag", "rs_bench_slope_5", "candle_score"]
 
-def regime_alignment_bonus(regime: str, signal: str) -> float:
-    bonus = 0.0
-    if regime == "BULL_TREND" and signal.startswith("CALL"): bonus += 0.05
-    elif regime == "BEAR_DOWNTREND" and signal.startswith("PUT"): bonus += 0.05
-    elif regime == "VOL_SPIKE": bonus -= 0.03
-    return bonus
+def find_analogs(frame: pd.DataFrame, current_ts: pd.Timestamp, n: int = 25) -> pd.DataFrame:
+    enriched = add_forward_returns(frame)
+    use = [c for c in ANALOG_FEATURES if c in enriched.columns]
+    if current_ts not in enriched.index or len(use) < 8: return pd.DataFrame()
+    cur_pos = enriched.index.get_loc(current_ts)
+    pool = enriched.iloc[:max(0, cur_pos - 10)].dropna(subset=use + ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"]).copy()
+    if len(pool) < 50: return pd.DataFrame()
+    current = enriched.loc[current_ts, use].astype(float)
+    X = pool[use].astype(float)
+    std = X.std().replace(0, np.nan)
+    z = ((X - current) / std).fillna(0.0)
+    pool["distance"] = np.sqrt((z.to_numpy() ** 2).sum(axis=1))
+    pool["similarity"] = 1 / (1 + pool["distance"])
+    return pool.nsmallest(n, "distance").copy()
 
-def build_analog_pool_batch(symbol: str, enriched_df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["Symbol", "Timestamp"] + ANALOG_FEATURES + ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"]
-    df = enriched_df[ANALOG_FEATURES + ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"]].copy()
-    df["Symbol"] = symbol
-    df["Timestamp"] = df.index
-    return df[[c for c in cols if c in df.columns]]
-
-def search_cross_ticker_analogs(pool: pd.DataFrame, current_vec: pd.Series, symbol: str, n: int = 30) -> pd.DataFrame:
-    if pool.empty or len(pool) < 20: return pd.DataFrame()
-    use_cols = [c for c in ANALOG_FEATURES if c in pool.columns]
-    if len(use_cols) < 8: return pd.DataFrame()
-    
-    current = current_vec[use_cols].astype(float).fillna(0)
-    pool_sub = pool[use_cols + ["Symbol", "Timestamp", "fwd_ret_1", "fwd_ret_2", "fwd_ret_5"]].dropna(subset=use_cols + ["fwd_ret_1"])
-    
-    # Standardize using pool stats
-    mean = pool_sub[use_cols].mean()
-    std = pool_sub[use_cols].std().replace(0, 1)
-    z_pool = (pool_sub[use_cols] - mean) / std
-    z_curr = (current - mean) / std
-    
-    dist = np.sqrt(((z_pool - z_curr.values) ** 2).sum(axis=1))
-    pool_sub["distance"] = dist.values
-    pool_sub["similarity"] = 1 / (1 + pool_sub["distance"])
-    return pool_sub.nsmallest(n, "distance").copy()
-
-def compute_state_aware_mc(analog_df: pd.DataFrame, fallback_close: pd.Series, n_sim: int = 5000, horizons: list[int] = [1,2,3,4,5]) -> dict:
-    out = {}
-    rng = np.random.default_rng()
-    
-    # Fallback params
-    if len(fallback_close) > 20:
-        log_ret = np.log(fallback_close).diff().dropna()
-        mu, sigma = float(log_ret.mean()), float(log_ret.std())
-    else:
-        mu, sigma = 0.0001, 0.015
-
-    if len(analog_df) >= 15:
-        # State-aware bootstrapping
-        for h in horizons:
-            col = f"fwd_ret_{h}"
-            if col not in analog_df.columns: 
-                out[f"mc_up_{h}d"] = 0.5; continue
-            draws = analog_df[col].dropna().to_numpy()
-            if len(draws) < 5: 
-                out[f"mc_up_{h}d"] = 0.5; continue
-            sims = rng.choice(draws, size=n_sim, replace=True)
-            out[f"mc_up_{h}d"] = float(np.mean(sims > 0))
-            out[f"mc_down_{h}d"] = 1.0 - out[f"mc_up_{h}d"]
-            out[f"mc_median_{h}d"] = float(np.median(sims))
-    else:
-        # GBM Fallback
-        for h in horizons:
-            drift = (mu - 0.5 * sigma**2) * h
-            vol = sigma * np.sqrt(h)
-            shocks = rng.normal(0, 1, n_sim)
-            final_returns = np.exp(drift + vol * shocks) - 1.0
-            out[f"mc_up_{h}d"] = float(np.mean(final_returns > 0))
-            out[f"mc_down_{h}d"] = 1.0 - out[f"mc_up_{h}d"]
-            out[f"mc_median_{h}d"] = float(np.median(final_returns))
+def summarize_analogs(analogs: pd.DataFrame) -> Dict[str, float]:
+    if analogs.empty: return {}
+    w = analogs["similarity"].fillna(1.0)
+    out = {"n": float(len(analogs))}
+    for n in [1, 2, 5]:
+        c = f"fwd_ret_{n}"
+        vals = analogs[c].fillna(0)
+        out[f"ret_{n}_median"] = float(vals.median())
+        out[f"ret_{n}_p_up"] = float(np.average((vals > 0).astype(float), weights=w))
+        out[f"ret_{n}_p_down"] = float(np.average((vals < 0).astype(float), weights=w))
     return out
 
-def compute_confidence_grade(analog_count: int, avg_sim: float, regime: str, signal: str, vol_ratio: float) -> Tuple[str, float]:
-    score = 0
-    if analog_count >= 25: score += 2
-    elif analog_count >= 15: score += 1
-    if avg_sim > 0.75: score += 1
-    if regime == "BULL_TREND" and signal.startswith("CALL"): score += 1
-    elif regime == "BEAR_DOWNTREND" and signal.startswith("PUT"): score += 1
-    if vol_ratio < 1.2: score += 1
-    
-    if score >= 5: return "A (High)", 1.0
-    if score >= 4: return "B (Medium-High)", 0.9
-    if score >= 2: return "C (Medium)", 0.75
-    return "D (Low)", 0.5
-
-# -----------------------------
-# Signal Logic & UI Helpers (Preserved)
-# -----------------------------
 def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     if row is None or row.empty: return "NO DATA", "No data"
     uo_pct = float(row.get("uo_pctile", 0.5))
@@ -530,10 +502,14 @@ def classify_timeframe_call(row: pd.Series, timeframe: str) -> Tuple[str, str]:
     gap_strength = float(row.get("uo_gap_strength", 0.0))
     is_tactical = timeframe in {"2hour_proxy", "hourly_proxy", "real_1hour", "real_2hour"}
     is_structural = timeframe in {"daily", "weekly"}
-    if is_tactical and uo_pct > 0.90 and uo_gap < 0 and uo_slope3 < 0 and rsi_val > 68: return "PUT", "Tactical momentum rolling from elevated zone"
-    if is_tactical and uo_pct > 0.78 and uo_gap > 0 and uo_slope3 >= 0: return "CALL", "Composite rising above signal"
-    if is_tactical and uo_pct < 0.20 and uo_gap > 0 and uo_slope3 > 0 and rsi_val < 38: return "CALL", "Turning up from washed-out zone"
-    if is_tactical and uo_gap < 0 and uo_slope3 < 0: return "PUT", "Composite below signal and falling"
+    if is_tactical and uo_pct > 0.90 and uo_gap < 0 and uo_slope3 < 0 and rsi_val > 68:
+        return "PUT", "Tactical momentum rolling from elevated zone"
+    if is_tactical and uo_pct > 0.78 and uo_gap > 0 and uo_slope3 >= 0:
+        return "CALL", "Composite rising above signal"
+    if is_tactical and uo_pct < 0.20 and uo_gap > 0 and uo_slope3 > 0 and rsi_val < 38:
+        return "CALL", "Turning up from washed-out zone"
+    if is_tactical and uo_gap < 0 and uo_slope3 < 0:
+        return "PUT", "Composite below signal and falling"
     if is_structural:
         above2 = int(row.get("uo_above_signal_2", 0)) == 1
         below2 = int(row.get("uo_below_signal_2", 0)) == 1
@@ -655,8 +631,8 @@ def plot_dashboard(symbol: str, hourly_df: pd.DataFrame, tactical_df: pd.DataFra
 # -----------------------------
 # Main App
 # -----------------------------
-st.title("📈 Stable Market Engine v8 | Context MC Ranked")
-st.caption("Cross-Ticker Analogs | State-Aware Monte Carlo | Regime Filter | Confidence Grading | CSV/Alpaca")
+st.title("📈 Stable Market Engine v7 | Monte Carlo Ranked")
+st.caption("Alpaca SDK | GBM Monte Carlo (1-5D) | Ultimate Oscillator | CSV Upload Supported")
 
 with st.sidebar:
     st.header("🔑 Credentials")
@@ -695,19 +671,16 @@ if benchmark not in daily_map or daily_map[benchmark].empty:
     st.error(f"Could not load benchmark {benchmark} from Alpaca."); st.stop()
 benchmark_daily = daily_map[benchmark]
 
-# v8: Classify Regime Once
-regime = classify_market_regime(benchmark_daily)
-st.info(f"🌍 Market Regime: `{regime}` (Trend Slope & Vol Ratio)")
-
-# v8: In-Memory Cross-Ticker Pool
-pool_batch_list = []
-enriched_cache: Dict[str, pd.DataFrame] = {}
-
+rows: List[Dict[str, object]] = []
+detail: Dict[str, Dict[str, object]] = {}
 progress = st.progress(0.0)
+
 for i, sym in enumerate(symbols):
     progress.progress((i + 1) / max(1, len(symbols)))
     daily_raw = daily_map.get(sym, pd.DataFrame())
-    if daily_raw.empty: continue
+    if daily_raw.empty:
+        rows.append({"Symbol": sym, "Status": "No data"})
+        continue
 
     if intraday_source == "real":
         tactical_raw = fetch_alpaca_2hour(sym, months=12, key=alpaca_key, secret=alpaca_secret, feed=feed)
@@ -725,35 +698,6 @@ for i, sym in enumerate(symbols):
     tactical_df = enrich_price_features(tactical_raw, tactical_timeframe, benchmark_daily)
     daily_df = enrich_price_features(daily_raw, "daily", benchmark_daily)
     weekly_df = enrich_price_features(weekly_raw, "weekly", benchmark_daily)
-    
-    # Store for later
-    enriched_cache[sym] = {
-        "hourly": hourly_df, "tactical": tactical_df, "daily": daily_df, "weekly": weekly_df,
-        "tactical_timeframe": tactical_timeframe, "hourly_label": hourly_label, "tactical_label": tactical_label
-    }
-    
-    # v8: Add to cross-ticker pool
-    daily_fwd = add_forward_returns(daily_df)
-    pool_batch_list.append(build_analog_pool_batch(sym, daily_fwd))
-
-progress.empty()
-global_analog_pool = pd.concat(pool_batch_list, ignore_index=True) if pool_batch_list else pd.DataFrame()
-
-# Second Pass: Rank & Score
-rows: List[Dict[str, object]] = []
-detail: Dict[str, Dict[str, object]] = {}
-progress = st.progress(0.0)
-
-for i, sym in enumerate(symbols):
-    progress.progress((i + 1) / max(1, len(symbols)))
-    cache = enriched_cache.get(sym)
-    if not cache: 
-        rows.append({"Symbol": sym, "Status": "No data"})
-        continue
-        
-    hourly_df, tactical_df, daily_df, weekly_df = cache["hourly"], cache["tactical"], cache["daily"], cache["weekly"]
-    hourly_label, tactical_label = cache["hourly_label"], cache["tactical_label"]
-    tactical_timeframe = cache["tactical_timeframe"]
 
     asof = pd.Timestamp.today().normalize() if analysis_mode == "Current" else pd.Timestamp(analysis_date)
     hourly_view = slice_asof(hourly_df, asof)
@@ -770,43 +714,25 @@ for i, sym in enumerate(symbols):
     weekly_row = weekly_view.iloc[-1] if not weekly_view.empty else pd.Series(dtype=float)
 
     # Signals
-    hourly_call, hourly_reason = classify_timeframe_call(hourly_row, hourly_timeframe if hourly_view.empty else cache["hourly_label"].lower().replace(" (proxy)", "_proxy").replace(" ", ""))
+    hourly_call, hourly_reason = classify_timeframe_call(hourly_row, hourly_timeframe)
     tactical_call, tactical_reason = classify_timeframe_call(tactical_row, tactical_timeframe)
     daily_call, daily_reason = classify_timeframe_call(daily_row, "daily")
     weekly_call, weekly_reason = classify_timeframe_call(weekly_row, "weekly")
     combined = combine(tactical_call, daily_call, weekly_call)
     sev = compute_severity(tactical_view, tactical_row)
-    
-    # v8: Cross-Ticker Analog Search
-    current_vec = daily_row[ANALOG_FEATURES].fillna(0) if len(daily_row) > 0 else pd.Series(dtype=float)
-    analogs = search_cross_ticker_analogs(global_analog_pool, current_vec, sym, n=30)
-    analog_summary = {}
-    if not analogs.empty:
-        w = analogs["similarity"].fillna(1.0)
-        analog_summary = {"n": float(len(analogs))}
-        for n in [1, 2, 5]:
-            c = f"fwd_ret_{n}"
-            vals = analogs[c].fillna(0)
-            analog_summary[f"ret_{n}_median"] = float(vals.median())
-            analog_summary[f"ret_{n}_p_up"] = float(np.average((vals > 0).astype(float), weights=w))
-            analog_summary[f"ret_{n}_p_down"] = float(np.average((vals < 0).astype(float), weights=w))
-            
+    analogs = find_analogs(daily_df, daily_row.name)
+    analog_summary = summarize_analogs(analogs)
     reco = recommendation(tactical_call if tactical_call != "NEUTRAL" else daily_call, sev, analog_summary)
     cross = distance_to_cross(tactical_row, tactical_view)
 
-    # v8: State-Aware Monte Carlo & Confidence
-    mc_probs = compute_state_aware_mc(analogs, daily_df["Close"], horizons=[1,2,3,4,5])
-    avg_sim = float(analogs["similarity"].mean()) if not analogs.empty else 0.5
-    vol_ratio = float(benchmark_daily["Close"].pct_change().rolling(20).std().iloc[-1]) / float(benchmark_daily["Close"].pct_change().rolling(60).std().iloc[-1]) if len(benchmark_daily) > 60 else 1.0
-    conf_grade, conf_weight = compute_confidence_grade(int(analog_summary.get("n", 0)), avg_sim, regime, combined, vol_ratio)
-    
-    mc_rank_score = np.mean([mc_probs[f"mc_up_{h}d"] for h in [1,2,3,4,5]]) * conf_weight
+    # Monte Carlo (uses full daily history for accurate vol/drift)
+    mc_probs = compute_monte_carlo(daily_raw["Close"])
+    mc_rank_score = np.mean([mc_probs[f"mc_up_{h}d"] for h in [1,2,3,4,5]])
 
     overheat_score = (float(tactical_row.get("uo_pctile", 0.5)) * 0.30 + float(daily_row.get("uo_pctile", 0.5)) * 0.35 + min(max(float(daily_row.get("rsi_14", 50))/100, 0), 1)*0.15 + min(max((float(daily_row.get("cci_20", 0))+200)/400, 0), 1)*0.20) * 100
 
     rows.append({
         "Symbol": sym, "Status": "OK", "As Of": str(daily_row.name.date()),
-        "Confidence": conf_grade,
         "MC Rank Score": round(mc_rank_score * 100, 1),
         "MC 1D Up %": round(mc_probs["mc_up_1d"]*100, 1), "MC 1D Down %": round(mc_probs["mc_down_1d"]*100, 1),
         "MC 2D Up %": round(mc_probs["mc_up_2d"]*100, 1), "MC 2D Down %": round(mc_probs["mc_down_2d"]*100, 1),
@@ -825,17 +751,18 @@ for i, sym in enumerate(symbols):
         "weekly": weekly_view, "weekly_call": (weekly_call, weekly_reason),
         "combined": combined, "recommendation": reco, "severity": sev, "analogs": analogs,
         "analog_summary": analog_summary, "cross": cross, "asof": asof,
-        "mc_probs": mc_probs, "conf_grade": conf_grade, "regime": regime
+        "mc_probs": mc_probs
     }
 
 progress.empty()
 results_df = pd.DataFrame(rows)
-st.subheader("📊 Ranked Results (Highest Context-Aware MC Up Probability First)")
+st.subheader("📊 Ranked Results (Highest MC Up Probability First)")
 if results_df.empty: st.warning("No results generated."); st.stop()
 
+# Sort by Monte Carlo Rank Score (descending)
 results_df = results_df.sort_values("MC Rank Score", ascending=False)
-st.dataframe(results_df, width="stretch", hide_index=True)
-st.download_button("⬇️ Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "v8_mc_ranked_results.csv", "text/csv")
+st.dataframe(results_df, width="stretch", hide_index=True, column_config={"MC Rank Score": st.column_config.NumberColumn(format="%.1f%%")})
+st.download_button("⬇️ Download results CSV", results_df.to_csv(index=False).encode("utf-8"), "mc_ranked_results.csv", "text/csv")
 
 valid_symbols = results_df.loc[results_df["Status"] == "OK", "Symbol"].tolist()
 if not valid_symbols: st.stop()
@@ -846,7 +773,7 @@ st.session_state.selected_symbol = selected
 
 item = detail[selected]
 st.divider()
-st.subheader(f"🔍 Detailed Analysis: {selected} | Confidence: `{item['conf_grade']}` | Regime: `{item['regime']}`")
+st.subheader(f"🔍 Detailed Analysis: {selected}")
 hourly_call, hourly_reason = item["hourly_call"]
 tactical_call, tactical_reason = item["tactical_call"]
 daily_call, daily_reason = item["daily_call"]
@@ -868,14 +795,12 @@ c3.metric("Daily", daily_call)
 c4.metric("Weekly", weekly_call)
 c5.metric("Combined", item["combined"])
 
-st.markdown("### 🎲 State-Aware Monte Carlo Probabilities")
+st.markdown("### 🎲 Monte Carlo Forward Probabilities")
 mc = item["mc_probs"]
 mc_cols = st.columns(5)
 for i, (col, h) in enumerate(zip(mc_cols, [1,2,3,4,5])):
-    up = mc[f'mc_up_{h}d']*100
-    down = mc[f'mc_down_{h}d']*100
-    col.metric(f"{h}D Up", f"{up:.1f}%")
-    col.caption(f"Down: {down:.1f}%")
+    col.metric(f"{h}D Up", f"{mc[f'mc_up_{h}d']*100:.1f}%")
+    col.caption(f"Down: {mc[f'mc_down_{h}d']*100:.1f}%")
 
 st.markdown(f"**Signal Reasons**\n- {hourly_label}: {hourly_reason}\n- {tactical_label}: {tactical_reason}\n- Daily: {daily_reason}\n- Weekly: {weekly_reason}")
 st.markdown(f"**Recommendation**: `{item['recommendation']}`")
