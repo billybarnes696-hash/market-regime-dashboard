@@ -426,7 +426,7 @@ def classify_market_regime(benchmark_df: pd.DataFrame) -> str:
     return "CHOP_RANGE"
 
 def build_analog_pool_batch(symbol: str, enriched_df: pd.DataFrame) -> pd.DataFrame:
-    """Defensive: only selects columns that actually exist."""
+    """Defensive: only selects columns that actually exist in the dataframe."""
     if enriched_df.empty: return pd.DataFrame()
     available = [c for c in ANALOG_FEATURES if c in enriched_df.columns]
     fwd = [c for c in ["fwd_ret_1", "fwd_ret_2", "fwd_ret_5"] if c in enriched_df.columns]
@@ -755,7 +755,10 @@ if run_analysis:
         combined = combine(tactical_call, daily_call, weekly_call)
         sev = compute_severity(tactical_view, tactical_row)
         
-        current_vec = daily_row[ANALOG_FEATURES].fillna(0) if len(daily_row) > 0 else pd.Series(dtype=float)
+        # 🛡️ FIX: Dynamic intersection prevents KeyError if columns are missing
+        safe_features = [f for f in ANALOG_FEATURES if f in daily_row.index]
+        current_vec = daily_row[safe_features].fillna(0) if len(daily_row) > 0 else pd.Series(dtype=float)
+        
         analogs = search_cross_ticker_analogs(st.session_state.pool, current_vec, n=30)
         analog_summary = {}
         if not analogs.empty:
