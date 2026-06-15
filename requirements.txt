@@ -1,8 +1,5 @@
-
-streamlit>=1.36
-alpaca-py>=0.42.0
-pandas>=2.2
-numpy>=1.26
-plotly>=5.22
-pytz>=2024.1
-pyarrow>=15.0.0
+streamlit
+pandas
+requests
+python-dateutil
+openpyxl
