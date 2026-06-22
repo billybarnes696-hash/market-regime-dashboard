@@ -26,182 +26,90 @@ except Exception:
 
 
 # ============================================================
-# Windsor Cross Quote-Ready SAM Finder + Price Check - v7
+# Windsor Cross SAM Opportunity Funnel - v9
 #
-# Purpose:
-# Find EASY-TO-RESPOND, quote-ready SAM.gov product opportunities
-# for a reseller/drop-ship strategy.
-#
-# Core workflow:
-# 1. Search SAM.gov for solicitation + combined synopsis/solicitation only.
-# 2. Scan available SAM attachments/PDFs/ZIPs.
-# 3. Extract likely products, part numbers, NSNs, quantities, brands.
-# 4. Rank by quick-hit/drop-ship fit.
-# 5. Create GSA Advantage search links for market benchmarking.
-# 6. Compare against uploaded distributor cost and optional GSA pricing.
-# 7. Produce a simple Bid / Supplier Check / Manual Review / Pass verdict.
-#
-# Notes:
-# - SAM often does not expose every attachment through API resourceLinks.
-# - GSA Advantage does not behave like a simple public product-price API in most cases.
-#   This app creates GSA Advantage search links and supports uploaded GSA price benchmarks.
-# - Distributor APIs can be added later; v7 supports distributor pricing CSV upload now.
+# This version is less frustrating by design:
+# - Runs multiple smaller SAM searches instead of one giant OR query.
+# - Shows funnel counts: raw results, category matches, quote-ready candidates.
+# - Has Discovery / Balanced / Strict modes.
+# - Keeps "maybe" opportunities visible in Discovery mode instead of hiding everything.
+# - Still filters out obvious non-targets: awards, sources sought, construction, staffing, etc.
 # ============================================================
 
-st.set_page_config(page_title="Windsor Cross Quote-Ready SAM Finder v7", layout="wide")
+st.set_page_config(page_title="Windsor Cross SAM Opportunity Funnel v9", layout="wide")
 
-st.title("Windsor Cross Quote-Ready SAM Finder + Price Check")
-st.caption(
-    "Find quote-ready product RFQs, scan attachments, extract products, benchmark GSA market pricing, "
-    "and compare against distributor cost."
-)
+st.title("Windsor Cross SAM Opportunity Funnel v9")
+st.caption("Find more quote-ready product opportunities first, then rank them for low-touch reseller/drop-ship fit.")
 
 
 # -----------------------------
-# Product Panels
+# Search Packs
 # -----------------------------
-PRODUCT_CATEGORY_KEYWORDS = {
+SEARCH_PACKS = {
+    "Toner / Printer / Office": [
+        "toner", "printer cartridge", "ink cartridge", "drum cartridge",
+        "office supplies", "copy paper", "paper", "binders", "envelopes"
+    ],
+    "Janitorial / Cleaning Supplies": [
+        "janitorial supplies", "cleaning supplies", "disinfectant",
+        "paper towels", "trash bags", "wipes", "soap", "sanitizer"
+    ],
+    "Gloves / PPE / Safety Supplies": [
+        "nitrile gloves", "disposable gloves", "ppe", "safety glasses",
+        "first aid kit", "ear plugs", "safety vest", "hard hats"
+    ],
     "Batteries / Power": [
-        "battery", "batteries", "lithium", "power supply", "charger", "adapter", "ups"
-    ],
-    "Toner / Printer": [
-        "toner", "cartridge", "printer", "drum", "ink", "mfd", "copier"
-    ],
-    "Gloves / PPE": [
-        "gloves", "ppe", "nitrile", "latex", "safety glasses", "mask", "respirator", "protective"
-    ],
-    "Janitorial / Cleaning": [
-        "janitorial", "cleaning", "disinfectant", "paper towels", "trash bags", "wipes",
-        "detergent", "custodial supplies", "soap", "sanitizer"
-    ],
-    "Office Supplies": [
-        "office supplies", "copy paper", "paper", "folders", "pens", "staples", "binders",
-        "envelopes", "labels"
+        "battery", "batteries", "lithium battery", "power supply",
+        "charger", "ups battery", "adapter"
     ],
     "IT Peripherals": [
-        "monitor", "keyboard", "mouse", "dock", "cable", "adapter", "headset", "webcam",
-        "scanner", "external drive"
-    ],
-    "Safety / Industrial Supplies": [
-        "safety", "first aid", "hard hat", "earplug", "helmet", "cones", "vest", "eyewash",
-        "spill kit"
+        "monitor", "keyboard", "mouse", "headset", "webcam",
+        "docking station", "cable", "adapter", "scanner"
     ],
     "Uniforms / Apparel": [
-        "uniform", "apparel", "shirt", "pants", "boots", "coveralls", "jacket"
+        "uniforms", "boots", "shirts", "pants", "coveralls", "jackets"
+    ],
+    "Industrial Consumables": [
+        "filters", "labels", "tape", "tools", "hardware", "fasteners",
+        "spill kit", "cones", "signs"
     ],
 }
 
-DEFAULT_CATEGORIES = [
-    "Batteries / Power",
-    "Toner / Printer",
-    "Gloves / PPE",
-    "Janitorial / Cleaning",
-    "Office Supplies",
-    "Safety / Industrial Supplies",
+PRODUCT_TERMS = sorted(set([t for terms in SEARCH_PACKS.values() for t in terms]))
+
+OBVIOUS_PASS_TITLE_TERMS = [
+    "construction", "renovation", "repair", "maintenance", "calibration", "tmde",
+    "services", "staffing", "support services", "janitorial services", "custodial services",
+    "installation", "install", "training", "software development", "content package",
+    "fuel", "diesel", "gasoline", "inspection", "testing", "rental", "lease",
+    "architect", "engineering", "design-build", "landscaping", "snow removal"
 ]
 
+ALLOW_TITLE_TERMS = [
+    "janitorial supplies", "cleaning supplies", "office supplies", "safety supplies",
+    "first aid supplies", "toner", "cartridge", "gloves", "battery", "batteries",
+    "paper towels", "trash bags", "monitor", "keyboard", "mouse", "uniforms"
+]
 
-# -----------------------------
-# Scoring Terms
-# -----------------------------
-EASY_TERMS = {
-    "rfq": 18,
-    "request for quote": 18,
-    "quote": 10,
-    "quotation": 10,
-    "firm fixed price": 16,
-    "ffp": 12,
-    "fob destination": 12,
-    "commercial product": 12,
-    "commercial item": 12,
-    "cots": 12,
-    "brand name": 14,
-    "brand name or equal": 14,
-    "authorized reseller": 18,
-    "authorized distributor": 18,
-    "distributor": 8,
-    "supplier": 6,
-    "unit price": 8,
-    "total price": 8,
-    "delivery": 8,
-    "lead time": 8,
-    "quantity": 8,
-    "purchase order": 10,
-    "simplified acquisition": 12,
-    "lowest price": 12,
-    "lpta": 10,
-    "email": 5,
-}
+EASY_TERMS = [
+    "rfq", "request for quote", "quote", "quotation", "firm fixed price", "ffp",
+    "fob destination", "commercial product", "commercial item", "cots", "brand name",
+    "brand name or equal", "authorized reseller", "authorized distributor", "unit price",
+    "total price", "delivery", "lead time", "quantity", "purchase order",
+    "simplified acquisition", "lowest price", "lpta"
+]
 
-SET_ASIDE_TERMS = {
-    "women-owned": 20,
-    "wosb": 20,
-    "edwosb": 20,
-    "economically disadvantaged women-owned": 20,
-    "total small business": 12,
-    "small business set-aside": 12,
-    "small business": 6,
-}
+HARD_TERMS = [
+    "oral presentation", "site visit", "mandatory site visit", "bafo", "best and final",
+    "technical proposal", "technical volume", "management approach", "quality control plan",
+    "staffing plan", "key personnel", "resume", "past performance", "security clearance",
+    "facility clearance", "statement of work", "performance work statement", "pws",
+    "labor categories", "onsite", "on-site", "installation", "service technician",
+    "subcontracting plan", "bond", "bid guarantee", "service contract act",
+    "wage determination", "construction", "renovation", "calibration", "tmde"
+]
 
-HARD_TERMS = {
-    "award notice": -100,
-    "sources sought": -80,
-    "presolicitation": -60,
-    "pre-solicitation": -60,
-    "oral presentation": -45,
-    "in-person presentation": -45,
-    "site visit": -35,
-    "mandatory site visit": -50,
-    "bafo": -30,
-    "best and final": -30,
-    "technical proposal": -40,
-    "technical volume": -40,
-    "management approach": -30,
-    "quality control plan": -25,
-    "staffing plan": -40,
-    "key personnel": -45,
-    "resume": -25,
-    "past performance": -25,
-    "cpars": -20,
-    "security clearance": -60,
-    "facility clearance": -60,
-    "secret clearance": -60,
-    "statement of work": -20,
-    "performance work statement": -25,
-    "pws": -20,
-    "labor category": -40,
-    "labor categories": -40,
-    "staffing": -40,
-    "onsite": -30,
-    "on-site": -30,
-    "installation": -30,
-    "maintenance services": -30,
-    "service technician": -35,
-    "subcontracting plan": -35,
-    "bond": -40,
-    "bid guarantee": -40,
-    "construction": -60,
-    "renovation": -60,
-    "repair": -35,
-    "calibration": -45,
-    "tmde": -45,
-    "service contract act": -35,
-    "wage determination": -30,
-}
-
-REQUIREMENT_PATTERNS = {
-    "Email quote likely": r"(email.*quote|quote.*email|submit.*quote|send.*quote)",
-    "CAGE/UEI likely needed": r"\b(cage|uei|sam registration|unique entity)\b",
-    "Delivery lead time requested": r"\b(lead time|delivery schedule|days aro|after receipt of order)\b",
-    "Authorized reseller proof": r"\b(authorized reseller|authorized distributor|authorization letter|reseller letter)\b",
-    "Brand name": r"\b(brand name|brand-name)\b",
-    "Unit/total price": r"\b(unit price|total price|extended price)\b",
-    "SF 1449/FAR clauses": r"\b(sf\s*1449|far|dfars)\b",
-    "Technical narrative": r"\b(technical proposal|technical volume|technical approach)\b",
-    "Past performance": r"\b(past performance|cpars|references)\b",
-    "Site visit": r"\b(site visit|walk.?through)\b",
-    "Oral presentation": r"\b(oral presentation|presentation)\b",
-}
+SET_ASIDE_BUCKETS = ["WOSB/EDWOSB", "Total Small Business", "Small Business", "No Set-Aside", "Unknown"]
 
 
 # -----------------------------
@@ -230,6 +138,14 @@ def get_notice_id(opp):
     return clean_text(first_value(opp, ["solicitationNumber", "noticeId", "opportunityId", "id"]))
 
 
+def get_title(opp):
+    return clean_text(opp.get("title", ""))
+
+
+def get_description(opp):
+    return clean_text(opp.get("description", ""))
+
+
 def get_set_aside(opp):
     return clean_text(first_value(opp, ["typeOfSetAsideDescription", "setAsideDescription", "setAside"]))
 
@@ -254,37 +170,6 @@ def get_ui_link(opp):
     return clean_text(opp.get("uiLink", ""))
 
 
-def notice_is_quote_ready_type(notice_type):
-    n = notice_type.lower()
-    return ("solicitation" in n or "combined" in n) and "award" not in n and "sources sought" not in n and "pre" not in n
-
-
-def notice_is_excluded_type(notice_type):
-    n = notice_type.lower()
-    return "award" in n or "sources sought" in n or "pre-solicitation" in n or "presolicitation" in n
-
-
-def category_terms(selected_categories):
-    terms = []
-    for cat in selected_categories:
-        terms.extend(PRODUCT_CATEGORY_KEYWORDS.get(cat, []))
-    return sorted(set([t.lower() for t in terms]))
-
-
-def category_hits(text, selected_categories):
-    t = text.lower()
-    hits = []
-    for term in category_terms(selected_categories):
-        if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", t):
-            hits.append(term)
-    return hits
-
-
-def build_keyword_from_categories(selected_categories):
-    terms = category_terms(selected_categories)
-    return " OR ".join(terms[:35])
-
-
 def parse_due_date(value):
     if not value:
         return pd.NaT
@@ -303,37 +188,6 @@ def days_until_due(value):
     return (dt.date() - date.today()).days
 
 
-def parse_money(value):
-    if value in (None, "", [], {}):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    matches = re.findall(r"[\$]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", str(value))
-    if not matches:
-        return None
-    try:
-        return float(matches[0].replace(",", ""))
-    except Exception:
-        return None
-
-
-def get_value(opp):
-    candidates = [
-        opp.get("awardAmount"),
-        opp.get("awardValue"),
-        opp.get("estimatedValue"),
-        opp.get("baseAndAllOptionsValue"),
-    ]
-    award = opp.get("award")
-    if isinstance(award, dict):
-        candidates.extend([award.get("amount"), award.get("awardAmount"), award.get("awardValue")])
-    for value in candidates:
-        parsed = parse_money(value)
-        if parsed is not None:
-            return parsed
-    return None
-
-
 def set_aside_bucket(set_aside):
     s = (set_aside or "").lower()
     if "women" in s or "wosb" in s or "edwosb" in s:
@@ -347,17 +201,48 @@ def set_aside_bucket(set_aside):
     return "Unknown"
 
 
-def extract_emails(text):
-    emails = sorted(set(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text or "")))
-    return ", ".join(emails[:5])
+def is_quote_ready_notice_type(notice_type):
+    n = notice_type.lower()
+    return ("solicitation" in n or "combined" in n) and "award" not in n and "sources sought" not in n and "pre" not in n
 
 
-def matched_requirements(text):
-    found = []
-    for label, pattern in REQUIREMENT_PATTERNS.items():
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            found.append(label)
-    return "; ".join(found)
+def is_excluded_notice_type(notice_type):
+    n = notice_type.lower()
+    return "award" in n or "sources sought" in n or "pre-solicitation" in n or "presolicitation" in n
+
+
+def title_obvious_pass(title):
+    t = title.lower()
+    if any(x in t for x in ALLOW_TITLE_TERMS):
+        return False
+    return any(x in t for x in OBVIOUS_PASS_TITLE_TERMS)
+
+
+def product_hits(text, selected_packs):
+    terms = []
+    for pack in selected_packs:
+        terms.extend(SEARCH_PACKS.get(pack, []))
+    terms = sorted(set(terms))
+    t = text.lower()
+    hits = []
+    for term in terms:
+        if re.search(rf"(?<![a-z0-9]){re.escape(term.lower())}(?![a-z0-9])", t):
+            hits.append(term)
+    return hits
+
+
+def broad_product_hits(text):
+    t = text.lower()
+    hits = []
+    for term in PRODUCT_TERMS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(term.lower())}(?![a-z0-9])", t):
+            hits.append(term)
+    return sorted(set(hits))
+
+
+def is_service_psc(psc):
+    p = clean_text(psc)
+    return bool(p) and not p[0].isdigit()
 
 
 def gsa_advantage_link(query):
@@ -367,10 +252,68 @@ def gsa_advantage_link(query):
     return f"https://www.gsaadvantage.gov/advantage/ws/search/advantage_search?keyword={quote_plus(query)}"
 
 
+def extract_emails(text):
+    return ", ".join(sorted(set(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text or "")))[:5])
+
+
+def find_nsns(text):
+    patterns = [r"\b\d{4}[-\s]?\d{2}[-\s]?\d{3}[-\s]?\d{4}\b", r"\b\d{13}\b"]
+    out = []
+    for p in patterns:
+        out.extend(re.findall(p, text))
+    return ", ".join(sorted(set(out))[:5])
+
+
+def find_part_numbers(text):
+    upper = text.upper()
+    patterns = [
+        r"\bpart(?:\s+number|\s+no\.?|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
+        r"\bp/n\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
+        r"\bmpn\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
+        r"\bmodel\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
+    ]
+    out = []
+    for p in patterns:
+        out.extend(re.findall(p, upper, flags=re.I))
+    bad = {"THE", "AND", "FOR", "WITH", "QUOTE", "SOLICITATION", "ITEM"}
+    cleaned = []
+    for x in out:
+        x = x.strip(" .,:;()[]{}")
+        if x and x not in bad:
+            cleaned.append(x)
+    return ", ".join(sorted(set(cleaned))[:8])
+
+
+def find_quantities(text):
+    patterns = [
+        r"\bqty\.?\s*[:\-]?\s*(\d{1,6})\b",
+        r"\bquantity\s*[:\-]?\s*(\d{1,6})\b",
+        r"\b(\d{1,6})\s*(each|ea|boxes|box|units|unit|cases|case|pairs|pair)\b",
+    ]
+    out = []
+    for p in patterns:
+        for m in re.findall(p, text, flags=re.I):
+            if isinstance(m, tuple):
+                out.append(" ".join([str(x) for x in m if x]))
+            else:
+                out.append(str(m))
+    return ", ".join(sorted(set(out))[:8])
+
+
+def primary_query(title, hits, parts, nsns):
+    if parts:
+        return parts.split(",")[0].strip()
+    if nsns:
+        return nsns.split(",")[0].strip()
+    if hits:
+        return hits[0]
+    return title
+
+
 # -----------------------------
 # Attachment extraction
 # -----------------------------
-def extract_pdf_text(content, max_pages=20):
+def extract_pdf_text(content, max_pages=15):
     if not PyPDF2:
         return ""
     try:
@@ -400,7 +343,6 @@ def extract_xlsx_text(content):
         wb = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=True)
         chunks = []
         for ws in wb.worksheets[:5]:
-            chunks.append(f"Sheet: {ws.title}")
             for row in ws.iter_rows(max_row=80, values_only=True):
                 line = " ".join([str(c) for c in row if c is not None])
                 if line.strip():
@@ -410,11 +352,11 @@ def extract_xlsx_text(content):
         return ""
 
 
-def extract_zip_text(content, max_pages=20):
+def extract_zip_text(content, max_pages=15):
     chunks = []
     try:
         with zipfile.ZipFile(BytesIO(content)) as z:
-            for name in z.namelist()[:25]:
+            for name in z.namelist()[:20]:
                 try:
                     data = z.read(name)
                 except Exception:
@@ -422,7 +364,7 @@ def extract_zip_text(content, max_pages=20):
                 lower = name.lower()
                 chunks.append(f"\n--- FILE: {name} ---\n")
                 if lower.endswith(".pdf") or data[:4] == b"%PDF":
-                    chunks.append(extract_pdf_text(data, max_pages=max_pages))
+                    chunks.append(extract_pdf_text(data, max_pages))
                 elif lower.endswith(".docx"):
                     chunks.append(extract_docx_text(data))
                 elif lower.endswith(".xlsx"):
@@ -431,12 +373,12 @@ def extract_zip_text(content, max_pages=20):
                     chunks.append(data.decode("utf-8", errors="ignore"))
     except Exception:
         return ""
-    return "\n".join([c for c in chunks if c])
+    return "\n".join(chunks)
 
 
 def get_resource_links(opp):
     links = opp.get("resourceLinks", []) or []
-    output = []
+    out = []
     if isinstance(links, list):
         for link in links:
             if isinstance(link, dict):
@@ -446,763 +388,401 @@ def get_resource_links(opp):
                 url = str(link)
                 name = url
             if url:
-                output.append({"name": name, "url": url})
-    return output
+                out.append({"name": name, "url": url})
+    return out
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def download_and_extract_resource(url, api_key, max_mb, max_pages):
-    try:
-        for params in [{}, {"api_key": api_key}]:
-            r = requests.get(
-                url,
-                params=params,
-                timeout=45,
-                headers={"User-Agent": "WindsorCrossQuoteReady/1.0"},
-            )
+def download_and_extract(url, api_key, max_mb, max_pages):
+    for params in [{}, {"api_key": api_key}]:
+        try:
+            r = requests.get(url, params=params, timeout=40, headers={"User-Agent": "WindsorCrossFunnel/1.0"})
             if r.status_code != 200:
                 continue
-
             if len(r.content) > max_mb * 1024 * 1024:
                 return "", f"Skipped > {max_mb}MB"
-
             content = r.content
-            content_type = r.headers.get("content-type", "").lower()
+            ct = r.headers.get("content-type", "").lower()
             lower = url.lower()
-
-            if content[:4] == b"%PDF" or ".pdf" in lower or "pdf" in content_type:
-                txt = extract_pdf_text(content, max_pages=max_pages)
-                return txt, "PDF scanned" if txt else "PDF downloaded; no text extracted"
-
-            if content[:2] == b"PK" or ".zip" in lower or "zip" in content_type:
-                txt = extract_zip_text(content, max_pages=max_pages)
-                return txt, "ZIP/Office scanned" if txt else "ZIP/Office downloaded; no text extracted"
-
+            if content[:4] == b"%PDF" or ".pdf" in lower or "pdf" in ct:
+                txt = extract_pdf_text(content, max_pages)
+                return txt, "PDF scanned" if txt else "PDF no text"
+            if content[:2] == b"PK" or ".zip" in lower or "zip" in ct:
+                txt = extract_zip_text(content, max_pages)
+                return txt, "ZIP/Office scanned" if txt else "ZIP no text"
             if ".docx" in lower:
                 return extract_docx_text(content), "DOCX scanned"
-
             if ".xlsx" in lower:
                 return extract_xlsx_text(content), "XLSX scanned"
-
-            if "text" in content_type or "json" in content_type or "xml" in content_type:
+            if "text" in ct or "json" in ct or "xml" in ct:
                 return r.text, "Text scanned"
-
-        return "", "Could not download readable attachment"
-    except Exception as e:
-        return "", f"Attachment error: {e}"
+        except Exception as e:
+            return "", f"Attachment error: {e}"
+    return "", "No readable attachment"
 
 
 def get_attachment_text(opp, api_key, max_attachments, max_mb, max_pages):
-    links = get_resource_links(opp)
-    chunks = []
-    statuses = []
-
-    for link in links[:max_attachments]:
-        text, status = download_and_extract_resource(link["url"], api_key, max_mb, max_pages)
+    chunks, statuses = [], []
+    for link in get_resource_links(opp)[:max_attachments]:
+        txt, status = download_and_extract(link["url"], api_key, max_mb, max_pages)
         statuses.append(f"{link['name']}: {status}")
-        if text:
-            chunks.append(text)
-
-    return "\n".join(chunks), statuses
-
-
-# -----------------------------
-# Product extraction
-# -----------------------------
-def find_nsns(text):
-    # NSN is typically 13 digits, often formatted 1234-01-234-5678.
-    patterns = [
-        r"\b\d{4}[-\s]?\d{2}[-\s]?\d{3}[-\s]?\d{4}\b",
-        r"\b\d{13}\b",
-    ]
-    found = []
-    for pattern in patterns:
-        found.extend(re.findall(pattern, text))
-    return sorted(set([x.strip() for x in found]))
-
-
-def find_quantities(text):
-    # Pull likely quantities from common RFQ language.
-    patterns = [
-        r"\bqty\.?\s*[:\-]?\s*(\d{1,6})\b",
-        r"\bquantity\s*[:\-]?\s*(\d{1,6})\b",
-        r"\b(\d{1,6})\s*(each|ea|boxes|box|units|unit|cases|case|pairs|pair)\b",
-    ]
-    found = []
-    for pattern in patterns:
-        for m in re.findall(pattern, text, flags=re.IGNORECASE):
-            if isinstance(m, tuple):
-                found.append(" ".join([str(x) for x in m if x]))
-            else:
-                found.append(str(m))
-    return sorted(set(found))
-
-
-def find_part_numbers(text):
-    # Conservative part number extraction. Avoids generic dates and clause numbers where possible.
-    patterns = [
-        r"\bpart(?:\s+number|\s+no\.?|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
-        r"\bp/n\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
-        r"\bmodel\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
-        r"\bmanufacturer part number\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
-        r"\bmpn\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/\.]{2,30})\b",
-    ]
-    found = []
-    upper = text.upper()
-    for pattern in patterns:
-        found.extend(re.findall(pattern, upper, flags=re.IGNORECASE))
-
-    # Clean obvious false positives
-    bad = {"THE", "AND", "FOR", "WITH", "FROM", "THIS", "THAT", "QUOTE", "SOLICITATION"}
-    cleaned = []
-    for x in found:
-        x = x.strip(" .,:;()[]{}")
-        if x and x not in bad and not re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", x):
-            cleaned.append(x)
-    return sorted(set(cleaned))[:8]
-
-
-def find_brand_names(text):
-    # Extract brands/manufacturers from common language.
-    patterns = [
-        r"\bbrand name\s*[:\-]?\s*([A-Z][A-Za-z0-9&\-\s]{2,40})",
-        r"\bmanufacturer\s*[:\-]?\s*([A-Z][A-Za-z0-9&\-\s]{2,40})",
-        r"\bmfr\.?\s*[:\-]?\s*([A-Z][A-Za-z0-9&\-\s]{2,40})",
-        r"\bmake\s*[:\-]?\s*([A-Z][A-Za-z0-9&\-\s]{2,40})",
-    ]
-    found = []
-    for pattern in patterns:
-        for m in re.findall(pattern, text, flags=re.IGNORECASE):
-            m = clean_text(m)
-            # stop at common boundary words
-            m = re.split(r"\b(model|part|p/n|qty|quantity|shall|must|with|for)\b", m, flags=re.IGNORECASE)[0]
-            found.append(clean_text(m))
-    return sorted(set([x for x in found if len(x) >= 2]))[:5]
-
-
-def extract_product_summary(title, full_text, selected_categories):
-    cat_hits = category_hits(full_text, selected_categories)
-    nsns = find_nsns(full_text)
-    parts = find_part_numbers(full_text)
-    qtys = find_quantities(full_text)
-    brands = find_brand_names(full_text)
-
-    # Choose best query for GSA/distributor matching.
-    if parts:
-        primary_query = parts[0]
-    elif nsns:
-        primary_query = nsns[0]
-    elif brands and cat_hits:
-        primary_query = f"{brands[0]} {cat_hits[0]}"
-    elif cat_hits:
-        primary_query = cat_hits[0]
-    else:
-        primary_query = title
-
-    return {
-        "Product Match Terms": ", ".join(cat_hits[:8]),
-        "Primary Product Query": clean_text(primary_query),
-        "Part Numbers": ", ".join(parts),
-        "NSNs": ", ".join(nsns),
-        "Quantities Found": ", ".join(qtys[:8]),
-        "Brands/Manufacturers": ", ".join(brands),
-        "GSA Advantage Link": gsa_advantage_link(primary_query),
-    }
+        if txt:
+            chunks.append(txt)
+    return "\n".join(chunks), "; ".join(statuses[:5])
 
 
 # -----------------------------
-# Pricing match
+# Pricing upload
 # -----------------------------
-def normalize_key(value):
-    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
-
-
-def prepare_price_df(uploaded_file, expected_name):
-    if uploaded_file is None:
+def prepare_price_df(uploaded):
+    if uploaded is None:
         return pd.DataFrame()
-
     try:
-        if uploaded_file.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
+        if uploaded.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded)
         else:
-            df = pd.read_excel(uploaded_file)
-    except Exception as e:
-        st.warning(f"Could not read {expected_name}: {e}")
+            df = pd.read_excel(uploaded)
+    except Exception:
         return pd.DataFrame()
-
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-
-    # Accept a few common column names.
-    part_cols = ["part_number", "part", "sku", "mpn", "manufacturer_part_number", "nsn"]
-    desc_cols = ["description", "item_description", "title", "product"]
-    cost_cols = ["unit_cost", "cost", "price", "your_cost", "distributor_cost"]
-    low_cols = ["gsa_low", "low_price", "lowest_price", "gsa_low_price"]
-    avg_cols = ["gsa_avg", "average_price", "avg_price", "gsa_average_price"]
-    vendor_cols = ["vendor", "supplier", "distributor"]
-
-    def pick(cols):
-        for c in cols:
-            if c in df.columns:
-                return c
-        return None
-
-    part_col = pick(part_cols)
-    desc_col = pick(desc_cols)
-    cost_col = pick(cost_cols)
-    low_col = pick(low_cols)
-    avg_col = pick(avg_cols)
-    vendor_col = pick(vendor_cols)
-
-    if part_col:
-        df["_match_key"] = df[part_col].apply(normalize_key)
-    elif desc_col:
-        df["_match_key"] = df[desc_col].apply(normalize_key)
+    part_col = next((c for c in ["part_number", "part", "sku", "mpn", "manufacturer_part_number", "nsn"] if c in df.columns), None)
+    cost_col = next((c for c in ["unit_cost", "cost", "price", "your_cost", "distributor_cost"] if c in df.columns), None)
+    vendor_col = next((c for c in ["vendor", "supplier", "distributor"] if c in df.columns), None)
+    desc_col = next((c for c in ["description", "item_description", "title", "product"] if c in df.columns), None)
+    key_col = part_col or desc_col
+    if key_col:
+        df["_match_key"] = df[key_col].astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
     else:
         df["_match_key"] = ""
-
-    df["_part_col"] = part_col or ""
-    df["_desc_col"] = desc_col or ""
     df["_cost_col"] = cost_col or ""
-    df["_low_col"] = low_col or ""
-    df["_avg_col"] = avg_col or ""
     df["_vendor_col"] = vendor_col or ""
-
     return df
 
 
-def find_price_match(product_query, part_numbers, nsns, price_df):
-    if price_df is None or price_df.empty:
-        return None
-
-    keys = []
-    for source in [product_query, part_numbers, nsns]:
-        for token in re.split(r"[,;\n]", str(source or "")):
-            k = normalize_key(token)
-            if len(k) >= 3:
-                keys.append(k)
-
-    keys = sorted(set(keys), key=len, reverse=True)
-
-    if not keys:
-        return None
-
-    for key in keys:
-        matches = price_df[price_df["_match_key"].astype(str).str.contains(key, na=False, regex=False)]
-        if not matches.empty:
-            return matches.iloc[0].to_dict()
-
-    return None
-
-
-def safe_float(value):
+def safe_float(v):
     try:
-        if pd.isna(value):
+        if pd.isna(v):
             return None
-        return float(str(value).replace("$", "").replace(",", "").strip())
+        return float(str(v).replace("$", "").replace(",", "").strip())
     except Exception:
         return None
 
 
-def price_analysis(product_query, part_numbers, nsns, distributor_df, gsa_df, target_margin, shipping_per_unit):
-    dist = find_price_match(product_query, part_numbers, nsns, distributor_df)
-    gsa = find_price_match(product_query, part_numbers, nsns, gsa_df)
+def price_match(query, parts, nsns, dist_df, target_margin):
+    if dist_df is None or dist_df.empty:
+        return None, "", None, None, "Need distributor cost"
 
-    dist_cost = None
-    dist_vendor = ""
-    dist_note = ""
+    keys = []
+    for val in [query, parts, nsns]:
+        for token in str(val or "").split(","):
+            k = re.sub(r"[^A-Z0-9]", "", token.upper())
+            if len(k) >= 3:
+                keys.append(k)
+    keys = sorted(set(keys), key=len, reverse=True)
 
-    if dist:
-        cost_col = dist.get("_cost_col", "")
-        vendor_col = dist.get("_vendor_col", "")
-        dist_cost = safe_float(dist.get(cost_col)) if cost_col else None
-        dist_vendor = str(dist.get(vendor_col, "")) if vendor_col else ""
-        dist_note = "Distributor match found"
-
-    gsa_low = None
-    gsa_avg = None
-    gsa_note = ""
-
-    if gsa:
-        low_col = gsa.get("_low_col", "")
-        avg_col = gsa.get("_avg_col", "")
-        cost_col = gsa.get("_cost_col", "")
-
-        # If user uploads one price column as "price", treat it as low if no explicit gsa_low.
-        gsa_low = safe_float(gsa.get(low_col)) if low_col else None
-        gsa_avg = safe_float(gsa.get(avg_col)) if avg_col else None
-
-        if gsa_low is None and cost_col:
-            gsa_low = safe_float(gsa.get(cost_col))
-
-        gsa_note = "GSA benchmark match found"
-
-    landed_cost = None
-    suggested_bid = None
-    gross_margin_pct = None
-    price_verdict = "Need pricing"
-
-    if dist_cost is not None:
-        landed_cost = dist_cost + float(shipping_per_unit or 0)
-        if target_margin >= 1:
-            target_margin = target_margin / 100
-        target_price = landed_cost / max(0.01, (1 - target_margin))
-
-        if gsa_avg:
-            # Try to stay slightly under average GSA market where possible.
-            suggested_bid = min(target_price, gsa_avg * 0.98)
-        elif gsa_low:
-            # If only low GSA is known, target slightly above cost but not wildly above market.
-            suggested_bid = min(target_price, gsa_low * 1.05)
-        else:
-            suggested_bid = target_price
-
-        if suggested_bid > 0:
-            gross_margin_pct = (suggested_bid - landed_cost) / suggested_bid
-
-        if gross_margin_pct is not None:
-            if gross_margin_pct >= target_margin and (gsa_low is None or suggested_bid <= gsa_low * 1.15):
-                price_verdict = "Price looks workable"
-            elif gross_margin_pct >= 0.10:
-                price_verdict = "Thin margin / review"
-            else:
-                price_verdict = "Margin too thin"
-    else:
-        if gsa_low or gsa_avg:
-            price_verdict = "Need distributor cost"
-        else:
-            price_verdict = "Use GSA link / supplier call"
-
-    return {
-        "Distributor Match": dist_note,
-        "Distributor Vendor": dist_vendor,
-        "Distributor Unit Cost": dist_cost,
-        "GSA Match": gsa_note,
-        "GSA Low": gsa_low,
-        "GSA Avg": gsa_avg,
-        "Landed Unit Cost": landed_cost,
-        "Suggested Unit Bid": suggested_bid,
-        "Estimated Gross Margin": gross_margin_pct,
-        "Price Verdict": price_verdict,
-    }
+    for k in keys:
+        matches = dist_df[dist_df["_match_key"].astype(str).str.contains(k, na=False, regex=False)]
+        if not matches.empty:
+            row = matches.iloc[0]
+            cost_col = row.get("_cost_col", "")
+            vendor_col = row.get("_vendor_col", "")
+            cost = safe_float(row.get(cost_col)) if cost_col else None
+            vendor = str(row.get(vendor_col, "")) if vendor_col else ""
+            if cost:
+                bid = cost / (1 - target_margin)
+                return cost, vendor, bid, target_margin, "Distributor cost found"
+    return None, "", None, None, "Need distributor cost"
 
 
 # -----------------------------
-# Difficulty / scoring
+# Scoring
 # -----------------------------
-def difficulty_from_text(full_text, notice_type, cat_hits):
-    t = full_text.lower()
-
-    if notice_is_excluded_type(notice_type):
-        return "Ignore", "Not a quote-ready solicitation type"
-
-    hard_hits = [term for term in HARD_TERMS if term in t]
-    easy_hits = [term for term in EASY_TERMS if term in t]
-
-    hard_stops = [
-        "mandatory site visit",
-        "oral presentation",
-        "security clearance",
-        "facility clearance",
-        "construction",
-        "renovation",
-        "technical proposal",
-        "staffing plan",
-        "labor categories",
-    ]
-
-    if any(x in t for x in hard_stops):
-        return "Hard / Pass", "Hard-stop response burden detected"
-
-    if not cat_hits:
-        return "Off Category", "Does not match selected Windsor Cross product categories"
-
-    if any(x in t for x in ["authorized reseller", "authorized distributor", "brand name"]) and len(easy_hits) >= 3 and len(hard_hits) <= 1:
-        return "Easy Supplier Check", "Simple product RFQ; supplier pricing/authorization is main task"
-
-    if len(easy_hits) >= 6 and len(hard_hits) <= 1:
-        return "Easy Quote", "Likely straightforward quote response"
-
-    if len(easy_hits) >= 4 and len(hard_hits) <= 2:
-        return "Medium", "Likely manageable; check attachments"
-
-    if len(hard_hits) >= 3:
-        return "Medium-Hard", "Several proposal burden terms detected"
-
-    return "Unknown / Review", "Not enough response detail found"
-
-
-def score_opp(opp, attachment_text, selected_categories, include_terms, exclude_terms):
-    title = clean_text(opp.get("title", ""))
-    desc = clean_text(opp.get("description", ""))
+def score_row(opp, attachment_text, selected_packs, mode):
+    title = get_title(opp)
+    desc = get_description(opp)
     notice_type = get_notice_type(opp)
     set_aside = get_set_aside(opp)
+    psc = get_psc(opp)
     due = get_due_date(opp)
 
     summary = f"{title} {desc} {notice_type} {set_aside}"
-    full_text = f"{summary} {attachment_text}"
-    t = full_text.lower()
+    # Use title/desc and early attachments for product matching to avoid FAR boilerplate false positives.
+    product_text = f"{summary} {attachment_text[:2500]}"
+    full = f"{summary} {attachment_text}"
+    full_lower = full.lower()
+
+    hits = product_hits(product_text, selected_packs)
+    broad_hits = broad_product_hits(product_text)
+
+    if is_excluded_notice_type(notice_type):
+        return 0, "Ignore", "Ignore", "Excluded notice type", hits, full
+
+    if not is_quote_ready_notice_type(notice_type):
+        return 10, "Pass", "Hard / Pass", "Not solicitation/combined solicitation", hits, full
+
+    # Discovery lets more through; strict requires product hit and supply PSC.
+    if title_obvious_pass(title):
+        return 0, "Pass", "Hard / Pass", "Service/fuel/construction/software title", hits, full
+
+    if mode == "Strict":
+        if not hits:
+            return 0, "Pass", "Off Category", "No selected product category match", hits, full
+        if is_service_psc(psc):
+            return 0, "Pass", "Hard / Pass", f"PSC {psc} appears service-based", hits, full
+    elif mode == "Balanced":
+        if not hits and not broad_hits:
+            return 0, "Pass", "Off Category", "No product category match", hits, full
+    else:  # Discovery
+        # In discovery, let unknowns through if they have quote-ready/easy terms.
+        pass
+
+    easy = [x for x in EASY_TERMS if x in full_lower]
+    hard = [x for x in HARD_TERMS if x in full_lower]
+
+    hard_stop = any(x in full_lower for x in [
+        "mandatory site visit", "oral presentation", "security clearance",
+        "facility clearance", "construction", "renovation", "technical proposal",
+        "staffing plan", "labor categories"
+    ])
+
+    if hard_stop:
+        return 0, "Pass", "Hard / Pass", "Hard-stop response burden", hits, full
 
     score = 35
     positives = []
     risks = []
 
-    # Hard filter by notice type
-    if notice_is_excluded_type(notice_type):
-        return {
-            "score": 0,
-            "action": "Ignore",
-            "difficulty": "Ignore",
-            "reason": "Excluded notice type: award/sources sought/pre-solicitation",
-            "positive": "",
-            "risks": "Not a quote-ready solicitation",
-            "requirements": "",
-            "emails": "",
-            "days_left": days_until_due(due),
-            "full_text": full_text,
-        }
+    score += 20
+    positives.append("quote-ready type")
 
-    if notice_is_quote_ready_type(notice_type):
+    if hits:
+        score += min(30, len(hits) * 8)
+        positives.append("category match")
+    elif broad_hits:
+        score += 10
+        positives.append("broad product signal")
+        risks.append("not selected category")
+
+    set_bucket = set_aside_bucket(set_aside)
+    if set_bucket == "WOSB/EDWOSB":
         score += 20
-        positives.append("Quote-ready notice type")
-    else:
-        score -= 20
-        risks.append("Notice type not clearly quote-ready")
+    elif set_bucket in ["Total Small Business", "Small Business"]:
+        score += 10
+    elif set_bucket == "No Set-Aside":
+        score -= 8
 
-    cat_hits = category_hits(full_text, selected_categories)
-    if cat_hits:
-        score += min(35, len(cat_hits) * 8)
-        positives.append("Product match: " + ", ".join(cat_hits[:6]))
-    else:
-        return {
-            "score": 0,
-            "action": "Pass",
-            "difficulty": "Off Category",
-            "reason": "Does not match selected product categories",
-            "positive": "",
-            "risks": "Off-category product/service",
-            "requirements": matched_requirements(full_text),
-            "emails": extract_emails(full_text),
-            "days_left": days_until_due(due),
-            "full_text": full_text,
-        }
-
-    for term, pts in SET_ASIDE_TERMS.items():
-        if term in t:
-            score += pts
-            positives.append(term)
-
-    if "no set aside" in set_aside.lower():
-        score -= 12
-        risks.append("No set-aside")
-
-    for term, pts in EASY_TERMS.items():
-        if term in t:
-            score += pts
-            positives.append(term)
-
-    for term, pts in HARD_TERMS.items():
-        if term in t:
-            score += pts
-            risks.append(term)
-
-    include_list = [x.strip().lower() for x in re.split(r"[,;\n]", include_terms or "") if x.strip()]
-    exclude_list = [x.strip().lower() for x in re.split(r"[,;\n]", exclude_terms or "") if x.strip()]
-
-    include_hits = [x for x in include_list if x in t]
-    exclude_hits = [x for x in exclude_list if x in t]
-
-    if include_hits:
-        score += min(20, len(include_hits) * 5)
-        positives.append("Include hits: " + ", ".join(include_hits[:5]))
-
-    if exclude_hits:
-        score -= min(70, len(exclude_hits) * 18)
-        risks.append("Exclude hits: " + ", ".join(exclude_hits[:5]))
+    score += min(35, len(easy) * 5)
+    score -= min(45, len(hard) * 8)
 
     dleft = days_until_due(due)
     if dleft is not None:
         if dleft < 0:
             score -= 100
-            risks.append("Past due")
+            risks.append("past due")
         elif dleft <= 2:
-            score -= 35
-            risks.append("Due in 0-2 days")
+            score -= 25
+            risks.append("due very soon")
         elif dleft <= 5:
-            score -= 12
-            risks.append("Due soon")
+            score -= 10
         elif dleft >= 7:
             score += 8
-            positives.append("Enough time to quote")
 
     if attachment_text:
-        positives.append("Attachments scanned")
-    else:
-        risks.append("No attachment text scanned")
-
-    difficulty, reason = difficulty_from_text(full_text, notice_type, cat_hits)
-
-    if difficulty == "Easy Quote":
-        score += 15
-    elif difficulty == "Easy Supplier Check":
-        score += 12
-    elif difficulty == "Medium-Hard":
-        score -= 20
-    elif difficulty == "Hard / Pass":
-        score -= 50
+        score += 5
 
     score = max(0, min(100, score))
 
-    if difficulty in ["Hard / Pass", "Off Category"] or score < 45:
-        action = "Pass"
-    elif score >= 85 and difficulty in ["Easy Quote", "Easy Supplier Check", "Medium"]:
+    if len(hard) >= 4:
+        difficulty = "Medium-Hard"
+    elif any(x in full_lower for x in ["authorized reseller", "authorized distributor", "brand name"]):
+        difficulty = "Easy Supplier Check"
+    elif len(easy) >= 5 and len(hard) <= 1:
+        difficulty = "Easy Quote"
+    elif len(easy) >= 3:
+        difficulty = "Medium"
+    else:
+        difficulty = "Unknown / Review"
+
+    if score >= 82 and difficulty in ["Easy Quote", "Easy Supplier Check", "Medium"]:
         action = "Pursue First"
-    elif score >= 70:
+    elif score >= 65:
         action = "Supplier Check"
-    elif score >= 55:
+    elif score >= 45:
         action = "Manual Review"
     else:
         action = "Pass"
 
-    return {
-        "score": score,
-        "action": action,
-        "difficulty": difficulty,
-        "reason": reason,
-        "positive": "; ".join(dict.fromkeys(positives[:10])),
-        "risks": "; ".join(dict.fromkeys(risks[:10])),
-        "requirements": matched_requirements(full_text),
-        "emails": extract_emails(full_text),
-        "days_left": dleft,
-        "full_text": full_text,
-    }
+    reason = f"easy={len(easy)}, hard={len(hard)}, product_hits={len(hits)}, broad_hits={len(broad_hits)}"
+    return score, action, difficulty, reason, hits or broad_hits, full
 
 
 # -----------------------------
 # SAM API
 # -----------------------------
 @st.cache_data(show_spinner=False, ttl=600)
-def sam_search(api_key, keyword, posted_from, posted_to, limit):
+def sam_search_one(api_key, query, posted_from, posted_to, limit):
     url = "https://api.sam.gov/opportunities/v2/search"
     params = {
         "api_key": api_key,
-        "q": keyword,
+        "q": query,
         "limit": limit,
         "postedFrom": posted_from,
         "postedTo": posted_to,
-        # Quote-ready only:
-        # o = Solicitation
-        # k = Combined Synopsis/Solicitation
         "ptype": "o,k",
     }
     r = requests.get(url, params=params, timeout=60)
+    if r.status_code != 200:
+        return r.status_code, r.text, []
     try:
-        data = r.json() if r.status_code == 200 else None
+        data = r.json()
+        return r.status_code, r.text, data.get("opportunitiesData", [])
     except Exception:
-        data = None
-    return r.status_code, r.text, data
+        return 500, r.text, []
 
 
 # -----------------------------
-# Sidebar
+# UI
 # -----------------------------
 with st.sidebar:
-    st.header("1) Windsor Cross Product Fit")
-
-    selected_categories = st.multiselect(
-        "Product Categories",
-        options=list(PRODUCT_CATEGORY_KEYWORDS.keys()),
-        default=DEFAULT_CATEGORIES,
-        help="Only opportunities matching these product categories survive."
-    )
-
-    search_from_categories = st.checkbox(
-        "Build SAM search from selected categories",
-        value=True,
-        help="Recommended. Keeps the search aligned to what Windsor Cross can resell."
-    )
-
-    manual_keywords = st.text_area(
-        "Optional extra keywords",
-        value="",
-        height=70,
-        placeholder="Example: authorized reseller OR brand name"
-    )
-
-    base_keyword = build_keyword_from_categories(selected_categories) if search_from_categories else ""
-    if manual_keywords.strip() and base_keyword:
-        keyword = f"({base_keyword}) OR ({manual_keywords.strip()})"
-    elif manual_keywords.strip():
-        keyword = manual_keywords.strip()
-    else:
-        keyword = base_keyword
-
-    st.caption("Actual SAM keyword search:")
-    st.code(keyword or "(blank)", language="text")
-
-    st.header("2) SAM Search Window")
+    st.header("1) Search Strategy")
 
     api_key = st.text_input("Paste SAM.gov API Key", type="password")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        posted_from = st.date_input("Posted From", date.today() - timedelta(days=30))
-    with col2:
-        posted_to = st.date_input("Posted To", date.today())
+    selected_packs = st.multiselect(
+        "Search Packs",
+        options=list(SEARCH_PACKS.keys()),
+        default=[
+            "Toner / Printer / Office",
+            "Janitorial / Cleaning Supplies",
+            "Gloves / PPE / Safety Supplies",
+            "Batteries / Power",
+            "IT Peripherals",
+        ],
+    )
 
-    limit = st.slider("SAM Results to Review", 10, 100, 50)
+    mode = st.radio(
+        "Funnel Mode",
+        options=["Discovery", "Balanced", "Strict"],
+        index=1,
+        help="Discovery shows more maybes. Strict shows only clean product/drop-ship fits."
+    )
 
-    st.info("Notice types are locked to Solicitation + Combined Synopsis/Solicitation.")
+    manual_keywords = st.text_area(
+        "Extra one-per-line searches",
+        value="authorized reseller\nbrand name\nfirm fixed price",
+        height=90
+    )
 
-    st.header("3) Set-Aside / Timing")
+    per_query_limit = st.slider("Results per search term", 5, 50, 15)
+    max_total_to_scan = st.slider("Max total unique notices to scan", 25, 300, 150)
+
+    st.header("2) Dates / Set-Aside")
+
+    posted_from = st.date_input("Posted From", date.today() - timedelta(days=90))
+    posted_to = st.date_input("Posted To", date.today())
 
     set_aside_filter = st.multiselect(
         "Set-Aside",
-        options=["WOSB/EDWOSB", "Total Small Business", "Small Business", "No Set-Aside", "Unknown"],
-        default=["WOSB/EDWOSB", "Total Small Business", "Small Business", "Unknown"],
+        options=SET_ASIDE_BUCKETS,
+        default=["WOSB/EDWOSB", "Total Small Business", "Small Business", "Unknown", "No Set-Aside"],
     )
 
-    min_score = st.slider("Minimum Score", 0, 100, 55)
-    min_days_left = st.slider("Minimum Days Left", 0, 30, 3)
-    max_days_left = st.slider("Maximum Days Left", 1, 90, 45)
+    min_days_left = st.slider("Minimum Days Left", 0, 30, 1)
+    max_days_left = st.slider("Maximum Days Left", 1, 180, 90)
 
-    hide_pass = st.checkbox("Hide Pass / Ignore", value=True)
+    min_score = st.slider("Minimum Score", 0, 100, 35 if mode == "Discovery" else 45)
 
-    st.header("4) Response Burden")
+    hide_pass = st.checkbox("Hide Pass / Ignore", value=(mode != "Discovery"))
 
-    include_terms = st.text_area(
-        "Boost terms",
-        value="authorized reseller\nbrand name\nfirm fixed price\nfob destination\nquote\nlowest price\nunit price\nlead time",
-        height=110
-    )
+    st.header("3) Attachments")
 
-    exclude_terms = st.text_area(
-        "Auto-penalty terms",
-        value="site visit\noral presentation\nbafo\ntechnical proposal\nconstruction\nrenovation\nstaffing\nsecurity clearance\nfacility clearance\ncalibration\ninstallation",
-        height=130
-    )
-
-    st.header("5) Attachment Scan")
-
-    scan_attachments = st.checkbox("Scan SAM attachment links/PDFs/ZIPs", value=True)
-    scan_top_n = st.slider("Scan attachments for top N raw results", 0, 100, 35)
-    max_attachments = st.slider("Max attachments per opportunity", 0, 10, 4)
+    scan_attachments = st.checkbox("Scan attachment links/PDFs/ZIPs", value=True)
+    scan_top_n = st.slider("Scan attachments for top N raw notices", 0, 300, 75)
+    max_attachments = st.slider("Max attachments per notice", 0, 10, 3)
     max_attachment_mb = st.slider("Max MB per attachment", 1, 25, 8)
-    max_pdf_pages = st.slider("Max pages per PDF", 1, 50, 20)
+    max_pdf_pages = st.slider("Max pages per PDF", 1, 50, 15)
 
-    st.header("6) Price Check")
+    st.header("4) Optional Distributor Pricing")
 
-    distributor_file = st.file_uploader(
-        "Upload distributor pricing CSV/XLSX",
-        type=["csv", "xlsx"],
-        help="Columns can include: part_number, sku, nsn, description, unit_cost, vendor, stock"
-    )
-
-    gsa_file = st.file_uploader(
-        "Upload GSA benchmark CSV/XLSX",
-        type=["csv", "xlsx"],
-        help="Columns can include: part_number, nsn, description, gsa_low, gsa_avg, price"
-    )
-
+    distributor_file = st.file_uploader("Upload distributor pricing CSV/XLSX", type=["csv", "xlsx"])
     target_margin = st.slider("Target gross margin", 0.05, 0.50, 0.20, 0.01)
-    shipping_per_unit = st.number_input("Estimated shipping/handling per unit", min_value=0.0, value=0.0, step=1.0)
 
 
-# -----------------------------
-# Main
-# -----------------------------
-if st.button("Find Quote-Ready Opportunities + Price Check", type="primary"):
+if st.button("Run Multi-Search Funnel", type="primary"):
     if not api_key:
-        st.error("Please paste your SAM.gov API key.")
+        st.error("Paste your SAM.gov API key.")
         st.stop()
 
-    if not keyword.strip():
-        st.error("Select at least one product category or enter keywords.")
+    queries = []
+    for pack in selected_packs:
+        queries.extend(SEARCH_PACKS.get(pack, []))
+    queries.extend([x.strip() for x in manual_keywords.splitlines() if x.strip()])
+    queries = list(dict.fromkeys(queries))
+
+    if not queries:
+        st.error("Select search packs or enter extra searches.")
         st.stop()
 
-    if posted_from > posted_to:
-        st.error("Posted From cannot be after Posted To.")
-        st.stop()
+    dist_df = prepare_price_df(distributor_file)
 
-    distributor_df = prepare_price_df(distributor_file, "distributor pricing")
-    gsa_df = prepare_price_df(gsa_file, "GSA benchmark pricing")
-
-    with st.spinner("Searching quote-ready SAM notices..."):
-        status, raw, data = sam_search(
-            api_key=api_key,
-            keyword=keyword,
-            posted_from=posted_from.strftime("%m/%d/%Y"),
-            posted_to=posted_to.strftime("%m/%d/%Y"),
-            limit=limit,
-        )
-
-    if status != 200:
-        st.error("SAM.gov API error")
-        st.text(raw)
-        st.stop()
-
-    opportunities = data.get("opportunitiesData", [])
-
-    if not opportunities:
-        st.warning("No SAM opportunities returned.")
-        st.json(data)
-        st.stop()
-
-    rows = []
+    all_opps = {}
+    status_errors = []
     progress = st.progress(0)
 
-    for i, opp in enumerate(opportunities):
-        title = clean_text(opp.get("title", ""))
+    st.write(f"Running {len(queries)} smaller SAM searches...")
+
+    for i, q in enumerate(queries):
+        status, raw, opps = sam_search_one(
+            api_key,
+            q,
+            posted_from.strftime("%m/%d/%Y"),
+            posted_to.strftime("%m/%d/%Y"),
+            per_query_limit,
+        )
+        if status != 200:
+            status_errors.append(f"{q}: {raw[:200]}")
+        for opp in opps:
+            key = get_notice_id(opp) or opp.get("noticeId") or get_ui_link(opp)
+            if key:
+                all_opps[key] = opp
+        progress.progress((i + 1) / len(queries))
+
+    raw_count = len(all_opps)
+    opp_list = list(all_opps.values())[:max_total_to_scan]
+
+    st.info(f"Raw unique quote-ready notices pulled: {raw_count}. Scanning/analyzing: {len(opp_list)}.")
+
+    rows = []
+    scan_progress = st.progress(0)
+
+    for i, opp in enumerate(opp_list):
         attachment_text = ""
-        attachment_status = []
+        attachment_status = ""
         links = get_resource_links(opp)
 
         if scan_attachments and i < scan_top_n:
             attachment_text, attachment_status = get_attachment_text(
-                opp,
-                api_key=api_key,
-                max_attachments=max_attachments,
-                max_mb=max_attachment_mb,
-                max_pages=max_pdf_pages,
+                opp, api_key, max_attachments, max_attachment_mb, max_pdf_pages
             )
 
-        result = score_opp(
-            opp=opp,
-            attachment_text=attachment_text,
-            selected_categories=selected_categories,
-            include_terms=include_terms,
-            exclude_terms=exclude_terms,
-        )
+        score, action, difficulty, reason, hits, full_text = score_row(opp, attachment_text, selected_packs, mode)
 
-        full_text = result.get("full_text", "")
-        product = extract_product_summary(title, full_text, selected_categories)
+        title = get_title(opp)
+        parts = find_part_numbers(full_text)
+        nsns = find_nsns(full_text)
+        qtys = find_quantities(full_text)
+        query = primary_query(title, hits, parts, nsns)
 
-        price = price_analysis(
-            product_query=product["Primary Product Query"],
-            part_numbers=product["Part Numbers"],
-            nsns=product["NSNs"],
-            distributor_df=distributor_df,
-            gsa_df=gsa_df,
-            target_margin=target_margin,
-            shipping_per_unit=shipping_per_unit,
-        )
+        cost, vendor, bid, margin, price_verdict = price_match(query, parts, nsns, dist_df, target_margin)
 
         set_aside = get_set_aside(opp)
-
-        # Final action refinement based on pricing.
-        final_action = result["action"]
-        if final_action in ["Pursue First", "Supplier Check"]:
-            if price["Price Verdict"] == "Margin too thin":
-                final_action = "Pass - Price"
-            elif price["Price Verdict"] == "Need distributor cost":
-                final_action = "Supplier Check"
-            elif price["Price Verdict"] == "Use GSA link / supplier call":
-                final_action = "Supplier Check"
+        dleft = days_until_due(get_due_date(opp))
 
         rows.append({
-            "Score": result["score"],
-            "Action": final_action,
-            "Difficulty": result["difficulty"],
-            "Why Difficulty": result["reason"],
+            "Score": score,
+            "Action": action,
+            "Difficulty": difficulty,
+            "Reason": reason,
             "Title": title,
             "Notice ID": get_notice_id(opp),
             "Notice Type": get_notice_type(opp),
@@ -1212,42 +792,46 @@ if st.button("Find Quote-Ready Opportunities + Price Check", type="primary"):
             "PSC": get_psc(opp),
             "Posted": get_posted_date(opp),
             "Due": get_due_date(opp),
-            "Days Left": result["days_left"],
-            "Value": get_value(opp),
-            "Product Match Terms": product["Product Match Terms"],
-            "Primary Product Query": product["Primary Product Query"],
-            "Part Numbers": product["Part Numbers"],
-            "NSNs": product["NSNs"],
-            "Quantities Found": product["Quantities Found"],
-            "Brands/Manufacturers": product["Brands/Manufacturers"],
-            "GSA Advantage Link": product["GSA Advantage Link"],
-            "Distributor Unit Cost": price["Distributor Unit Cost"],
-            "Distributor Vendor": price["Distributor Vendor"],
-            "GSA Low": price["GSA Low"],
-            "GSA Avg": price["GSA Avg"],
-            "Landed Unit Cost": price["Landed Unit Cost"],
-            "Suggested Unit Bid": price["Suggested Unit Bid"],
-            "Estimated Gross Margin": price["Estimated Gross Margin"],
-            "Price Verdict": price["Price Verdict"],
+            "Days Left": dleft,
+            "Product Hits": ", ".join(hits[:8]),
+            "Primary Query": query,
+            "Part Numbers": parts,
+            "NSNs": nsns,
+            "Quantities": qtys,
+            "Distributor Cost": cost,
+            "Distributor Vendor": vendor,
+            "Suggested Bid": bid,
+            "Price Verdict": price_verdict,
             "Attachments": len(links),
-            "Response Requirements": result["requirements"],
-            "Contact Emails": result["emails"],
-            "Positive Signals": result["positive"],
-            "Pass/Risk Reasons": result["risks"],
+            "Attachment Status": attachment_status,
+            "Contact Emails": extract_emails(full_text),
+            "GSA Advantage Link": gsa_advantage_link(query),
             "SAM Link": get_ui_link(opp),
-            "Attachment Status": "; ".join(attachment_status[:5]),
             "_attachment_preview": clean_text(attachment_text[:5000]),
             "_attachment_links": links,
         })
+        scan_progress.progress((i + 1) / len(opp_list))
 
-        progress.progress((i + 1) / len(opportunities))
+    if not rows:
+        st.warning("No results returned from SAM.")
+        st.stop()
 
     df = pd.DataFrame(rows)
 
-    if hide_pass:
-        df = df[~df["Action"].isin(["Pass", "Ignore", "Pass - Price"])]
+    funnel = {
+        "Raw pulled": raw_count,
+        "Analyzed": len(df),
+        "Product hits": int((df["Product Hits"].fillna("") != "").sum()),
+        "Supplier Check+": int(df["Action"].isin(["Pursue First", "Supplier Check"]).sum()),
+        "Pass/Ignore": int(df["Action"].isin(["Pass", "Ignore"]).sum()),
+    }
 
-    df = df[df["Score"] >= min_score]
+    cols = st.columns(5)
+    for c, (label, val) in zip(cols, funnel.items()):
+        c.metric(label, val)
+
+    if hide_pass:
+        df = df[~df["Action"].isin(["Pass", "Ignore"])]
 
     if set_aside_filter:
         df = df[df["Set Aside Bucket"].isin(set_aside_filter)]
@@ -1257,131 +841,98 @@ if st.button("Find Quote-Ready Opportunities + Price Check", type="primary"):
         | ((df["Days Left"] >= min_days_left) & (df["Days Left"] <= max_days_left))
     ]
 
+    df = df[df["Score"] >= min_score]
+
     if df.empty:
-        st.warning("No quote-ready opportunities survived. That is okay — the filters are doing their job.")
+        st.warning("No rows survived the display filters. Switch to Discovery mode, lower minimum score, or uncheck Hide Pass.")
         st.stop()
 
-    df = df.sort_values(by=["Score", "Days Left"], ascending=[False, True], na_position="last")
-    st.session_state["quote_ready_df"] = df
-
-    st.success(f"Found {len(df)} quote-ready opportunities after filters")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Pursue First", int((df["Action"] == "Pursue First").sum()))
-    c2.metric("Supplier Check", int((df["Action"] == "Supplier Check").sum()))
-    c3.metric("Manual Review", int((df["Action"] == "Manual Review").sum()))
-    c4.metric("Easy Quote", int((df["Difficulty"] == "Easy Quote").sum()))
-    c5.metric("Easy Supplier Check", int((df["Difficulty"] == "Easy Supplier Check").sum()))
+    df = df.sort_values(["Score", "Days Left"], ascending=[False, True], na_position="last")
+    st.session_state["funnel_df"] = df
 
     display_cols = [
-        "Score", "Action", "Difficulty", "Price Verdict", "Product Match Terms",
-        "Primary Product Query", "Part Numbers", "NSNs", "Quantities Found",
-        "Title", "Notice ID", "Set Aside", "NAICS", "PSC", "Due", "Days Left",
-        "Distributor Unit Cost", "GSA Low", "GSA Avg", "Suggested Unit Bid",
-        "Estimated Gross Margin", "GSA Advantage Link", "SAM Link"
+        "Score", "Action", "Difficulty", "Title", "Notice ID", "Set Aside", "NAICS", "PSC",
+        "Due", "Days Left", "Product Hits", "Primary Query", "Part Numbers", "NSNs",
+        "Quantities", "Price Verdict", "Distributor Cost", "Suggested Bid",
+        "GSA Advantage Link", "SAM Link"
     ]
+
+    st.success(f"Displaying {len(df)} opportunities after filters.")
 
     st.dataframe(
         df[display_cols],
         use_container_width=True,
         column_config={
-            "SAM Link": st.column_config.LinkColumn("Open in SAM"),
-            "GSA Advantage Link": st.column_config.LinkColumn("Search GSA Advantage"),
+            "SAM Link": st.column_config.LinkColumn("Open SAM"),
+            "GSA Advantage Link": st.column_config.LinkColumn("Search GSA"),
             "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100),
-            "Distributor Unit Cost": st.column_config.NumberColumn("Distributor Unit Cost", format="$%.2f"),
-            "GSA Low": st.column_config.NumberColumn("GSA Low", format="$%.2f"),
-            "GSA Avg": st.column_config.NumberColumn("GSA Avg", format="$%.2f"),
-            "Suggested Unit Bid": st.column_config.NumberColumn("Suggested Unit Bid", format="$%.2f"),
-            "Estimated Gross Margin": st.column_config.NumberColumn("Estimated Gross Margin", format="%.1%"),
+            "Distributor Cost": st.column_config.NumberColumn("Distributor Cost", format="$%.2f"),
+            "Suggested Bid": st.column_config.NumberColumn("Suggested Bid", format="$%.2f"),
         }
     )
 
     export = df.drop(columns=["_attachment_preview", "_attachment_links"], errors="ignore")
     st.download_button(
-        "Download Quote-Ready CSV",
+        "Download Funnel Results CSV",
         export.to_csv(index=False),
-        "windsor_cross_quote_ready_price_checked_results.csv",
+        "windsor_cross_sam_funnel_results.csv",
         "text/csv"
     )
 
 
-# -----------------------------
-# Review panel
-# -----------------------------
-if "quote_ready_df" in st.session_state:
-    df = st.session_state["quote_ready_df"]
-
+if "funnel_df" in st.session_state:
+    df = st.session_state["funnel_df"]
     st.markdown("---")
-    st.header("Inspect One Opportunity")
+    st.header("Inspect One Result")
 
     options = [
-        f"{row['Score']}/100 | {row['Action']} | {row['Notice ID']} | {row['Primary Product Query']} | {row['Title'][:75]}"
+        f"{row['Score']}/100 | {row['Action']} | {row['Notice ID']} | {row['Title'][:90]}"
         for _, row in df.iterrows()
     ]
-
-    selected = st.selectbox("Choose an opportunity", options)
+    selected = st.selectbox("Choose result", options)
 
     if selected:
-        # Extract notice id from option
-        parts = selected.split("|")
-        notice_id = parts[2].strip()
+        notice_id = selected.split("|")[2].strip()
         row = df[df["Notice ID"] == notice_id].iloc[0]
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Score", int(row["Score"]))
         c2.metric("Action", row["Action"])
         c3.metric("Difficulty", row["Difficulty"])
-        c4.metric("Price Verdict", row["Price Verdict"])
+        c4.metric("Days Left", "Unknown" if pd.isna(row["Days Left"]) else int(row["Days Left"]))
 
         st.markdown(f"### {row['Title']}")
         st.write(f"**Notice ID:** {row['Notice ID']}")
-        st.write(f"**Notice Type:** {row['Notice Type']}")
         st.write(f"**Set Aside:** {row['Set Aside']}")
         st.write(f"**NAICS / PSC:** {row['NAICS']} / {row['PSC']}")
         st.write(f"**Due:** {row['Due']}")
+        st.write(f"**Reason:** {row['Reason']}")
         st.markdown(f"[Open in SAM]({row['SAM Link']})")
-
-        st.subheader("Extracted Product")
-        st.write(f"**Primary Product Query:** {row['Primary Product Query']}")
-        st.write(f"**Product Match Terms:** {row['Product Match Terms']}")
-        st.write(f"**Part Numbers:** {row['Part Numbers'] or 'None detected'}")
-        st.write(f"**NSNs:** {row['NSNs'] or 'None detected'}")
-        st.write(f"**Quantities Found:** {row['Quantities Found'] or 'None detected'}")
-        st.write(f"**Brands/Manufacturers:** {row['Brands/Manufacturers'] or 'None detected'}")
         st.markdown(f"[Search GSA Advantage]({row['GSA Advantage Link']})")
 
-        st.subheader("Price Check")
-        price_cols = st.columns(4)
-        price_cols[0].metric("Distributor Cost", "N/A" if pd.isna(row["Distributor Unit Cost"]) else f"${row['Distributor Unit Cost']:.2f}")
-        price_cols[1].metric("GSA Low", "N/A" if pd.isna(row["GSA Low"]) else f"${row['GSA Low']:.2f}")
-        price_cols[2].metric("Suggested Bid", "N/A" if pd.isna(row["Suggested Unit Bid"]) else f"${row['Suggested Unit Bid']:.2f}")
-        price_cols[3].metric("Gross Margin", "N/A" if pd.isna(row["Estimated Gross Margin"]) else f"{row['Estimated Gross Margin']:.1%}")
+        st.subheader("Product Extraction")
+        st.write(f"**Product Hits:** {row['Product Hits']}")
+        st.write(f"**Primary Query:** {row['Primary Query']}")
+        st.write(f"**Part Numbers:** {row['Part Numbers'] or 'None detected'}")
+        st.write(f"**NSNs:** {row['NSNs'] or 'None detected'}")
+        st.write(f"**Quantities:** {row['Quantities'] or 'None detected'}")
 
-        st.write(f"**Distributor Vendor:** {row['Distributor Vendor'] or 'None matched'}")
+        st.subheader("Price")
         st.write(f"**Price Verdict:** {row['Price Verdict']}")
-
-        st.subheader("Response Readiness")
-        st.write(f"**Difficulty:** {row['Difficulty']}")
-        st.write(f"**Why:** {row['Why Difficulty']}")
-        st.write(f"**Detected Requirements:** {row['Response Requirements'] or 'None detected'}")
-        st.write(f"**Contact Emails:** {row['Contact Emails'] or 'None detected'}")
-
-        st.subheader("Ranking Explanation")
-        st.write(f"**Positive Signals:** {row['Positive Signals']}")
-        st.write(f"**Pass/Risk Reasons:** {row['Pass/Risk Reasons']}")
+        st.write(f"**Distributor Vendor:** {row['Distributor Vendor'] or 'None matched'}")
+        st.write(f"**Distributor Cost:** {row['Distributor Cost']}")
+        st.write(f"**Suggested Bid:** {row['Suggested Bid']}")
 
         st.subheader("Attachments")
         links = row["_attachment_links"]
-        if not links:
-            st.info("No API attachment links were returned.")
-        else:
+        if links:
             for link in links:
                 st.markdown(f"- [{link['name']}]({link['url']})")
-            st.write(f"**Attachment Status:** {row['Attachment Status'] or 'Not scanned'}")
+        else:
+            st.info("No API attachment links found.")
 
-        with st.expander("Attachment text preview used for scoring"):
-            preview = row["_attachment_preview"]
-            if preview:
-                st.text_area("Attachment Preview", value=preview, height=300)
+        with st.expander("Attachment preview"):
+            if row["_attachment_preview"]:
+                st.text_area("Attachment text", row["_attachment_preview"], height=300)
             else:
-                st.info("No readable attachment text was scanned.")
+                st.info("No readable attachment text scanned.")
