@@ -1,5 +1,6 @@
 streamlit
-pandas
 requests
-python-dateutil
+pandas
+PyPDF2
+python-docx
 openpyxl
